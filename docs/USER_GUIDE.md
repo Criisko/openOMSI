@@ -244,6 +244,24 @@ on the Controllers page, by name, separated by `|`) and `language` (`ENG`, `DEU`
 in). The file also carries a `version`; older files that say
 `boarding=pay` because that was the launcher's old default are read as `auto`.
 
+`dlss` (Settings → Anti-aliasing → **DLSS / DLAA**, its quality in the row below; the same in
+the game menu's Options → Graphics, where another quality is taken at once) draws the
+picture with NVIDIA DLSS Super Resolution instead of MSAA, FXAA and the render scale: `off`
+(default), `dlaa` (the window's own resolution, DLSS as anti-aliasing only), `quality`,
+`balanced`, `performance` or `ultra_performance` (about 67 %, 58 %, 50 % and 33 % of the
+window's width and height, scaled up by DLSS; the HUD stays at full resolution). It needs
+Windows, DirectX 12 (the game takes it when DLSS is on) and a GeForce RTX card with a
+current driver, and NVIDIA's Streamline runtime beside `openomsi.exe` - openOMSI ships none
+of NVIDIA's files: copy `sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll` and
+`nvngx_dlss.dll` from the [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline)'s
+`bin/x64` (or point `OMSI_STREAMLINE_DIR` at them). Without any of that the game says why
+in its log and draws as without DLSS, with the `msaa` the settings hold. The picture DLSS
+gets is the tone-mapped one; each frame the projection moves by a sub-pixel offset, and the
+depth prepass writes every pixel's motion (the camera's and each object's, from last
+frame's model matrices). The drops of the rain on the windscreen get their pane's motion and
+DLSS's bias mask (the current picture before the history), so they neither streak nor show
+twice; at Ultra performance they flicker a little, drawn from a ninth of the pixels.
+
 `drive_keys` is a control preset: `simple` (W/S/A/D and the arrow keys drive; the default),
 `wasd`, `arrows`, or `omsi` ("Custom controls") - only the layout of `Inputs/keyboard.cfg`
 (OMSI's Shift + numpad, or what the Controls page made of it), nothing added. **T** sells the ticket a passenger asks for on a bus without a
@@ -451,6 +469,9 @@ Environment variables, all off unless set. The useful ones:
 | `OMSI_NO_BRIDGE=1` | a LAN host leaves the internet alone (no UPnP port forward, no address posting) - for tests |
 | `OMSI_NO_LAN_MODS=1` | a LAN host serves no mods and a joining game fetches none |
 | `OMSI_BACKEND=vulkan\|dx12\|gl` | the graphics interface to ask first (the log lists every adapter each one offers) |
+| `OMSI_DLSS=off\|dlaa\|quality\|balanced\|performance\|ultra_performance` | DLSS whatever the settings say |
+| `OMSI_STREAMLINE_DIR=dir`, `OMSI_DLSS_VERBOSE=1` | where Streamline's DLLs are (the game's folder by default), and all of Streamline's log |
+| `OMSI_DLSS_JITTER_SIGN=-1` | tell DLSS the sub-pixel offset the other way round (a picture that shimmers or smears on every edge with DLSS) |
 | `OMSI_GPU_LIMITS=default\|downlevel` | pretend the graphics card can only do this much (tests of old cards) |
 | `OMSI_GPU_ARRAYS=textures\|nostorage` | read the scene's arrays from textures, as on OpenGL chips without storage buffers in the vertex shader (or without any: no per-pixel lamp light) - tests of old cards |
 | `OMSI_RENDER_OCCLUDED=1` | draw even while the window is hidden (tests) |

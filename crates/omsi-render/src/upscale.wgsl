@@ -5,7 +5,9 @@
 // what the smaller picture lost, most where the picture is flat and least on hard edges.
 struct Params {
     // xy: size of the source picture, z: sharpening 0..1, w: 1 = the picture at the window's
-    // own size smoothed by FXAA instead (the plain graphics without multisampling)
+    // own size smoothed by FXAA instead (the plain graphics without multisampling); 2 = DLSS's
+    // result, which holds the sRGB-encoded values it read from the picture: decoded here, as
+    // the window's sRGB target encodes what it is given
     src: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> p: Params;
@@ -164,7 +166,7 @@ fn fs_copy(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let size = p.src.xy;
-    if (p.src.w > 0.5) {
+    if (p.src.w > 0.5 && p.src.w < 1.5) {
         return vec4<f32>(fxaa(in.uv, 1.0 / size), 1.0);
     }
     let px = 1.0 / size;
@@ -190,5 +192,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let wgt = amp * peak;
         col = clamp((col + (n + s + w + e) * wgt) / (vec3<f32>(1.0) + 4.0 * wgt), vec3<f32>(0.0), vec3<f32>(1.0));
     }
+    if (p.src.w > 1.5) {
+        col = srgb_to_linear(col);
+    }
     return vec4<f32>(col, 1.0);
+}
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let x = max(c, vec3<f32>(0.0));
+    return select(pow((x + 0.055) / 1.055, vec3<f32>(2.4)), x / 12.92, x <= vec3<f32>(0.04045));
 }

@@ -460,9 +460,15 @@ fn vertex_specular(wp: vec3<f32>, n: vec3<f32>) -> array<vec3<f32>, 2> {
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    let e = draw_list[in.inst];
+    return vertex_main(in.pos, in.normal, in.uv, in.inst);
+}
+
+// (the scene vertex of `vs_main`; the DLSS prepass's `vs_motion` takes the same, so that its
+// depth is the main pass's to the last bit)
+fn vertex_main(in_pos: vec3<f32>, in_normal: vec3<f32>, in_uv: vec2<f32>, in_inst: u32) -> VsOut {
+    let e = draw_list[in_inst];
     let m = model_matrix(e);
-    let wp = m * vec4<f32>(in.pos, 1.0);
+    let wp = m * vec4<f32>(in_pos, 1.0);
     var out: VsOut;
     // Legacy surfaces are pulled towards the eye along the line of sight. OMSI splines and
     // [surface] objects use a fixed 8 cm world lift; ordered scenery phases use their authored
@@ -480,12 +486,12 @@ fn vs_main(in: VsIn) -> VsOut {
     }
     out.clip = camera.view_proj * vec4<f32>(cp, 1.0);
     out.world = wp.xyz;
-    out.normal = safe_normal((m * vec4<f32>(in.normal, 0.0)).xyz);
+    out.normal = safe_normal((m * vec4<f32>(in_normal, 0.0)).xyz);
     let sp = vertex_specular(wp.xyz, out.normal);
     out.spec_sun = sp[0];
     out.spec_sky = sp[1];
     let pr = inst_params[e * 2u];
-    out.uv = in.uv + pr.zw;
+    out.uv = in_uv + pr.zw;
     out.params = pr;
     out.params2 = inst_params[e * 2u + 1u];
     if (pr.y < 0.5) {
@@ -639,9 +645,16 @@ fn fs_puddle_glass_depth(in: FsIn) {
 
 @fragment
 fn fs_shadow_test(in: FsIn) {
-    var duv = tex_address(in.uv);
+    if (!cutout_covers(in.uv, in.params)) {
+        discard;
+    }
+}
+
+// Whether an alpha-tested material covers its pixel in the depth passes (`fs_shadow_test`).
+fn cutout_covers(in_uv: vec2<f32>, in_params: vec4<f32>) -> bool {
+    var duv = tex_address(in_uv);
     if (material.extra.x > 0.5) {
-        duv = in.uv * material.extra.z;
+        duv = in_uv * material.extra.z;
     }
     // Use the light-pass footprint for cutout coverage. Forcing mip 0 here aliases dense
     // foliage and alpha layers into a checkerboard when the light projection moves by a
@@ -653,12 +666,10 @@ fn fs_shadow_test(in: FsIn) {
     var a = select(diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv).a, 1.0, material.params.x > 1.5 && material.params.z < 0.5);
     if (material.params.z > 0.5) {
         // (the transmap stays where it is: [texcoordtransX/Y] only moves the diffuse stage)
-        let tm = sample_transmap(tex_address(in.uv - in.params.zw));
+        let tm = sample_transmap(tex_address(in_uv - in_params.zw));
         a = select(1.0, tm.a, material.params.w > 0.5);
     }
-    if (a < 0.5) {
-        discard;
-    }
+    return a >= 0.5;
 }
 
 // Roads with feathered alpha borders stay blended while their overlaps compose.
@@ -683,19 +694,21 @@ fn fs_surface_depth(in: FsIn) -> @location(0) vec4<f32> {
 // remain out of the prepass and are composited normally.
 @fragment
 fn fs_transmap_depth(in: FsIn) {
-    if (material.params.z < 0.5) {
+    if (!transmap_covers(in.uv, in.params)) {
         discard;
     }
-    let tm = sample_transmap(tex_address(in.uv - in.params.zw));
-    let a = select(1.0, tm.a, material.params.w > 0.5) * in.params.x;
+}
+
+// Whether the opaque part of a blended transmap covers its pixel (`fs_transmap_depth`).
+fn transmap_covers(in_uv: vec2<f32>, in_params: vec4<f32>) -> bool {
+    let tm = sample_transmap(tex_address(in_uv - in_params.zw));
+    let a = select(1.0, tm.a, material.params.w > 0.5) * in_params.x;
     // Only what the colour pass will cover completely may hide what lies behind it: a
     // texel that is merely more opaque than not (the dimmer and anti-aliased dots of a
     // display's text layer, whose transmap is its script texture) wrote depth here, the
     // display's backplate behind it was then rejected, and the half-transparent text was
     // blended over the sky - holes in the display.
-    if (a < 0.99) {
-        discard;
-    }
+    return material.params.z > 0.5 && a >= 0.99;
 }
 
 // 1 = lit by the sun, 0 = in shadow. Two cascades: the near one (sharp, around the camera)

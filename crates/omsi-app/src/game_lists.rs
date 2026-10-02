@@ -1578,9 +1578,23 @@ pub(crate) fn dropdown_apply(app: &mut App, action: &str) {
             }
         }
         "pick" => {
-            if let Some((key, value)) = arg.split_once(' ') {
-                remember_setting(key, value);
-                reload_settings(app);
+            match arg.split_once(' ') {
+                Some(("aa", "dlss")) => {
+                    if !dlss_on(&settings_file()) {
+                        remember_setting("dlss", "quality");
+                    }
+                    reload_settings(app);
+                }
+                Some(("aa", msaa)) => {
+                    remember_setting("dlss", "off");
+                    remember_setting("msaa", msaa);
+                    reload_settings(app);
+                }
+                Some((key, value)) => {
+                    remember_setting(key, value);
+                    reload_settings(app);
+                }
+                None => {}
             }
         }
         "preset" => {
@@ -1672,6 +1686,11 @@ fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
         "graphics" => vec![("vanilla", "Vanilla (as OMSI 2)"), ("vanilla_plus", "Vanilla+"), ("enhanced", "Enhanced")],
         "msaa" => vec![("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA"), ("8", "8x MSAA")],
         "render_scale" => vec![("auto", "Auto"), ("1", "100%"), ("0.85", "85%"), ("0.75", "75%"), ("0.67", "67%"), ("0.5", "50%")],
+        // anti-aliasing as the launcher's settings have it: MSAA (`msaa`), or NVIDIA DLSS
+        // (`dlss`, Windows: it needs DirectX 12) with its quality in a row of its own
+        "aa" if cfg!(windows) => vec![("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA"), ("8", "8x MSAA"), ("dlss", "DLSS / DLAA")],
+        "aa" => select_options("msaa"),
+        "dlss" if cfg!(windows) => vec![("dlaa", "DLAA (native resolution)"), ("quality", "Quality"), ("balanced", "Balanced"), ("performance", "Performance"), ("ultra_performance", "Ultra performance")],
         "anisotropy" => vec![("1", "Off"), ("2", "2x"), ("4", "4x"), ("8", "8x")],
         "shadow_size" => vec![("1024", "1024"), ("2048", "2048"), ("4096", "4096")],
         "shadow_casters" => vec![("all", "Every solid mesh"), ("omsi", "[shadow] meshes, as OMSI")],
@@ -1700,9 +1719,18 @@ fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
 
 fn select_state(file: &serde_json::Value, key: &str) -> (Vec<(&'static str, &'static str)>, Option<usize>, String) {
     let options = select_options(key);
-    let cur = value_text(file.get(key).unwrap_or(&serde_json::Value::Null));
+    let cur = match key {
+        "aa" if dlss_on(file) => "dlss".to_string(),
+        "aa" => value_text(file.get("msaa").unwrap_or(&serde_json::Value::Null)),
+        _ => value_text(file.get(key).unwrap_or(&serde_json::Value::Null)),
+    };
     let at = options.iter().position(|o| same_value(o.0, &cur));
     (options, at, cur)
+}
+
+/// Whether the settings file asks for NVIDIA DLSS (Windows only).
+fn dlss_on(file: &serde_json::Value) -> bool {
+    cfg!(windows) && file.get("dlss").and_then(|v| v.as_str()).is_some_and(|m| m != "off")
 }
 
 fn select_row(file: &serde_json::Value, key: &str, name: &str, desc: &str) -> Option<(String, String)> {
@@ -1753,6 +1781,10 @@ fn reload_settings(app: &mut App) {
 }
 
 fn sync_live(app: &mut App) {
+    // (another DLSS quality is taken at once; DLSS on or off with the next start)
+    if let Some(r) = app.renderer.as_mut() {
+        r.set_dlss_mode(app.settings.dlss_mode());
+    }
     let s = &app.settings;
     crate::startup::SOUND_AI.store(s.vol_ai.to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::startup::SOUND_SCENERY.store(s.vol_scenery.to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -1778,6 +1810,7 @@ fn options_pages(app: &App) -> Vec<Page> {
     let pct = |v: f32| format!("{:.0} %", v * 100.0);
     let cm = |v: f32| format!("{:+.0} cm", v * 100.0);
     let later = "Takes effect when the game starts the next time";
+    let dlss_on = dlss_on(&file);
     let game: Vec<(String, String)> = vec![
         switch_row(app, "navigator", "Navigator", "Enables/Disables the Minimap"),
         switch_row(app, "nav_ai", "AI vehicles on the map", "Shows/hides the other (AI) vehicles on the Minimap and the city map"),
@@ -1802,8 +1835,9 @@ fn options_pages(app: &App) -> Vec<Page> {
     let graphics: Vec<(String, String)> = vec![
         preset_row(&file, "Quality preset", "Sets most of the graphics options at once"),
         pick("graphics", "Graphics", later),
-        pick("msaa", "Anti-aliasing", later),
-        pick("render_scale", "Render scale", later),
+        pick("aa", "Anti-aliasing", later),
+        // (DLSS draws at the size its quality asks for: it takes the render scale's row)
+        if dlss_on { pick("dlss", "DLSS quality", "Changes at once; DLSS on or off takes effect when the game starts the next time") } else { pick("render_scale", "Render scale", later) },
         pick("anisotropy", "Anisotropic", later),
         switch_row(app, "shadows", "Sun shadows", "Enables/Disabled shadows"),
         pick("shadow_size", "Shadow map", later),
