@@ -471,9 +471,15 @@ fn vertex_specular(wp: vec3<f32>, n: vec3<f32>) -> array<vec3<f32>, 2> {
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    let e = draw_list[in.inst];
+    return vertex_main(in.pos, in.normal, in.uv, in.inst);
+}
+
+// (the scene vertex of `vs_main`; the DLSS prepass's `vs_motion` takes the same, so that its
+// depth is the main pass's to the last bit)
+fn vertex_main(in_pos: vec3<f32>, in_normal: vec3<f32>, in_uv: vec2<f32>, in_inst: u32) -> VsOut {
+    let e = draw_list[in_inst];
     let m = model_matrix(e);
-    let wp = m * vec4<f32>(in.pos, 1.0);
+    let wp = m * vec4<f32>(in_pos, 1.0);
     var out: VsOut;
     // Legacy surfaces are pulled towards the eye along the line of sight. OMSI splines and
     // [surface] objects use a fixed 8 cm world lift; ordered scenery phases use their authored
@@ -491,12 +497,12 @@ fn vs_main(in: VsIn) -> VsOut {
     }
     out.clip = camera.view_proj * vec4<f32>(cp, 1.0);
     out.world = wp.xyz;
-    out.normal = safe_normal((m * vec4<f32>(in.normal, 0.0)).xyz);
+    out.normal = safe_normal((m * vec4<f32>(in_normal, 0.0)).xyz);
     let sp = vertex_specular(wp.xyz, out.normal);
     out.spec_sun = sp[0];
     out.spec_sky = sp[1];
     let pr = inst_params[e * 2u];
-    out.uv = in.uv + pr.zw;
+    out.uv = in_uv + pr.zw;
     out.params = pr;
     out.params2 = inst_params[e * 2u + 1u];
     if (pr.y < 0.5) {
@@ -645,9 +651,16 @@ fn fs_puddle_glass_depth(in: FsIn) {
 
 @fragment
 fn fs_shadow_test(in: FsIn) {
-    var duv = tex_address(in.uv);
+    if (!cutout_covers(in.uv, in.params)) {
+        discard;
+    }
+}
+
+// Whether an alpha-tested material covers its pixel in the depth passes (`fs_shadow_test`).
+fn cutout_covers(in_uv: vec2<f32>, in_params: vec4<f32>) -> bool {
+    var duv = tex_address(in_uv);
     if (material.extra.x > 0.5) {
-        duv = in.uv * material.extra.z;
+        duv = in_uv * material.extra.z;
     }
     // Use the light-pass footprint for cutout coverage. Forcing mip 0 here aliases dense
     // foliage and alpha layers into a checkerboard when the light projection moves by a
@@ -659,12 +672,10 @@ fn fs_shadow_test(in: FsIn) {
     var a = select(diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv).a, 1.0, material.params.x > 1.5 && material.params.z < 0.5);
     if (material.params.z > 0.5) {
         // (the transmap stays where it is: [texcoordtransX/Y] only moves the diffuse stage)
-        let tm = sample_transmap(tex_address(in.uv - in.params.zw));
+        let tm = sample_transmap(tex_address(in_uv - in_params.zw));
         a = select(1.0, tm.a, material.params.w > 0.5);
     }
-    if (a < 0.5) {
-        discard;
-    }
+    return a >= 0.5;
 }
 
 // Roads with feathered alpha borders stay blended while their overlaps compose.
@@ -689,19 +700,21 @@ fn fs_surface_depth(in: FsIn) -> @location(0) vec4<f32> {
 // remain out of the prepass and are composited normally.
 @fragment
 fn fs_transmap_depth(in: FsIn) {
-    if (material.params.z < 0.5) {
+    if (!transmap_covers(in.uv, in.params)) {
         discard;
     }
-    let tm = sample_transmap(tex_address(in.uv - in.params.zw));
-    let a = select(1.0, tm.a, material.params.w > 0.5) * in.params.x;
+}
+
+// Whether the opaque part of a blended transmap covers its pixel (`fs_transmap_depth`).
+fn transmap_covers(in_uv: vec2<f32>, in_params: vec4<f32>) -> bool {
+    let tm = sample_transmap(tex_address(in_uv - in_params.zw));
+    let a = select(1.0, tm.a, material.params.w > 0.5) * in_params.x;
     // Only what the colour pass will cover completely may hide what lies behind it: a
     // texel that is merely more opaque than not (the dimmer and anti-aliased dots of a
     // display's text layer, whose transmap is its script texture) wrote depth here, the
     // display's backplate behind it was then rejected, and the half-transparent text was
     // blended over the sky - holes in the display.
-    if (a < 0.99) {
-        discard;
-    }
+    return material.params.z > 0.5 && a >= 0.99;
 }
 
 // 1 = lit by the sun, 0 = in shadow. Two cascades: the near one (sharp, around the camera)
@@ -1717,4 +1730,124 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
     }
     a = a * in.params.x;
     return vec4<f32>(rgb, a);
+}
+
+// --- DLSS: the depth prepass also writes each pixel's motion (see `DlssState` in lib.rs)
+struct Motion {
+    // this frame's view-projection without the sub-pixel jitter
+    vp: mat4x4<f32>,
+    // last frame's, for last frame's model matrices (relative to last frame's render origin)
+    vp_prev: mat4x4<f32>,
+    // last frame's, relative to this frame's render origin: the sky, and the entries without
+    // a matrix of last frame
+    vp_prev_here: mat4x4<f32>,
+    // the inverse of `vp` (the sky's directions)
+    vp_inv: mat4x4<f32>,
+    // xy: the render size in pixels, z: 1 when `prev_models` holds last frame's matrices,
+    // w: how many entries it holds
+    params: vec4<f32>,
+};
+@group(3) @binding(0) var<uniform> motion: Motion;
+// last frame's model matrices, as `models`
+@group(3) @binding(1) var<storage, read> prev_models: array<vec4<f32>>;
+
+struct MotionOut {
+    @builtin(position) @invariant clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) params: vec4<f32>,
+    @location(4) params2: vec4<f32>,
+    // (without the jitter) this frame's and last frame's clip position
+    @location(5) cur: vec4<f32>,
+    @location(6) prev: vec4<f32>,
+};
+// (the fragment side of MotionOut, without the invariant: see FsIn)
+struct MotionFsIn {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) params: vec4<f32>,
+    @location(4) params2: vec4<f32>,
+    @location(5) cur: vec4<f32>,
+    @location(6) prev: vec4<f32>,
+};
+
+@vertex
+fn vs_motion(in: VsIn) -> MotionOut {
+    let v = vertex_main(in.pos, in.normal, in.uv, in.inst);
+    let e = draw_list[in.inst];
+    let local = vec4<f32>(in.pos, 1.0);
+    let wp = model_matrix(e) * local;
+    var out: MotionOut;
+    out.clip = v.clip;
+    out.world = v.world;
+    out.normal = v.normal;
+    out.uv = v.uv;
+    out.params = v.params;
+    out.params2 = v.params2;
+    out.cur = motion.vp * wp;
+    if (motion.params.z > 0.5 && f32(e) < motion.params.w) {
+        let k = e * 4u;
+        let pm = mat4x4<f32>(prev_models[k], prev_models[k + 1u], prev_models[k + 2u], prev_models[k + 3u]);
+        out.prev = motion.vp_prev * (pm * local);
+    } else {
+        out.prev = motion.vp_prev_here * wp;
+    }
+    return out;
+}
+
+// From this pixel to where the same point was last frame, in pixels (x right, y down).
+fn motion_pixels(cur: vec4<f32>, prev: vec4<f32>) -> vec4<f32> {
+    if (prev.w <= 1e-4 || cur.w <= 1e-4) {
+        return vec4<f32>(0.0);
+    }
+    let d = (prev.xy / prev.w - cur.xy / cur.w) * vec2<f32>(0.5, -0.5) * motion.params.xy;
+    return vec4<f32>(d, 0.0, 0.0);
+}
+
+@fragment
+fn fs_motion(in: MotionFsIn) -> @location(0) vec4<f32> {
+    return motion_pixels(in.cur, in.prev);
+}
+
+@fragment
+fn fs_motion_test(in: MotionFsIn) -> @location(0) vec4<f32> {
+    if (!cutout_covers(in.uv, in.params)) {
+        discard;
+    }
+    return motion_pixels(in.cur, in.prev);
+}
+
+@fragment
+fn fs_motion_transmap(in: MotionFsIn) -> @location(0) vec4<f32> {
+    if (!transmap_covers(in.uv, in.params)) {
+        discard;
+    }
+    return motion_pixels(in.cur, in.prev);
+}
+
+// The sky (whatever the prepass leaves uncovered): a point on the far plane, drawn first.
+struct SkyMotionOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) ndc: vec2<f32>,
+};
+
+@vertex
+fn vs_motion_sky(@builtin(vertex_index) i: u32) -> SkyMotionOut {
+    let x = f32(i32(i & 1u) * 4 - 1);
+    let y = f32(i32(i >> 1u) * 4 - 1);
+    var out: SkyMotionOut;
+    // (reversed Z: depth 0 is the far plane)
+    out.clip = vec4<f32>(x, y, 0.0, 1.0);
+    out.ndc = vec2<f32>(x, y);
+    return out;
+}
+
+@fragment
+fn fs_motion_sky(in: SkyMotionOut) -> @location(0) vec4<f32> {
+    let far = motion.vp_inv * vec4<f32>(in.ndc, 0.0, 1.0);
+    let wp = vec4<f32>(far.xyz / far.w, 1.0);
+    return motion_pixels(vec4<f32>(in.ndc, 0.0, 1.0), motion.vp_prev_here * wp);
 }

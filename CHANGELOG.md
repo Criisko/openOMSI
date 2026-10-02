@@ -4,6 +4,14 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
 [docs/VERSIONING.md](docs/VERSIONING.md)); the downloads are on the
 [Releases](https://github.com/openOMSI-Project/openOMSI/releases) page.
 
+## Unreleased
+
+### Graphics
+- NVIDIA DLSS Super Resolution and DLAA (Windows, DirectX 12, GeForce RTX): Settings →
+  Anti-aliasing → DLSS / DLAA, with its quality (DLAA, Quality, Balanced, Performance,
+  Ultra performance) in the row below. NVIDIA's Streamline DLLs go beside the game (see the
+  user guide); without them, or on another card, the game draws as before.
+
 ## 0.1.1120 - 2026-10-02
 
 ### Passengers and doors

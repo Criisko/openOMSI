@@ -284,6 +284,46 @@ fn sel_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, name: &str, r: Rect,
     }
 }
 
+/// Whether the settings ask for NVIDIA DLSS (Windows only: it needs DirectX 12).
+fn dlss_on(s: &Value) -> bool {
+    cfg!(windows) && get(s, "dlss").as_str().is_some_and(|m| m != "off")
+}
+
+/// Anti-aliasing: MSAA (`msaa`) or NVIDIA DLSS / DLAA (`dlss`, its quality in a row of its
+/// own). DLSS leaves `msaa` as it was: a machine that cannot do DLSS draws with that.
+fn aa_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, r: Rect) {
+    ui.label(Rect::new(r.x, r.y, r.w * 0.45, r.h), "Anti-aliasing");
+    let mut options: Vec<(&str, &str)> = vec![("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA"), ("8", "8x MSAA")];
+    if cfg!(windows) {
+        options.push(("dlss", "DLSS / DLAA"));
+    }
+    let cur = if dlss_on(s) {
+        "dlss".to_string()
+    } else {
+        match get(s, "msaa") {
+            Value::Number(n) => n.as_i64().unwrap_or(4).to_string(),
+            Value::String(x) => x.clone(),
+            _ => "4".to_string(),
+        }
+    };
+    let labels: Vec<String> = options.iter().map(|o| o.1.to_string()).collect();
+    let mut sel = options.iter().position(|o| o.0 == cur).unwrap_or(0);
+    if ui.select("s-msaa", Rect::new(r.x + r.w * 0.45, r.y, r.w * 0.55, r.h), &mut sel, &labels) {
+        match options[sel].0 {
+            "dlss" => {
+                if !dlss_on(s) {
+                    s["dlss"] = json!("quality");
+                }
+            }
+            v => {
+                s["dlss"] = json!("off");
+                s["msaa"] = json!(v.parse::<i64>().unwrap_or(1));
+            }
+        }
+        *dirty = 0.3;
+    }
+}
+
 fn toggle_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, r: Rect, label: &str, key: &str) {
     let mut v = get(s, key).as_bool().unwrap_or(false);
     if ui.toggle(&format!("set-{key}"), r, &mut v, label) {
@@ -539,8 +579,13 @@ fn graphics_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) ->
     sel_setting(ui, s, dirty, "s-graphics", c.row(), "Graphics", "graphics", &[("vanilla", "Vanilla (as OMSI 2)"), ("vanilla_plus", "Vanilla+"), ("enhanced", "Enhanced")]);
     // Vanilla draws what OMSI 2 draws: no sun shadows, ambient occlusion or detail grain
     let classic = get(s, "graphics").as_str() == Some("vanilla");
-    sel_setting(ui, s, dirty, "s-msaa", c.row(), "Anti-aliasing", "msaa", &[("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA"), ("8", "8x MSAA")]);
-    sel_setting(ui, s, dirty, "s-scale", c.row(), "Render scale", "render_scale", &[("auto", "Auto"), ("1", "100%"), ("0.85", "85%"), ("0.75", "75%"), ("0.67", "67%"), ("0.5", "50%")]);
+    aa_setting(ui, s, dirty, c.row());
+    // DLSS draws the picture at the size its quality asks for: it takes the render scale's row
+    if dlss_on(s) {
+        sel_setting(ui, s, dirty, "s-dlss", c.row(), "DLSS quality", "dlss", &[("dlaa", "DLAA (native resolution)"), ("quality", "Quality"), ("balanced", "Balanced"), ("performance", "Performance"), ("ultra_performance", "Ultra performance")]);
+    } else {
+        sel_setting(ui, s, dirty, "s-scale", c.row(), "Render scale", "render_scale", &[("auto", "Auto"), ("1", "100%"), ("0.85", "85%"), ("0.75", "75%"), ("0.67", "67%"), ("0.5", "50%")]);
+    }
     sel_setting(ui, s, dirty, "s-af", c.row(), "Anisotropic", "anisotropy", &[("1", "Off"), ("2", "2x"), ("4", "4x"), ("8", "8x"), ("16", "16x")]);
     if !classic {
         sel_setting(ui, s, dirty, "s-shadow", c.row(), "Shadow map", "shadow_size", &[("1024", "1024"), ("2048", "2048"), ("4096", "4096")]);
