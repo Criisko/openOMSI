@@ -1,0 +1,173 @@
+# Windows release for this fork.
+#
+# It is the project's .github/workflows/release.yml cut down to what a fork can build, plus
+# one extra step that carries the ReShade workaround:
+#
+#   * Windows x64 only. The Android job wants secrets.ANDROID_KEYSTORE_B64, which a fork does
+#     not have, and the project's release job waits for every platform - so one missing
+#     secret would mean no release at all.
+#   * The archive keeps the same name the launcher's updater looks for
+#     (openOMSI-<version>-windows-x64.zip), so the game updates itself from this fork.
+#
+# THE RESHADE WORKAROUND, and why it is here rather than in a commit:
+#   wgpu makes IDXGIFactoryMedia through the legacy CreateDXGIFactory1. ReShade hooks that
+#   legacy export, and the process then dies with an access violation inside dxgi.dll
+#   (0xc0000005) before any window shows - the game never starts. openOMSI never makes a
+#   composition swapchain, so that factory is not needed at all, and wgpu itself treats the
+#   call as optional (it is wrapped in .ok() upstream). The step takes that one line out of
+#   the wgpu-hal source before building.
+#
+#   Keeping it in the workflow (instead of vendoring wgpu-hal into the repository) means the
+#   only thing to keep up with upstream is this file: the step reads the wgpu-hal version out
+#   of Cargo.lock itself. If that version ever stops containing the line, the step fails and
+#   says so, so a stale workaround cannot slip into a release unnoticed.
+
+name: Windows release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
+
+      # MAJOR.MINOR from VERSION, COMMIT the commits since VERSION last changed
+      # (scripts/version.sh, in PowerShell so that no shell is needed on the runner).
+      - name: Version
+        id: v
+        shell: pwsh
+        run: |
+          $base = (Get-Content VERSION -Raw).Trim()
+          $last = (git log -1 --format=%H -- VERSION)
+          $n = if ($last) { [int](git rev-list --count "$last..HEAD") } else { 0 }
+          $version = "$base.$n"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "OPENOMSI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "openOMSI $version"
+
+      - name: The ReShade workaround
+        shell: pwsh
+        run: |
+          $lock = Get-Content Cargo.lock -Raw
+          if ($lock -notmatch '(?ms)^name = "wgpu-hal"\r?\nversion = "([^"]+)"') {
+            throw 'wgpu-hal is not in Cargo.lock'
+          }
+          $ver = $Matches[1]
+          Write-Host "wgpu-hal $ver"
+
+          Invoke-WebRequest "https://static.crates.io/crates/wgpu-hal/wgpu-hal-$ver.crate" -OutFile wgpu-hal.crate
+          tar -xzf wgpu-hal.crate
+          New-Item -ItemType Directory -Force vendor | Out-Null
+          Move-Item "wgpu-hal-$ver" vendor/wgpu-hal
+
+          $file = 'vendor/wgpu-hal/src/dx12/instance.rs'
+          $text = Get-Content $file -Raw
+          $note = @(
+            '        // IDXGIFactoryMedia is made through the legacy CreateDXGIFactory1. ReShade hooks',
+            '        // that legacy export and the process dies with an access violation inside dxgi.dll,',
+            '        // so it is not asked for here. It is optional to wgpu (upstream wraps the call in',
+            '        // .ok()) and is only used for CreateSwapChainForCompositionSurfaceHandle, which',
+            '        // openOMSI never makes.',
+            '        let factory_media: Option<Dxgi::IDXGIFactoryMedia> = None;',
+            '        let _ = &lib_dxgi;'
+          ) -join "`n"
+          $pattern = '(?m)^[ \t]*// Create IDXGIFactoryMedia\r?\n[ \t]*let factory_media = lib_dxgi\.create_factory_media\(\)\.ok\(\);'
+          $patched = $text -replace $pattern, $note
+          if ($patched -eq $text) {
+            throw 'the line to patch is not in wgpu-hal any more - look at the workaround before releasing'
+          }
+          Set-Content $file $patched -NoNewline
+
+          Add-Content Cargo.toml "`n# Lets ReShade load: see vendor/wgpu-hal/src/dx12/instance.rs`n[patch.crates-io]`nwgpu-hal = { path = `"vendor/wgpu-hal`" }`n"
+
+      # No --locked here: the [patch.crates-io] entry above changes Cargo.lock, so the build
+      # has to be allowed to record that (one entry, wgpu-hal's source).
+      - name: Build
+        shell: pwsh
+        run: |
+          cargo build --release --target $env:TARGET -p omsi-app -p omsi-launcher-core
+          if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+          New-Item -ItemType Directory -Force dist/windows | Out-Null
+          Copy-Item "target/$env:TARGET/release/openomsi.exe", "target/$env:TARGET/release/openomsi-launcher.exe" dist/windows/
+          Get-ChildItem dist/windows
+
+      # Microsoft's shader compiler for DirectX 12 (dxcompiler.dll, dxil.dll beside the
+      # program): without it wgpu falls back to the old FXC, which is slow and refuses some
+      # of the game's shaders. The archive has to carry it, because an update removes the
+      # program files an earlier one installed that the new archive no longer has.
+      - name: DirectX shader compiler
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R microsoft/DirectXShaderCompiler --pattern "dxc_*.zip" -D dxc
+          $zip = Get-ChildItem dxc/*.zip | Where-Object { $_.Name -notmatch "linux|pdb" } | Select-Object -First 1
+          Expand-Archive $zip.FullName -DestinationPath dxc/x
+          Copy-Item "dxc/x/bin/x64/dxcompiler.dll", "dxc/x/bin/x64/dxil.dll" dist/windows/
+          Get-ChildItem dist/windows
+
+      # The Visual C++ runtime beside the program (Microsoft allows it to be shipped
+      # app-locally): without it a PC lacking the Redistributable refuses to start the game.
+      - name: Visual C++ runtime
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1
+          $dir = if ($crt) { $crt.FullName } else { "$env:SystemRoot\System32" }
+          foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
+            Copy-Item (Join-Path $dir $dll) dist/windows/
+          }
+          Get-ChildItem dist/windows
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "openOMSI-$env:OPENOMSI_VERSION-windows-x64"
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item README.md, LICENSE dist/windows/
+          Compress-Archive -Path dist/windows/* -DestinationPath "out/$name.zip"
+          Get-ChildItem out
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version="$OPENOMSI_VERSION"
+          tag="v$version"
+          notes="**openOMSI $version** (this fork: the Windows build with the ReShade workaround)
+
+          The project's own release notes for this commit are on
+          https://github.com/openOMSI-Project/openOMSI/releases."
+          git tag -f "$tag" "$GITHUB_SHA"
+          git push -f origin "$tag"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" out/*.zip --clobber
+            gh release edit "$tag" --title "openOMSI $version" --notes "$notes"
+          else
+            gh release create "$tag" out/*.zip --verify-tag --title "openOMSI $version" --notes "$notes"
+          fi
