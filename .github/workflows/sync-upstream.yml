@@ -7,7 +7,9 @@
 # never discards anything and never force-pushes: it merges, or it does nothing at all.
 #
 # A merge that conflicts fails this job and changes nothing, which leaves the newest release
-# where it was: the fork is never left in a state nobody chose. (Then it wants a look by hand.)
+# where it was: the fork is never left in a state nobody chose. The two files both sides always
+# write to settle by themselves (.gitattributes), and a release that will not compile is never
+# published, so all a failed merge costs is one night without a new release.
 name: Sync with the project
 
 on:
