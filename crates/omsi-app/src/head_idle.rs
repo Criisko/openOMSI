@@ -1,9 +1,22 @@
 //! The part of the driver's head that moves when nothing else does.
 //!
 //! A person standing still does not hold their head still: it breathes up and down, shifts
-//! its weight slowly from one side to the other and wanders about the middle. That is what
-//! this is - the sway of a head that has nothing to react to, so the view is never perfectly
-//! frozen while the bus stands at a stop and the player touches nothing.
+//! its weight slowly from one side to the other and leans a little, and it wanders about the
+//! middle while doing it. That is what this is - the sway of a head that has nothing to react
+//! to, so the view is never perfectly frozen while the bus stands at a stop and the player
+//! touches nothing.
+//!
+//! Each of those movements has its own slow rate, and none of the rates is a multiple of
+//! another, so the pattern never lands on itself and the head does not look like a metronome.
+//! The sideways sway and the lean have to be periodic: a movement that only drifts one way and
+//! stops reads as nothing at all, however far it goes - the eye gives up on a slow uniform
+//! slide (the same reason a bus climbing onto a bridge looks level). The long drift is still
+//! there underneath each of them, in a smaller share, so that nothing repeats exactly.
+//!
+//! The vertical movement is the largest - and the one that is really noticed, because it is
+//! the breath. The fore and aft movement is the smallest: from the driver's seat it runs along
+//! the line of sight, so moving by it changes almost nothing on the screen; it is here for the
+//! near field and for the mirrors, which the eye is asked for.
 //!
 //! It is *added* to what the bus's own motion does (OMSI's head movement, `Player::move_head`):
 //! where that is thrown by accelerations and is therefore nothing at a standstill, this goes on
@@ -14,19 +27,19 @@ use glam::Vec3;
 
 /// How far the head wanders at full strength: metres in the bus's frame (across, along, up).
 const SIDE_M: f32 = 0.010;
-const FORE_M: f32 = 0.007;
+const FORE_M: f32 = 0.003;
 const UP_M: f32 = 0.014;
 
 /// The turn it adds to the view at full strength, in degrees.
 const YAW_DEG: f32 = 0.30;
 const PITCH_DEG: f32 = 0.18;
-const ROLL_DEG: f32 = 0.40;
+const ROLL_DEG: f32 = 0.30;
 
-/// The periods of the three slow movements, in seconds: a breath (about fifteen a minute), a
-/// shift of weight, and the long wander of a standing body. They are not multiples of each
-/// other, so the pattern never lands on itself and the head never looks like a metronome.
+/// The periods of the movements, in seconds: a breath (about fifteen a minute), the weight
+/// going from one foot to the other, the body's lean, and the long wander of a standing body.
 const BREATH_S: f32 = 4.1;
-const WEIGHT_S: f32 = 7.3;
+const WEIGHT_S: f32 = 6.4;
+const LEAN_S: f32 = 5.7;
 const WANDER_S: f32 = 13.1;
 
 /// Where the head is and how it is turned on its own at one instant.
@@ -60,21 +73,31 @@ impl HeadIdle {
         }
         self.time += dt.clamp(0.0, 0.1);
         let t = self.time;
-        let breathe = (std::f32::consts::TAU * t / BREATH_S).sin();
         self.offset = Vec3::new(
-            SIDE_M * strength * (wander(t, WEIGHT_S, 11) * 0.7 + wander(t, WANDER_S, 12) * 0.3),
+            // the weight from one foot to the other: the sideways sway, slow enough not to be
+            // a step, and with a drift under it so that it never comes back to the same place
+            SIDE_M * strength * (wave(t, WEIGHT_S, 0.35) * 0.75 + wander(t, WANDER_S, 12) * 0.25),
+            // fore and aft: the smallest of the three (see the note at the top of the file)
             FORE_M * strength * wander(t, WANDER_S, 13),
-            UP_M * strength * (breathe * 0.6 + wander(t, BREATH_S, 14) * 0.4),
+            // the breath, the one movement that is really periodic, and the largest
+            UP_M * strength * (wave(t, BREATH_S, 0.0) * 0.6 + wander(t, BREATH_S, 14) * 0.4),
         );
         self.yaw = YAW_DEG * strength * wander(t, WANDER_S, 15);
         self.pitch = PITCH_DEG * strength * wander(t, WEIGHT_S, 16);
-        self.roll = ROLL_DEG * strength * (wander(t, WEIGHT_S, 17) * 0.6 + wander(t, WANDER_S, 18) * 0.4);
+        // the lean: a horizon only just tilting, at its own rate
+        self.roll = ROLL_DEG * strength * (wave(t, LEAN_S, 0.6) * 0.7 + wander(t, WANDER_S, 17) * 0.3);
     }
 
     /// The head is where it began: nothing is added to the view at all.
     pub(crate) fn is_still(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// A slow, even wave in -1..1 that depends on the time alone. `phase` is a share of the
+/// period, so that several waves do not all start from the same point.
+fn wave(t: f32, period: f32, phase: f32) -> f32 {
+    (std::f32::consts::TAU * (t / period + phase)).sin()
 }
 
 /// A smooth wander in -1..1 that depends on the time alone: one value every `period` seconds,
@@ -155,6 +178,22 @@ mod tests {
         assert!(high - low > SIDE_M, "range {low}..{high}");
         // and it stays around the middle: no walking off to one side
         assert!((sum / frames as f32).abs() < SIDE_M * 0.25, "mean {}", sum / frames as f32);
+    }
+
+    #[test]
+    fn the_sideways_sway_comes_back() {
+        // (a movement that only drifts one way reads as nothing at all, however far it goes:
+        // the sideways sway has to turn round again and again for the eye to catch it)
+        let mut head = HeadIdle::default();
+        let (mut changes, mut before) = (0, 0.0f32);
+        for _ in 0..(60.0 * 60.0) as u32 {
+            head.step(1.0 / 60.0, 1.0);
+            if before != 0.0 && head.offset.x.signum() != before.signum() {
+                changes += 1;
+            }
+            before = head.offset.x;
+        }
+        assert!(changes >= 10, "the sideways sway turned round {changes} times in a minute");
     }
 
     #[test]
