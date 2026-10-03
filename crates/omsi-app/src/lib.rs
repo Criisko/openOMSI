@@ -486,6 +486,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         hover: None,
         hover_part: None,
         hover_hand: false,
+        head_idle_hold: Default::default(),
         input_script: parse_input_script(),
         shot: None,
         paused: false,

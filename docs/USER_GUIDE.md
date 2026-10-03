@@ -237,7 +237,8 @@ lock to lock, 900° by default) and `wheel_lock` (how far it is turned for the b
 lock; 0 = the whole wheel, as OMSI), `fov` (degrees for the views from the bus; 0 = the bus's
 own cameras), `head_idle` (0..1, 0 by default: how far the view sways on its own - a head at
 rest breathes and shifts its weight, and 0 of it is exactly as OMSI; most of it is seen while
-the bus waits at a stop), `collision_objects` (walls, poles and bridges stop the bus; off is OMSI's `no_collision`
+the bus waits at a stop) and `head_idle_pace` (0.5..2: how fast that sway moves, 1 being the
+pace it is designed at), `collision_objects` (walls, poles and bridges stop the bus; off is OMSI's `no_collision`
 option and is taken from OMSI's options when openOMSI starts the first time), `graphics_api`
 (`auto`, `vulkan`, `dx12` on Windows, `gl`: which graphics interface the game asks first -
 with `auto` Vulkan, then DirectX 12, then OpenGL), `ctrl_off` (game controllers switched off

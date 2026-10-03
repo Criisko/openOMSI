@@ -1360,10 +1360,11 @@ impl Player {
 
     /// The head of someone who is doing nothing at all: a standing body breathes and shifts
     /// its weight, so the view is never quite still while the bus waits at a stop (Settings ->
-    /// idle head sway, off by default). `strength` is how much of the sway is asked for.
+    /// idle head sway, off by default). `strength` is how much of the sway is asked for and
+    /// `pace` how fast it is to move, against the pace it is designed at.
     /// Nothing of it is written into `head`: the springs above stay the bus's business alone.
-    pub(crate) fn move_head_idle(&mut self, dt: f32, strength: f32) {
-        self.head_idle.step(dt, strength);
+    pub(crate) fn move_head_idle(&mut self, dt: f32, strength: f32, pace: f32) {
+        self.head_idle.step(dt, strength, pace);
     }
 
     /// Where the driver's eye is in the bus's frame: the head OMSI's head movement throws

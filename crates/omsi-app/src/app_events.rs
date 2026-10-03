@@ -893,7 +893,14 @@ impl ApplicationHandler for App {
                         // into the springs above. Nothing of it while a headset or a real
                         // head tracker moves the head - that head is not a still one)
                         let idle = if vr_on || (self.settings.head_tracking && self.headtrack.is_some()) { 0.0 } else { self.settings.head_idle };
-                        p.move_head_idle(dt, idle);
+                        // (a switch under the cursor is a hand reaching for it, and a view that
+                        // goes on sliding under the pointer is a view that misses what it was
+                        // reaching for. Held, not reset: the camera stays where it is, which is
+                        // where any camera is while the player is busy with something)
+                        let reaching = idle > 0.0 && (self.hover.is_some() || self.hover_hand);
+                        if !self.head_idle_hold.step(dt, reaching) {
+                            p.move_head_idle(dt, idle, self.settings.head_idle_pace);
+                        }
                         if let Some(w) = self.world.as_ref() {
                             crate::rail_drive::frame(p, self.traffic.as_ref().map(|t| &t.net), w, dt);
                         }
