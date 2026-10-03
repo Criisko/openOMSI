@@ -1,0 +1,2939 @@
+From 6eeaff78eb53ef55206fef2d0a3f64ff53dd59f3 Mon Sep 17 00:00:00 2001
+From: Nussaccino <1345551+Nussaccino@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 20:13:13 +0200
+Subject: [PATCH] DLSS Super Resolution and DLAA through NVIDIA Streamline
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Settings → Graphics → Anti-aliasing → DLSS / DLAA, with its quality (DLAA,
+Quality, Balanced, Performance, Ultra performance) in the render scale's row,
+and the same in the game menu's Options → Graphics, where another quality is
+taken at once; `dlss=` in settings.cfg, OMSI_DLSS to override. Windows,
+DirectX 12 (taken when DLSS is on) and a GeForce RTX: Streamline's DLLs are
+loaded at run time from beside the game (or OMSI_STREAMLINE_DIR), nothing of
+NVIDIA's is linked or shipped. Without them, or on another card or graphics
+API, the picture is drawn as before, with the MSAA the settings hold.
+
+- dlss.rs: Streamline 2.14's C layout in Rust (sizes checked at compile
+  time); DLSS recorded into a D3D12 command list of ours on wgpu's queue
+  between the scene's submit and the HUD's; a swap chain that presents
+  nothing, so that Streamline's end-of-frame bookkeeping runs with manual
+  hooking
+- the projection jittered (Halton 2,3); the depth prepass writes motion
+  vectors - the camera's and every object's, from last frame's model
+  matrices - with the same depth as the main pass (vs_main's vertex shared).
+  The motion passes are in dlss_motion.wgsl, in the scene module only where
+  its arrays are storage buffers (never on the chips reading them from
+  textures)
+- the rain films' drops get their pane's motion and DLSS's BiasCurrentColor
+  mask: they neither streak nor show twice once DLSS scales up
+- DLSS's result decoded from sRGB on its way into an sRGB window
+---
+ Cargo.lock                              |   2 +
+ crates/omsi-app/locales/app.yml         | 182 +++++
+ crates/omsi-app/src/game_lists.rs       |  46 +-
+ crates/omsi-app/src/launcher/mod.rs     |   4 +-
+ crates/omsi-app/src/launcher/pages.rs   |  49 +-
+ crates/omsi-app/src/settings.rs         |  40 +-
+ crates/omsi-app/src/startup.rs          |   3 +-
+ crates/omsi-launcher-core/src/lib.rs    |  28 +-
+ crates/omsi-render/Cargo.toml           |   5 +-
+ crates/omsi-render/src/dlss.rs          | 973 ++++++++++++++++++++++++
+ crates/omsi-render/src/dlss_motion.wgsl | 155 ++++
+ crates/omsi-render/src/lib.rs           | 741 +++++++++++++++++-
+ crates/omsi-render/src/shader.wgsl      |  45 +-
+ crates/omsi-render/src/upscale.wgsl     |  14 +-
+ docs/USER_GUIDE.md                      |  21 +
+ 15 files changed, 2233 insertions(+), 75 deletions(-)
+ create mode 100644 crates/omsi-render/src/dlss.rs
+ create mode 100644 crates/omsi-render/src/dlss_motion.wgsl
+
+diff --git a/Cargo.lock b/Cargo.lock
+index bfa3b09..8306950 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3414,7 +3414,9 @@ dependencies = [
+  "pollster",
+  "rayon",
+  "wgpu",
++ "wgpu-hal",
+  "windows 0.62.2",
++ "windows-core 0.62.2",
+  "winit",
+ ]
+ 
+diff --git a/crates/omsi-app/locales/app.yml b/crates/omsi-app/locales/app.yml
+index 32df4cb..a91b952 100644
+--- a/crates/omsi-app/locales/app.yml
++++ b/crates/omsi-app/locales/app.yml
+@@ -19213,6 +19213,162 @@ _version: 2
+ "Placing given up":
+   pt: "Posicionamento cancelado"
+   pt-pt: "Colocação cancelada"
++"DLSS / DLAA":
++  ru: "DLSS / DLAA"
++  de: "DLSS / DLAA"
++  fr: "DLSS / DLAA"
++  uk: "DLSS / DLAA"
++  be: "DLSS / DLAA"
++  kk: "DLSS / DLAA"
++  pl: "DLSS / DLAA"
++  cs: "DLSS / DLAA"
++  hu: "DLSS / DLAA"
++  es: "DLSS / DLAA"
++  pt: "DLSS / DLAA"
++  pt-pt: "DLSS / DLAA"
++  it: "DLSS / DLAA"
++  nl: "DLSS / DLAA"
++  tr: "DLSS / DLAA"
++  ja: "DLSS / DLAA"
++  zh: "DLSS / DLAA"
++  hi: "DLSS / DLAA"
++  zh-tw: "DLSS / DLAA"
++  ko: "DLSS / DLAA"
++  th: "DLSS / DLAA"
++  vi: "DLSS / DLAA"
++  id: "DLSS / DLAA"
++  ms: "DLSS / DLAA"
++  tl: "DLSS / DLAA"
++"DLSS quality":
++  ru: "Качество DLSS"
++  de: "DLSS-Qualität"
++  fr: "Qualité DLSS"
++  uk: "Якість DLSS"
++  be: "Якасць DLSS"
++  kk: "DLSS сапасы"
++  pl: "Jakość DLSS"
++  cs: "Kvalita DLSS"
++  hu: "DLSS minőség"
++  es: "Calidad de DLSS"
++  pt: "Qualidade do DLSS"
++  pt-pt: "Qualidade do DLSS"
++  it: "Qualità DLSS"
++  nl: "DLSS-kwaliteit"
++  tr: "DLSS kalitesi"
++  ja: "DLSS 品質"
++  zh: "DLSS 质量"
++  hi: "DLSS गुणवत्ता"
++  zh-tw: "DLSS 品質"
++  ko: "DLSS 품질"
++  th: "คุณภาพ DLSS"
++  vi: "Chất lượng DLSS"
++  id: "Kualitas DLSS"
++  ms: "Kualiti DLSS"
++  tl: "Kalidad ng DLSS"
++"DLAA (native resolution)":
++  ru: "DLAA (исходное разрешение)"
++  de: "DLAA (native Auflösung)"
++  fr: "DLAA (résolution native)"
++  uk: "DLAA (рідна роздільність)"
++  be: "DLAA (родная раздзяляльнасць)"
++  kk: "DLAA (төл ажыратымдылық)"
++  pl: "DLAA (natywna rozdzielczość)"
++  cs: "DLAA (nativní rozlišení)"
++  hu: "DLAA (natív felbontás)"
++  es: "DLAA (resolución nativa)"
++  pt: "DLAA (resolução nativa)"
++  pt-pt: "DLAA (resolução nativa)"
++  it: "DLAA (risoluzione nativa)"
++  nl: "DLAA (eigen resolutie)"
++  tr: "DLAA (doğal çözünürlük)"
++  ja: "DLAA (ネイティブ解像度)"
++  zh: "DLAA（原生分辨率）"
++  hi: "DLAA (मूल रिज़ॉल्यूशन)"
++  zh-tw: "DLAA（原生解析度）"
++  ko: "DLAA (기본 해상도)"
++  th: "DLAA (ความละเอียดดั้งเดิม)"
++  vi: "DLAA (độ phân giải gốc)"
++  id: "DLAA (resolusi asli)"
++  ms: "DLAA (resolusi asal)"
++  tl: "DLAA (native na resolusyon)"
++"Quality":
++  ru: "Качество"
++  de: "Qualität"
++  fr: "Qualité"
++  uk: "Якість"
++  be: "Якасць"
++  kk: "Сапа"
++  pl: "Jakość"
++  cs: "Kvalita"
++  hu: "Minőség"
++  es: "Calidad"
++  pt: "Qualidade"
++  pt-pt: "Qualidade"
++  it: "Qualità"
++  nl: "Kwaliteit"
++  tr: "Kalite"
++  ja: "品質"
++  zh: "质量"
++  hi: "गुणवत्ता"
++  zh-tw: "品質"
++  ko: "품질"
++  th: "คุณภาพ"
++  vi: "Chất lượng"
++  id: "Kualitas"
++  ms: "Kualiti"
++  tl: "Kalidad"
++"Balanced":
++  ru: "Баланс"
++  de: "Ausgewogen"
++  fr: "Équilibré"
++  uk: "Баланс"
++  be: "Баланс"
++  kk: "Теңгерімді"
++  pl: "Zrównoważony"
++  cs: "Vyvážený"
++  hu: "Kiegyensúlyozott"
++  es: "Equilibrado"
++  pt: "Equilibrado"
++  pt-pt: "Equilibrado"
++  it: "Bilanciato"
++  nl: "Gebalanceerd"
++  tr: "Dengeli"
++  ja: "バランス"
++  zh: "平衡"
++  hi: "संतुलित"
++  zh-tw: "平衡"
++  ko: "균형"
++  th: "สมดุล"
++  vi: "Cân bằng"
++  id: "Seimbang"
++  ms: "Seimbang"
++  tl: "Balanse"
++"Ultra performance":
++  ru: "Ультрапроизводительность"
++  de: "Ultra-Leistung"
++  fr: "Ultra performance"
++  uk: "Ультрапродуктивність"
++  be: "Ультрапрадукцыйнасць"
++  kk: "Ультра өнімділік"
++  pl: "Ultra wydajność"
++  cs: "Ultra výkon"
++  hu: "Ultra teljesítmény"
++  es: "Ultrarrendimiento"
++  pt: "Ultra desempenho"
++  pt-pt: "Ultra desempenho"
++  it: "Ultra prestazioni"
++  nl: "Ultraprestaties"
++  tr: "Ultra performans"
++  ja: "ウルトラパフォーマンス"
++  zh: "超级性能"
++  hi: "अल्ट्रा परफ़ॉर्मेंस"
++  zh-tw: "超高效能"
++  ko: "울트라 성능"
++  th: "ประสิทธิภาพสูงสุด"
++  vi: "Hiệu năng cực cao"
++  id: "Performa ultra"
++  ms: "Prestasi ultra"
++  tl: "Ultra performance"
+ "Driving":
+   ru: "Вождение"
+   de: "Fahren"
+@@ -21701,3 +21857,29 @@ _version: 2
+   ru: "Наряды этой линии в выбранный день"
+   de: "Umläufe dieser Linie am gewählten Tag"
+   uk: "Наряди цієї лінії в обраний день"
++"Changes at once; DLSS on or off takes effect when the game starts the next time":
++  ru: "Меняется сразу; включение или выключение DLSS действует после следующего запуска игры"
++  de: "Wirkt sofort; DLSS ein- oder ausschalten wirkt beim nächsten Spielstart"
++  fr: "S'applique immédiatement ; activer ou désactiver le DLSS prend effet au prochain démarrage du jeu"
++  uk: "Змінюється одразу; увімкнення чи вимкнення DLSS діє після наступного запуску гри"
++  be: "Змяняецца адразу; уключэнне ці выключэнне DLSS дзейнічае пасля наступнага запуску гульні"
++  kk: "Бірден өзгереді; DLSS қосу немесе өшіру ойын келесі іске қосылғанда күшіне енеді"
++  pl: "Działa od razu; włączenie lub wyłączenie DLSS działa po następnym uruchomieniu gry"
++  cs: "Projeví se ihned; zapnutí nebo vypnutí DLSS se projeví při příštím spuštění hry"
++  hu: "Azonnal érvényes; a DLSS be- vagy kikapcsolása a játék következő indításakor lép életbe"
++  es: "Cambia al instante; activar o desactivar DLSS surte efecto al iniciar el juego la próxima vez"
++  pt: "Muda na hora; ligar ou desligar o DLSS vale a partir da próxima vez que o jogo iniciar"
++  pt-pt: "Muda de imediato; ligar ou desligar o DLSS tem efeito no próximo arranque do jogo"
++  it: "Cambia subito; attivare o disattivare il DLSS ha effetto al prossimo avvio del gioco"
++  nl: "Werkt meteen; DLSS aan- of uitzetten werkt bij de volgende start van het spel"
++  tr: "Hemen değişir; DLSS'i açmak veya kapatmak oyunun bir sonraki başlangıcında etkili olur"
++  ja: "すぐに反映されます。DLSS のオン/オフは次回の起動時に反映されます"
++  zh: "立即生效；开启或关闭 DLSS 将在下次启动游戏时生效"
++  hi: "तुरंत बदलता है; DLSS चालू या बंद करना अगली बार गेम शुरू होने पर लागू होता है"
++  zh-tw: "立即生效；開啟或關閉 DLSS 將在下次啟動遊戲時生效"
++  ko: "즉시 바뀝니다. DLSS 켜기/끄기는 다음에 게임을 시작할 때 적용됩니다"
++  th: "เปลี่ยนทันที การเปิดหรือปิด DLSS จะมีผลเมื่อเริ่มเกมครั้งถัดไป"
++  vi: "Thay đổi ngay; bật hoặc tắt DLSS có hiệu lực khi khởi động trò chơi lần sau"
++  id: "Langsung berubah; menyalakan atau mematikan DLSS berlaku saat game dimulai berikutnya"
++  ms: "Berubah serta-merta; menghidupkan atau mematikan DLSS berkuat kuasa apabila permainan dimulakan semula"
++  tl: "Agad na nagbabago; ang pag-on o pag-off ng DLSS ay may bisa sa susunod na pagsisimula ng laro"
+diff --git a/crates/omsi-app/src/game_lists.rs b/crates/omsi-app/src/game_lists.rs
+index 1e91602..19c10c9 100644
+--- a/crates/omsi-app/src/game_lists.rs
++++ b/crates/omsi-app/src/game_lists.rs
+@@ -1578,9 +1578,23 @@ pub(crate) fn dropdown_apply(app: &mut App, action: &str) {
+             }
+         }
+         "pick" => {
+-            if let Some((key, value)) = arg.split_once(' ') {
+-                remember_setting(key, value);
+-                reload_settings(app);
++            match arg.split_once(' ') {
++                Some(("aa", "dlss")) => {
++                    if !dlss_on(&settings_file()) {
++                        remember_setting("dlss", "quality");
++                    }
++                    reload_settings(app);
++                }
++                Some(("aa", msaa)) => {
++                    remember_setting("dlss", "off");
++                    remember_setting("msaa", msaa);
++                    reload_settings(app);
++                }
++                Some((key, value)) => {
++                    remember_setting(key, value);
++                    reload_settings(app);
++                }
++                None => {}
+             }
+         }
+         "preset" => {
+@@ -1672,6 +1686,11 @@ fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
+         "graphics" => vec![("vanilla", "Vanilla (as OMSI 2)"), ("vanilla_plus", "Vanilla+"), ("enhanced", "Enhanced")],
+         "msaa" => vec![("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA"), ("8", "8x MSAA")],
+         "render_scale" => vec![("auto", "Auto"), ("1", "100%"), ("0.85", "85%"), ("0.75", "75%"), ("0.67", "67%"), ("0.5", "50%")],
++        // anti-aliasing as the launcher's settings have it: MSAA (`msaa`), or NVIDIA DLSS
++        // (`dlss`, Windows: it needs DirectX 12) with its quality in a row of its own
++        "aa" if cfg!(windows) => vec![("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA"), ("8", "8x MSAA"), ("dlss", "DLSS / DLAA")],
++        "aa" => select_options("msaa"),
++        "dlss" if cfg!(windows) => vec![("dlaa", "DLAA (native resolution)"), ("quality", "Quality"), ("balanced", "Balanced"), ("performance", "Performance"), ("ultra_performance", "Ultra performance")],
+         "anisotropy" => vec![("1", "Off"), ("2", "2x"), ("4", "4x"), ("8", "8x")],
+         "shadow_size" => vec![("1024", "1024"), ("2048", "2048"), ("4096", "4096")],
+         "shadow_casters" => vec![("all", "Every solid mesh"), ("omsi", "[shadow] meshes, as OMSI")],
+@@ -1700,11 +1719,20 @@ fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
+ 
+ fn select_state(file: &serde_json::Value, key: &str) -> (Vec<(&'static str, &'static str)>, Option<usize>, String) {
+     let options = select_options(key);
+-    let cur = value_text(file.get(key).unwrap_or(&serde_json::Value::Null));
++    let cur = match key {
++        "aa" if dlss_on(file) => "dlss".to_string(),
++        "aa" => value_text(file.get("msaa").unwrap_or(&serde_json::Value::Null)),
++        _ => value_text(file.get(key).unwrap_or(&serde_json::Value::Null)),
++    };
+     let at = options.iter().position(|o| same_value(o.0, &cur));
+     (options, at, cur)
+ }
+ 
++/// Whether the settings file asks for NVIDIA DLSS (Windows only).
++fn dlss_on(file: &serde_json::Value) -> bool {
++    cfg!(windows) && file.get("dlss").and_then(|v| v.as_str()).is_some_and(|m| m != "off")
++}
++
+ fn select_row(file: &serde_json::Value, key: &str, name: &str, desc: &str) -> Option<(String, String)> {
+     let (options, at, cur) = select_state(file, key);
+     if options.is_empty() {
+@@ -1753,6 +1781,10 @@ fn reload_settings(app: &mut App) {
+ }
+ 
+ fn sync_live(app: &mut App) {
++    // (another DLSS quality is taken at once; DLSS on or off with the next start)
++    if let Some(r) = app.renderer.as_mut() {
++        r.set_dlss_mode(app.settings.dlss_mode());
++    }
+     let s = &app.settings;
+     crate::startup::SOUND_AI.store(s.vol_ai.to_bits(), std::sync::atomic::Ordering::Relaxed);
+     crate::startup::SOUND_SCENERY.store(s.vol_scenery.to_bits(), std::sync::atomic::Ordering::Relaxed);
+@@ -1778,6 +1810,7 @@ fn options_pages(app: &App) -> Vec<Page> {
+     let pct = |v: f32| format!("{:.0} %", v * 100.0);
+     let cm = |v: f32| format!("{:+.0} cm", v * 100.0);
+     let later = "Takes effect when the game starts the next time";
++    let dlss_on = dlss_on(&file);
+     let game: Vec<(String, String)> = vec![
+         switch_row(app, "navigator", "Navigator", "Enables/Disables the Minimap"),
+         switch_row(app, "nav_ai", "AI vehicles on the map", "Shows/hides the other (AI) vehicles on the Minimap and the city map"),
+@@ -1802,8 +1835,9 @@ fn options_pages(app: &App) -> Vec<Page> {
+     let graphics: Vec<(String, String)> = vec![
+         preset_row(&file, "Quality preset", "Sets most of the graphics options at once"),
+         pick("graphics", "Graphics", later),
+-        pick("msaa", "Anti-aliasing", later),
+-        pick("render_scale", "Render scale", later),
++        pick("aa", "Anti-aliasing", later),
++        // (DLSS draws at the size its quality asks for: it takes the render scale's row)
++        if dlss_on { pick("dlss", "DLSS quality", "Changes at once; DLSS on or off takes effect when the game starts the next time") } else { pick("render_scale", "Render scale", later) },
+         pick("anisotropy", "Anisotropic", later),
+         switch_row(app, "shadows", "Sun shadows", "Enables/Disabled shadows"),
+         pick("shadow_size", "Shadow map", later),
+diff --git a/crates/omsi-app/src/launcher/mod.rs b/crates/omsi-app/src/launcher/mod.rs
+index 9563e0b..854da82 100644
+--- a/crates/omsi-app/src/launcher/mod.rs
++++ b/crates/omsi-app/src/launcher/mod.rs
+@@ -1311,5 +1311,5 @@ impl Launcher {
+ /// The showroom's renderer: a bus on a floor needs none of the game's costly passes - no
+ /// ambient occlusion, a small shadow map, 4x MSAA for the edges whatever the game uses.
+ fn showroom_options(settings: &crate::settings::Settings) -> omsi_render::RenderOptions {
+-    omsi_render::RenderOptions { msaa: 4, ssao: false, shadow_size: 1024, render_scale: 1.0, ..settings.render_options() }
+-}
+\ No newline at end of file
++    omsi_render::RenderOptions { msaa: 4, ssao: false, shadow_size: 1024, render_scale: 1.0, dlss: omsi_render::DlssMode::Off, ..settings.render_options() }
++}
+diff --git a/crates/omsi-app/src/launcher/pages.rs b/crates/omsi-app/src/launcher/pages.rs
+index 61d6697..2d6129d 100644
+--- a/crates/omsi-app/src/launcher/pages.rs
++++ b/crates/omsi-app/src/launcher/pages.rs
+@@ -284,6 +284,46 @@ fn sel_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, name: &str, r: Rect,
+     }
+ }
+ 
++/// Whether the settings ask for NVIDIA DLSS (Windows only: it needs DirectX 12).
++fn dlss_on(s: &Value) -> bool {
++    cfg!(windows) && get(s, "dlss").as_str().is_some_and(|m| m != "off")
++}
++
++/// Anti-aliasing: MSAA (`msaa`) or NVIDIA DLSS / DLAA (`dlss`, its quality in a row of its
++/// own). DLSS leaves `msaa` as it was: a machine that cannot do DLSS draws with that.
++fn aa_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, r: Rect) {
++    ui.label(Rect::new(r.x, r.y, r.w * 0.45, r.h), "Anti-aliasing");
++    let mut options: Vec<(&str, &str)> = vec![("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA"), ("8", "8x MSAA")];
++    if cfg!(windows) {
++        options.push(("dlss", "DLSS / DLAA"));
++    }
++    let cur = if dlss_on(s) {
++        "dlss".to_string()
++    } else {
++        match get(s, "msaa") {
++            Value::Number(n) => n.as_i64().unwrap_or(4).to_string(),
++            Value::String(x) => x.clone(),
++            _ => "4".to_string(),
++        }
++    };
++    let labels: Vec<String> = options.iter().map(|o| o.1.to_string()).collect();
++    let mut sel = options.iter().position(|o| o.0 == cur).unwrap_or(0);
++    if ui.select("s-msaa", Rect::new(r.x + r.w * 0.45, r.y, r.w * 0.55, r.h), &mut sel, &labels) {
++        match options[sel].0 {
++            "dlss" => {
++                if !dlss_on(s) {
++                    s["dlss"] = json!("quality");
++                }
++            }
++            v => {
++                s["dlss"] = json!("off");
++                s["msaa"] = json!(v.parse::<i64>().unwrap_or(1));
++            }
++        }
++        *dirty = 0.3;
++    }
++}
++
+ fn toggle_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, r: Rect, label: &str, key: &str) {
+     let mut v = get(s, key).as_bool().unwrap_or(false);
+     if ui.toggle(&format!("set-{key}"), r, &mut v, label) {
+@@ -539,8 +579,13 @@ fn graphics_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) ->
+     sel_setting(ui, s, dirty, "s-graphics", c.row(), "Graphics", "graphics", &[("vanilla", "Vanilla (as OMSI 2)"), ("vanilla_plus", "Vanilla+"), ("enhanced", "Enhanced")]);
+     // Vanilla draws what OMSI 2 draws: no sun shadows, ambient occlusion or detail grain
+     let classic = get(s, "graphics").as_str() == Some("vanilla");
+-    sel_setting(ui, s, dirty, "s-msaa", c.row(), "Anti-aliasing", "msaa", &[("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA"), ("8", "8x MSAA")]);
+-    sel_setting(ui, s, dirty, "s-scale", c.row(), "Render scale", "render_scale", &[("auto", "Auto"), ("1", "100%"), ("0.85", "85%"), ("0.75", "75%"), ("0.67", "67%"), ("0.5", "50%")]);
++    aa_setting(ui, s, dirty, c.row());
++    // DLSS draws the picture at the size its quality asks for: it takes the render scale's row
++    if dlss_on(s) {
++        sel_setting(ui, s, dirty, "s-dlss", c.row(), "DLSS quality", "dlss", &[("dlaa", "DLAA (native resolution)"), ("quality", "Quality"), ("balanced", "Balanced"), ("performance", "Performance"), ("ultra_performance", "Ultra performance")]);
++    } else {
++        sel_setting(ui, s, dirty, "s-scale", c.row(), "Render scale", "render_scale", &[("auto", "Auto"), ("1", "100%"), ("0.85", "85%"), ("0.75", "75%"), ("0.67", "67%"), ("0.5", "50%")]);
++    }
+     sel_setting(ui, s, dirty, "s-af", c.row(), "Anisotropic", "anisotropy", &[("1", "Off"), ("2", "2x"), ("4", "4x"), ("8", "8x"), ("16", "16x")]);
+     if !classic {
+         sel_setting(ui, s, dirty, "s-shadow", c.row(), "Shadow map", "shadow_size", &[("1024", "1024"), ("2048", "2048"), ("4096", "4096")]);
+diff --git a/crates/omsi-app/src/settings.rs b/crates/omsi-app/src/settings.rs
+index fc669af..3b8dd6a 100644
+--- a/crates/omsi-app/src/settings.rs
++++ b/crates/omsi-app/src/settings.rs
+@@ -64,6 +64,9 @@ pub struct Settings {
+     pub drive_keys: String,
+     /// Anti-aliasing of the enhanced picture after tone mapping: `fxaa` (default) or `off`.
+     pub post_aa: String,
++    /// NVIDIA DLSS in place of MSAA and the render scale: `off` (default), `dlaa`, `quality`,
++    /// `balanced`, `performance` or `ultra_performance` (see `omsi_render::dlss`).
++    pub dlss: String,
+     /// OMSI's maintenance condition (`[wear_lifespan]`): 0 infinite (no wear), 1 very bad,
+     /// 2 bad, 3 normal, 4 good - the player's bus's `wearlifespan` 1.5e6, 0.01, 0.1, 1, 10
+     ///; AI vehicles never wear.
+@@ -305,7 +308,7 @@ impl Default for Settings {
+ impl Settings {
+     /// The defaults of a computer.
+     fn desktop() -> Self {
+-        Self { msaa: 4, anisotropy: 8, ssao: true, shadows: true, shadow_size: 2048, shadow_blobs: true, navigator: true, ui_opacity: 0.85, notes: true, ui_scale: 1.0, ui_scale_window: true, navigator_corner: "bottom-left".into(), boarding: "auto".into(), detail_textures: true, exact_fare: true, enhanced: false, graphics: "vanilla_plus".into(), vr: false, vr_scale: 0.65, vr_head_smoothing_ms: 0.0, vr_mirror_rate: 16.0, vr_desktop_mirror: true, fullscreen: false, vsync: true, volume: 0.6, drive_keys: "simple".into(), post_aa: "fxaa".into(), render_scale: 0.0, language: "ENG".into(), pax_voices: "all".into(), nav_arrows: false, nav_ai: true, get_up: false, texture_compression: true, texture_memory: 0, auto_clutch: true, momentary_gears: false, auto_shift: false, min_obj_size: 0.013, max_obj_dist: -1.0, max_fps: 0, chat: true, tooltips: true, name_tags: true, show_fps: false, clouds: true, pax_density: 1.0, vol_ai: 1.0, vol_scenery: 1.0, mirror_size: 256, mirror_hud: 0, mirror_refresh: "full".into(), doppler: true, driver: true, maintenance: 0, ai_unsched_factor: 1.0, ai_max_scheduled: 0, ai_max_parked: 0, ai_max_humans: 200, collision_vehicles: true, collision_objects: true, collision_pedestrians: true, head_movement: true, driverview_smooth: true, hands_in_cab: false, alt_view: true, time_speed: 1.0, time_sync: false, metar_sync: false, metar_station: String::new(), machine_translation: false, shadow_casters: "all".into(), ctrl_deadzone: 0.0, ctrl_off: String::new(), steering_linear: false, old_steering: false, red_steer_spd: false, reflections: true, led_glow: 6, led_mips: 1.3, mouse_sens: 1.0, graphics_api: "auto".into(), ff_invert: false, ff_enabled: true, brake_hold: true, mouse_steering: false, mouse_right_off: false, look_sens: 1.0, blinker_cancel: true, wheel_range: 900.0, wheel_lock: 0.0, fov: 0.0, camera_collision: true, steer_look: false, steer_look_angle: 30.0, steer_look_response: 0.25, pedal_throttle: 1.0, pedal_brake: 1.0, seat: [0.0; 3], head_tracking: false, head_tracking_port: 4242, head_tracking_invert: String::new(), discord_status: true, discord_app_id: String::new() }
++        Self { msaa: 4, anisotropy: 8, ssao: true, shadows: true, shadow_size: 2048, shadow_blobs: true, navigator: true, ui_opacity: 0.85, notes: true, ui_scale: 1.0, ui_scale_window: true, navigator_corner: "bottom-left".into(), boarding: "auto".into(), detail_textures: true, exact_fare: true, enhanced: false, graphics: "vanilla_plus".into(), vr: false, vr_scale: 0.65, vr_head_smoothing_ms: 0.0, vr_mirror_rate: 16.0, vr_desktop_mirror: true, fullscreen: false, vsync: true, volume: 0.6, drive_keys: "simple".into(), post_aa: "fxaa".into(), dlss: "off".into(), render_scale: 0.0, language: "ENG".into(), pax_voices: "all".into(), nav_arrows: false, nav_ai: true, get_up: false, texture_compression: true, texture_memory: 0, auto_clutch: true, momentary_gears: false, auto_shift: false, min_obj_size: 0.013, max_obj_dist: -1.0, max_fps: 0, chat: true, tooltips: true, name_tags: true, show_fps: false, clouds: true, pax_density: 1.0, vol_ai: 1.0, vol_scenery: 1.0, mirror_size: 256, mirror_hud: 0, mirror_refresh: "full".into(), doppler: true, driver: true, maintenance: 0, ai_unsched_factor: 1.0, ai_max_scheduled: 0, ai_max_parked: 0, ai_max_humans: 200, collision_vehicles: true, collision_objects: true, collision_pedestrians: true, head_movement: true, driverview_smooth: true, hands_in_cab: false, alt_view: true, time_speed: 1.0, time_sync: false, metar_sync: false, metar_station: String::new(), machine_translation: false, shadow_casters: "all".into(), ctrl_deadzone: 0.0, ctrl_off: String::new(), steering_linear: false, old_steering: false, red_steer_spd: false, reflections: true, led_glow: 6, led_mips: 1.3, mouse_sens: 1.0, graphics_api: "auto".into(), ff_invert: false, ff_enabled: true, brake_hold: true, mouse_steering: false, mouse_right_off: false, look_sens: 1.0, blinker_cancel: true, wheel_range: 900.0, wheel_lock: 0.0, fov: 0.0, camera_collision: true, steer_look: false, steer_look_angle: 30.0, steer_look_response: 0.25, pedal_throttle: 1.0, pedal_brake: 1.0, seat: [0.0; 3], head_tracking: false, head_tracking_port: 4242, head_tracking_invert: String::new(), discord_status: true, discord_app_id: String::new() }
+     }
+ }
+ 
+@@ -315,6 +318,13 @@ impl Settings {
+         cfg!(windows) && (self.vr || omsi_cfg::env::var_os("OMSI_OPENXR").is_some())
+     }
+ 
++    /// DLSS as asked for (`OMSI_DLSS=quality|...|off` overrides the setting): Windows only,
++    /// where it needs DirectX 12.
++    pub fn dlss_mode(&self) -> omsi_render::DlssMode {
++        let mode = omsi_cfg::env::var("OMSI_DLSS").ok().map(|v| omsi_render::DlssMode::parse(&v)).unwrap_or_else(|| omsi_render::DlssMode::parse(&self.dlss));
++        if cfg!(windows) { mode } else { omsi_render::DlssMode::Off }
++    }
++
+     /// `~/.openomsi/settings.cfg` (or `%USERPROFILE%` on Windows).
+     pub fn path() -> Option<PathBuf> {
+         let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+@@ -341,7 +351,7 @@ impl Settings {
+         if let Some(n) = omsi_cfg::env::var("OMSI_SAFE_GPU").ok().and_then(|v| v.parse::<u32>().ok()).filter(|n| *n > 0) {
+             s.apply_safe_gpu(n);
+         }
+-        log::info!("settings from {}: msaa {} af {} ssao {} shadows {} ({}) navigator {} graphics {} post aa {} vsync {} render scale {} boarding {} min object size {} max object distance {} max fps {}", p.display(), s.msaa, s.anisotropy, s.ssao, s.shadows, s.shadow_size, s.navigator, s.graphics, s.post_aa, s.vsync, s.render_scale_text(), s.boarding, s.min_obj_size, s.object_distance(), s.max_fps);
++        log::info!("settings from {}: msaa {} af {} ssao {} shadows {} ({}) navigator {} graphics {} post aa {} dlss {} vsync {} render scale {} boarding {} min object size {} max object distance {} max fps {}", p.display(), s.msaa, s.anisotropy, s.ssao, s.shadows, s.shadow_size, s.navigator, s.graphics, s.post_aa, s.dlss, s.vsync, s.render_scale_text(), s.boarding, s.min_obj_size, s.object_distance(), s.max_fps);
+         s
+     }
+ 
+@@ -488,6 +498,7 @@ impl Settings {
+                 "notes" => s.notes = b(v),
+                 "ui_scale" => s.ui_scale = v.parse::<f32>().ok().filter(|x| x.is_finite()).map(|x| x.clamp(0.5, 2.0)).unwrap_or(s.ui_scale),
+                 "shadow_casters" => s.shadow_casters = if v.eq_ignore_ascii_case("omsi") { "omsi".into() } else { "all".into() },
++                "dlss" => s.dlss = omsi_render::DlssMode::parse(v).as_str().into(),
+                 "post_aa" => s.post_aa = if matches!(v.to_ascii_lowercase().as_str(), "off" | "0" | "none" | "false") { "off".into() } else { "fxaa".into() },
+                 "drive_keys" => s.drive_keys = match v.to_ascii_lowercase().as_str() { "wasd" | "arrows" | "omsi" | "simple" => v.to_ascii_lowercase(), _ => s.drive_keys },
+                 _ => {}
+@@ -522,8 +533,8 @@ impl Settings {
+             SETTINGS_VERSION, self.msaa, self.anisotropy, self.ssao as u8, self.shadows as u8, self.shadow_size, self.shadow_blobs as u8, self.navigator as u8, self.ui_opacity, self.navigator_corner, self.boarding, self.detail_textures as u8, self.exact_fare as u8, self.enhanced as u8, self.graphics, self.vr as u8, self.vr_scale, self.fullscreen as u8, self.vsync as u8, self.volume, self.drive_keys, self.post_aa, self.render_scale_text(), self.language, self.texture_compression as u8, self.texture_memory, self.auto_clutch as u8, self.momentary_gears as u8, self.min_obj_size, if self.max_obj_dist < 0.0 { "auto".to_string() } else { self.max_obj_dist.to_string() }, self.max_fps, self.chat as u8, self.tooltips as u8, self.name_tags as u8, self.show_fps as u8, self.clouds as u8, self.pax_density, self.vol_ai, self.vol_scenery, self.mirror_size, self.mirror_hud, self.mirror_refresh, self.doppler as u8, self.driver as u8, self.driverview_smooth as u8
+         );
+         text.push_str(&format!(
+-            "vr_head_smoothing_ms={}\nvr_mirror_rate={}\nvr_desktop_mirror={}\nled_glow={}\nled_mips={}\nui_scale={}\nui_scale_window={}\nnotes={}\n",
+-            self.vr_head_smoothing_ms, self.vr_mirror_rate, self.vr_desktop_mirror as u8, self.led_glow, self.led_mips, self.ui_scale, self.ui_scale_window as u8, self.notes as u8,
++            "vr_head_smoothing_ms={}\nvr_mirror_rate={}\nvr_desktop_mirror={}\nled_glow={}\nled_mips={}\nui_scale={}\nui_scale_window={}\nnotes={}\ndlss={}\n",
++            self.vr_head_smoothing_ms, self.vr_mirror_rate, self.vr_desktop_mirror as u8, self.led_glow, self.led_mips, self.ui_scale, self.ui_scale_window as u8, self.notes as u8, self.dlss,
+         ));
+         text.push_str(&format!("steer_look={}\nsteer_look_angle={}\nsteer_look_response={}\nlook_sens={}\nblinker_cancel={}\n", self.steer_look as u8, self.steer_look_angle, self.steer_look_response, self.look_sens, self.blinker_cancel as u8));
+         text.push_str(&format!("discord_status={}\ndiscord_app_id={}\n", self.discord_status as u8, self.discord_app_id));
+@@ -557,6 +568,8 @@ impl Settings {
+     pub fn apply_safe_gpu(&mut self, n: u32) {
+         self.msaa = 1;
+         self.ssao = false;
++        // (DLSS's own command lists are the first suspect)
++        self.dlss = "off".into();
+         self.shadow_size = self.shadow_size.min(2048);
+         self.mirror_size = self.mirror_size.min(256);
+         let budget = if self.texture_memory > 0 { self.texture_memory } else { 1200 };
+@@ -572,7 +585,7 @@ impl Settings {
+     }
+ 
+     pub fn render_options(&self) -> omsi_render::RenderOptions {
+-        omsi_render::RenderOptions { msaa: self.msaa, anisotropy: self.anisotropy, shadow_size: self.shadow_size, ssao: self.ssao, render_scale: self.render_scale, compress_textures: self.texture_compression, fxaa: self.post_aa != "off", min_obj_size: self.min_obj_size, max_obj_dist: self.object_distance(), omsi_shadow_casters: self.shadow_casters == "omsi", shadow_blobs: self.shadow_blobs, reflections: self.reflections, no_enhanced: graphics_mode(&self.graphics) != "enhanced" }
++        omsi_render::RenderOptions { msaa: self.msaa, anisotropy: self.anisotropy, shadow_size: self.shadow_size, ssao: self.ssao, render_scale: self.render_scale, compress_textures: self.texture_compression, fxaa: self.post_aa != "off", min_obj_size: self.min_obj_size, max_obj_dist: self.object_distance(), omsi_shadow_casters: self.shadow_casters == "omsi", shadow_blobs: self.shadow_blobs, reflections: self.reflections, no_enhanced: graphics_mode(&self.graphics) != "enhanced", dlss: self.dlss_mode() }
+     }
+ }
+ 
+@@ -698,6 +711,23 @@ mod tests {
+         assert!(Settings::from_text("post_aa=FXAA").render_options().fxaa);
+         assert_eq!(Settings::from_text(&off.to_text()), off);
+     }
++
++    #[test]
++    fn dlss_is_read_and_written() {
++        assert_eq!(Settings::from_text("").dlss, "off");
++        assert_eq!(Settings::from_text("dlss=Ultra Performance\n").dlss, "ultra_performance");
++        assert_eq!(Settings::from_text("dlss=nonsense\n").dlss, "off");
++        let on = Settings::from_text("msaa=4\ndlss=dlaa\n");
++        assert_eq!(on.dlss, "dlaa");
++        // (the renderer drops the MSAA itself; the setting keeps it for a machine without DLSS)
++        assert_eq!(on.msaa, 4);
++        if cfg!(windows) {
++            assert_eq!(on.render_options().dlss, omsi_render::DlssMode::Dlaa);
++        } else {
++            assert_eq!(on.render_options().dlss, omsi_render::DlssMode::Off);
++        }
++        assert_eq!(Settings::from_text(&on.to_text()), on);
++    }
+ }
+ 
+ impl Settings {
+diff --git a/crates/omsi-app/src/startup.rs b/crates/omsi-app/src/startup.rs
+index c6d0853..10c167b 100644
+--- a/crates/omsi-app/src/startup.rs
++++ b/crates/omsi-app/src/startup.rs
+@@ -191,7 +191,8 @@ pub(crate) fn backend_order() -> Vec<wgpu::Backends> {
+         return vec![wgpu::Backends::METAL];
+     }
+     let settings = crate::settings::Settings::load();
+-    let wanted = if settings.vr_requested() {
++    // (the headset and DLSS need DirectX 12: Streamline and OpenXR take wgpu's D3D12 device)
++    let wanted = if settings.vr_requested() || (cfg!(windows) && settings.dlss_mode().is_on()) {
+         "dx12".to_owned()
+     } else {
+         omsi_cfg::env::var("OMSI_BACKEND").ok().unwrap_or(settings.graphics_api)
+diff --git a/crates/omsi-launcher-core/src/lib.rs b/crates/omsi-launcher-core/src/lib.rs
+index 2943107..2e36d9a 100644
+--- a/crates/omsi-launcher-core/src/lib.rs
++++ b/crates/omsi-launcher-core/src/lib.rs
+@@ -1762,6 +1762,19 @@ fn mirror_refresh(x: &str) -> &'static str {
+     }
+ }
+ 
++/// `off`, `dlaa`, `quality`, `balanced`, `performance` or `ultra_performance` from the ways a
++/// file may spell a DLSS mode (as the game's `omsi_render::DlssMode::parse`).
++pub fn dlss_mode(v: &str) -> &'static str {
++    match v.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
++        "dlaa" | "native" => "dlaa",
++        "quality" | "on" | "1" | "true" => "quality",
++        "balanced" => "balanced",
++        "performance" => "performance",
++        "ultra_performance" | "ultraperformance" => "ultra_performance",
++        _ => "off",
++    }
++}
++
+ /// The page's view of a `settings.cfg` text (None: no file yet, the game's defaults).
+ pub fn settings_from_text(text: Option<&str>) -> Value {
+     let mut v = json!({ "msaa": 4, "anisotropy": 8, "ssao": true, "shadows": true, "shadow_size": 2048, "navigator": true, "ui_opacity": 0.85, "navigator_corner": "bottom-left", "boarding": "auto", "detail_textures": true, "exact_fare": true, "enhanced": false, "graphics": "vanilla_plus", "fullscreen": false, "vsync": true, "volume": 0.6, "drive_keys": "simple", "render_scale": "auto", "view_distance": "auto", "language": "ENG", "texture_memory": 0, "texture_compression": true, "chat": true, "tooltips": true, "name_tags": true, "show_fps": false, "clouds": true, "pax_density": 1.0, "vol_ai": 1.0, "vol_scenery": 1.0, "mirror_size": 256, "doppler": true, "driver": true, "max_fps": 0, "min_obj_size": 0.013, "max_obj_dist": "auto" });
+@@ -1782,7 +1795,7 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
+         v[k] = d;
+     }
+     // openOMSI's own: what passengers say, OMSI's route arrows, getting up from the seat
+-    for (k, d) in [("pax_voices", json!("all")), ("nav_arrows", json!(false)), ("nav_ai", json!(true)), ("get_up", json!(false)), ("time_speed", json!("1")), ("time_sync", json!(false)), ("metar_sync", json!(false)), ("metar_station", json!("")), ("machine_translation", json!(false)), ("shadow_casters", json!("all")), ("shadow_blobs", json!(true)), ("reflections", json!(true)), ("mouse_sens", json!(1.0)), ("graphics_api", json!("auto")), ("ctrl_off", json!("")), ("steering_linear", json!(false)), ("old_steering", json!(false)), ("red_steer_spd", json!(false)), ("ff_invert", json!(false)), ("ff_enabled", json!(true)), ("brake_hold", json!(true)), ("auto_clutch", json!(true)), ("momentary_gears", json!(false)), ("wheel_range", json!(900.0)), ("wheel_lock", json!(0.0)), ("fov", json!(0.0)), ("camera_collision", json!(true)), ("steer_look", json!(false)), ("pedal_throttle", json!(1.0)), ("pedal_brake", json!(1.0)), ("seat_x", json!(0.0)), ("seat_y", json!(0.0)), ("seat_z", json!(0.0)), ("head_tracking", json!(false)), ("led_glow", json!(6)), ("led_mips", json!(1.3)), ("ui_scale", json!(1.0)), ("ui_scale_window", json!(true)), ("notes", json!(true)), ("mouse_steering", json!(false)), ("mouse_right_off", json!(false)), ("blinker_cancel", json!(true))] {
++    for (k, d) in [("pax_voices", json!("all")), ("nav_arrows", json!(false)), ("nav_ai", json!(true)), ("get_up", json!(false)), ("time_speed", json!("1")), ("time_sync", json!(false)), ("metar_sync", json!(false)), ("metar_station", json!("")), ("machine_translation", json!(false)), ("shadow_casters", json!("all")), ("shadow_blobs", json!(true)), ("reflections", json!(true)), ("mouse_sens", json!(1.0)), ("graphics_api", json!("auto")), ("ctrl_off", json!("")), ("steering_linear", json!(false)), ("old_steering", json!(false)), ("red_steer_spd", json!(false)), ("ff_invert", json!(false)), ("ff_enabled", json!(true)), ("brake_hold", json!(true)), ("auto_clutch", json!(true)), ("momentary_gears", json!(false)), ("wheel_range", json!(900.0)), ("wheel_lock", json!(0.0)), ("fov", json!(0.0)), ("camera_collision", json!(true)), ("steer_look", json!(false)), ("pedal_throttle", json!(1.0)), ("pedal_brake", json!(1.0)), ("seat_x", json!(0.0)), ("seat_y", json!(0.0)), ("seat_z", json!(0.0)), ("head_tracking", json!(false)), ("led_glow", json!(6)), ("led_mips", json!(1.3)), ("ui_scale", json!(1.0)), ("ui_scale_window", json!(true)), ("notes", json!(true)), ("mouse_steering", json!(false)), ("mouse_right_off", json!(false)), ("blinker_cancel", json!(true)), ("dlss", json!("off"))] {
+         v[k] = d;
+     }
+     v["steer_look_angle"] = json!(30.0);
+@@ -1840,6 +1853,7 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
+             "led_mips" => v[&k] = json!(val.trim().parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| x.clamp(0.0, 4.0)).unwrap_or(1.3)),
+             "led_glow" => v[&k] = json!(val.parse::<i64>().map(|x| x.clamp(0, 15)).unwrap_or(6)),
+             "look_sens" => v[&k] = json!(val.parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| x.clamp(0.1, 2.0)).unwrap_or(1.0)),
++            "dlss" => v[&k] = json!(dlss_mode(val)),
+             "steer_look_angle" => v[&k] = json!(val.parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| x.clamp(0.0, 60.0)).unwrap_or(30.0)),
+             "steer_look_response" => v[&k] = json!(val.parse::<f64>().ok().filter(|x| x.is_finite()).map(|x| x.clamp(0.05, 1.0)).unwrap_or(0.25)),
+             "pedal_throttle" | "pedal_brake" => v[&k] = json!(val.parse::<f64>().map(|x| x.clamp(0.25, 4.0)).unwrap_or(1.0)),
+@@ -2159,6 +2173,8 @@ pub fn settings_to_text(v: &Value, old: Option<&str>) -> String {
+     let vr_head_smoothing_ms = v.get("vr_head_smoothing_ms").and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))).filter(|x| x.is_finite()).unwrap_or(0.0).clamp(0.0, 30.0);
+     let vr_mirror_rate = v.get("vr_mirror_rate").and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))).filter(|x| x.is_finite()).unwrap_or(16.0).clamp(-1.0, 360.0);
+     let text = format!("{text}vr={}\nvr_scale={vr_scale}\nvr_head_smoothing_ms={vr_head_smoothing_ms}\nvr_mirror_rate={vr_mirror_rate}\nvr_desktop_mirror={}\ndiscord_status={}\nlauncher_rest={}\n", b("vr", false), b("vr_desktop_mirror", true), b("discord_status", true), b("launcher_rest", true));
++    // NVIDIA DLSS (the game's `omsi_render::DlssMode`)
++    let text = format!("{text}dlss={}\n", dlss_mode(v.get("dlss").and_then(|x| x.as_str()).unwrap_or("off")));
+     // what the page does not manage (keys of newer games, hand-written ones) stays as it
+     // was in the file; other spellings of the keys just written go
+     let mut text = text;
+@@ -2808,6 +2824,16 @@ mod tests {
+         assert!(text.lines().any(|l| l == "update_check=0") && text.lines().any(|l| l == "update_auto=1"), "{text}");
+     }
+ 
++    #[test]
++    fn dlss_settings_round_trip() {
++        assert_eq!(settings_from_text(None)["dlss"], json!("off"));
++        let v = settings_from_text(Some("msaa=2\ndlss=Balanced\n"));
++        assert_eq!((v["dlss"].clone(), v["msaa"].clone()), (json!("balanced"), json!(2)));
++        let text = settings_to_text(&v, None);
++        assert!(text.lines().any(|l| l == "dlss=balanced") && text.lines().any(|l| l == "msaa=2"), "{text}");
++        assert_eq!(settings_from_text(Some("dlss=what\n"))["dlss"], json!("off"));
++    }
++
+     #[test]
+     fn vr_settings_round_trip() {
+         let mut settings = settings_from_text(None);
+diff --git a/crates/omsi-render/Cargo.toml b/crates/omsi-render/Cargo.toml
+index 7190837..f0f60df 100644
+--- a/crates/omsi-render/Cargo.toml
++++ b/crates/omsi-render/Cargo.toml
+@@ -20,7 +20,10 @@ anyhow.workspace = true
+ winit.workspace = true
+ 
+ [target.'cfg(windows)'.dependencies]
+-windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Foundation"] }
++# (DLSS: NVIDIA Streamline on wgpu's own D3D12 device and queue, see `dlss`)
++windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D12", "Win32_Foundation", "Win32_System_LibraryLoader"] }
++windows-core = "0.62"
++wgpu-hal = { version = "29", features = ["dx12"] }
+ 
+ [dev-dependencies]
+ naga = { version = "29", features = ["spv-out", "glsl-out"] }
+diff --git a/crates/omsi-render/src/dlss.rs b/crates/omsi-render/src/dlss.rs
+new file mode 100644
+index 0000000..472a2cd
+--- /dev/null
++++ b/crates/omsi-render/src/dlss.rs
+@@ -0,0 +1,973 @@
++// The Streamline structures, constants and identifiers below are transcribed from NVIDIA's
++// Streamline SDK headers (https://github.com/NVIDIA-RTX/Streamline), which come under this
++// licence:
++//
++// Copyright (c) 2022-2024 NVIDIA CORPORATION. All rights reserved
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++// SOFTWARE.
++
++//! NVIDIA DLSS Super Resolution and DLAA through NVIDIA Streamline (DirectX 12, GeForce RTX).
++//!
++//! Streamline's interposer (`sl.interposer.dll`) and its plugins (`sl.common.dll`,
++//! `sl.dlss.dll`, NVIDIA's `nvngx_dlss.dll`) are loaded at run time from beside the game (or
++//! `OMSI_STREAMLINE_DIR`): nothing of NVIDIA's is linked into openOMSI or shipped with it, and
++//! a machine without them simply draws as before. The structures below are the C layout of
++//! the Streamline 2.14 headers (`sl_core_types.h`, `sl_consts.h`, `sl_dlss.h`).
++//!
++//! wgpu keeps its own D3D12 command lists; DLSS is recorded into one of ours and executed on
++//! wgpu's queue between the frame's scene submit and its HUD submit (as the OpenXR path
++//! does it), so queue order puts it after the picture it reads and before the HUD drawn
++//! over its result. Streamline is told the state each tagged resource is in (wgpu's legacy
++//! barriers leave it in the one of its last use) and returns it in that state.
++
++#[cfg(not(windows))]
++use anyhow::Result;
++
++/// DLSS quality mode: the share of the window's size the 3D picture is drawn at before DLSS
++/// brings it up to the window (DLAA: the window's own size, DLSS as anti-aliasing only).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub enum DlssMode {
++    #[default]
++    Off,
++    Dlaa,
++    Quality,
++    Balanced,
++    Performance,
++    UltraPerformance,
++}
++
++impl DlssMode {
++    /// The settings' word for a mode (`dlss=` in settings.cfg).
++    pub fn parse(s: &str) -> DlssMode {
++        match s.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
++            "dlaa" | "native" => DlssMode::Dlaa,
++            "quality" | "on" | "1" | "true" => DlssMode::Quality,
++            "balanced" => DlssMode::Balanced,
++            "performance" => DlssMode::Performance,
++            "ultra_performance" | "ultraperformance" => DlssMode::UltraPerformance,
++            _ => DlssMode::Off,
++        }
++    }
++
++    pub fn as_str(self) -> &'static str {
++        match self {
++            DlssMode::Off => "off",
++            DlssMode::Dlaa => "dlaa",
++            DlssMode::Quality => "quality",
++            DlssMode::Balanced => "balanced",
++            DlssMode::Performance => "performance",
++            DlssMode::UltraPerformance => "ultra_performance",
++        }
++    }
++
++    pub fn is_on(self) -> bool {
++        self != DlssMode::Off
++    }
++
++    /// The share of the window's width and height the picture is drawn at when Streamline
++    /// does not say (NVIDIA's published ratios).
++    pub fn scale(self) -> f32 {
++        match self {
++            DlssMode::Off | DlssMode::Dlaa => 1.0,
++            DlssMode::Quality => 0.667,
++            DlssMode::Balanced => 0.58,
++            DlssMode::Performance => 0.5,
++            DlssMode::UltraPerformance => 0.333,
++        }
++    }
++}
++
++/// What DLSS reads and writes this frame: the D3D12 resources behind wgpu's textures.
++pub struct Inputs<'a> {
++    /// The 3D picture at the render size (the renderer's colour format, sRGB).
++    pub color: &'a wgpu::Texture,
++    /// The depth prepass's depth (reversed Z) at the render size.
++    pub depth: &'a wgpu::Texture,
++    /// Motion vectors (Rg32Float, pixels towards the last frame) at the render size.
++    pub motion: &'a wgpu::Texture,
++    /// The `BiasCurrentColor` mask (R8Unorm, 1: the current picture over the history) at
++    /// the render size.
++    pub bias: &'a wgpu::Texture,
++    /// The result at the window's size (Rgba16Float, storage).
++    pub output: &'a wgpu::Texture,
++    pub render_size: (u32, u32),
++    pub output_size: (u32, u32),
++}
++
++/// The camera of this frame for DLSS: every matrix as glam's columns (which are the rows of
++/// Streamline's row-vector matrices), without the jitter.
++pub struct FrameConstants {
++    pub view_to_clip: [[f32; 4]; 4],
++    pub clip_to_view: [[f32; 4]; 4],
++    pub clip_to_prev_clip: [[f32; 4]; 4],
++    pub prev_clip_to_clip: [[f32; 4]; 4],
++    /// The sub-pixel offset the projection was moved by, in pixels.
++    pub jitter: [f32; 2],
++    pub camera_pos: [f32; 3],
++    pub camera_up: [f32; 3],
++    pub camera_right: [f32; 3],
++    pub camera_fwd: [f32; 3],
++    pub near: f32,
++    pub far: f32,
++    /// Vertical field of view (radians).
++    pub fov: f32,
++    pub aspect: f32,
++    /// The history is not the same scene (a jump, a new size, the first frame).
++    pub reset: bool,
++}
++
++#[cfg(windows)]
++pub use imp::Runtime;
++
++#[cfg(not(windows))]
++pub struct Runtime;
++
++#[cfg(not(windows))]
++impl Runtime {
++    pub fn load(_device: &wgpu::Device, _queue: &wgpu::Queue) -> Result<Runtime> {
++        anyhow::bail!("DLSS needs Windows with DirectX 12")
++    }
++    pub fn render_size(&mut self, mode: DlssMode, out: (u32, u32)) -> (u32, u32) {
++        fallback_render_size(mode, out)
++    }
++    pub fn evaluate(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue, _mode: DlssMode, _inputs: &Inputs, _c: &FrameConstants) -> Result<()> {
++        anyhow::bail!("DLSS needs Windows with DirectX 12")
++    }
++}
++
++/// The render size of a mode by NVIDIA's ratios (whole pixels, at least one).
++pub fn fallback_render_size(mode: DlssMode, (w, h): (u32, u32)) -> (u32, u32) {
++    let s = mode.scale();
++    (((w as f32 * s).round() as u32).max(1), ((h as f32 * s).round() as u32).max(1))
++}
++
++#[cfg(windows)]
++mod imp {
++    use super::{fallback_render_size, DlssMode, FrameConstants, Inputs};
++    use anyhow::{anyhow, bail, Context, Result};
++    use std::ffi::{c_char, c_void, CStr};
++    use windows::core::{Interface, PCSTR, PCWSTR};
++    use windows::Win32::Foundation::{FreeLibrary, HANDLE, HMODULE};
++    use windows::Win32::Graphics::Direct3D12::*;
++    use windows::Win32::Graphics::Dxgi::Common::*;
++    use windows::Win32::Graphics::Dxgi::{IDXGIDeviceSubObject_Impl, IDXGIObject_Impl, IDXGIOutput, IDXGISwapChain, IDXGISwapChain_Impl, DXGI_FRAME_STATISTICS, DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_CHAIN_FLAG};
++    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR};
++
++    // --- Streamline 2.14's C layout
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct StructType {
++        data1: u32,
++        data2: u16,
++        data3: u16,
++        data4: [u8; 8],
++    }
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct Base {
++        next: *mut c_void,
++        struct_type: StructType,
++        struct_version: usize,
++    }
++
++    impl Base {
++        const fn new(struct_type: StructType, struct_version: usize) -> Base {
++            Base { next: std::ptr::null_mut(), struct_type, struct_version }
++        }
++    }
++
++    const PREFERENCES: StructType = StructType { data1: 0x1ca10965, data2: 0xbf8e, data3: 0x432b, data4: [0x8d, 0xa1, 0x67, 0x16, 0xd8, 0x79, 0xfb, 0x14] };
++    const RESOURCE: StructType = StructType { data1: 0x3a9d70cf, data2: 0x2418, data3: 0x4b72, data4: [0x83, 0x91, 0x13, 0xf8, 0x72, 0x1c, 0x72, 0x61] };
++    const RESOURCE_TAG: StructType = StructType { data1: 0x4c6a5aad, data2: 0xb445, data3: 0x496c, data4: [0x87, 0xff, 0x1a, 0xf3, 0x84, 0x5b, 0xe6, 0x53] };
++    const VIEWPORT_HANDLE: StructType = StructType { data1: 0x171b6435, data2: 0x9b3c, data3: 0x4fc8, data4: [0x99, 0x94, 0xfb, 0xe5, 0x25, 0x69, 0xaa, 0xa4] };
++    const ADAPTER_INFO: StructType = StructType { data1: 0x0677315f, data2: 0xa746, data3: 0x4492, data4: [0x9f, 0x42, 0xcb, 0x61, 0x42, 0xc9, 0xc3, 0xd4] };
++    const CONSTANTS: StructType = StructType { data1: 0xdcd35ad7, data2: 0x4e4a, data3: 0x4bad, data4: [0xa9, 0x0c, 0xe0, 0xc4, 0x9e, 0xb2, 0x3a, 0xfe] };
++    const DLSS_OPTIONS: StructType = StructType { data1: 0x6ac826e4, data2: 0x4c61, data3: 0x4101, data4: [0xa9, 0x2d, 0x63, 0x8d, 0x42, 0x10, 0x57, 0xb8] };
++    const DLSS_OPTIMAL_SETTINGS: StructType = StructType { data1: 0xef1d0957, data2: 0xfd58, data3: 0x4df7, data4: [0xb5, 0x04, 0x8b, 0x69, 0xd8, 0xaa, 0x6b, 0x76] };
++
++    /// `sl::kSDKVersion` of the headers this layout is taken from (2.14.1).
++    const SDK_VERSION: u64 = (2 << 48) | (14 << 32) | (1 << 16) | 0xfedc;
++    const FEATURE_DLSS: u32 = 0;
++    const BUFFER_DEPTH: u32 = 0;
++    const BUFFER_MOTION_VECTORS: u32 = 1;
++    const BUFFER_SCALING_INPUT_COLOR: u32 = 3;
++    const BUFFER_SCALING_OUTPUT_COLOR: u32 = 4;
++    const BUFFER_BIAS_CURRENT_COLOR_HINT: u32 = 29;
++    /// `ResourceLifecycle::eValidUntilEvaluate`
++    const VALID_UNTIL_EVALUATE: u32 = 2;
++    const FLAG_DISABLE_CL_STATE_TRACKING: u64 = 1 << 0;
++    const FLAG_DISABLE_DEBUG_TEXT: u64 = 1 << 1;
++    const FLAG_USE_MANUAL_HOOKING: u64 = 1 << 2;
++    const FLAG_FRAME_BASED_TAGGING: u64 = 1 << 7;
++    const FALSE: u8 = 0;
++    const TRUE: u8 = 1;
++    /// openOMSI's own project id for NVIDIA's NGX (engine type "custom" asks for one).
++    const PROJECT_ID: &CStr = c"6f3c2a8e-1d4b-4e7a-9c52-0b8d7e1f4a36";
++
++    #[repr(C)]
++    struct Preferences {
++        base: Base,
++        show_console: bool,
++        log_level: u32,
++        paths_to_plugins: *const *const u16,
++        num_paths_to_plugins: u32,
++        path_to_logs_and_data: *const u16,
++        allocate_callback: *const c_void,
++        release_callback: *const c_void,
++        log_message_callback: Option<unsafe extern "C" fn(u32, *const c_char)>,
++        flags: u64,
++        features_to_load: *const u32,
++        num_features_to_load: u32,
++        application_id: u32,
++        engine: u32,
++        engine_version: *const c_char,
++        project_id: *const c_char,
++        render_api: u32,
++    }
++
++    #[repr(C)]
++    struct Resource {
++        base: Base,
++        kind: u8,
++        native: *mut c_void,
++        memory: *mut c_void,
++        view: *mut c_void,
++        state: u32,
++        width: u32,
++        height: u32,
++        native_format: u32,
++        mip_levels: u32,
++        array_layers: u32,
++        gpu_virtual_address: u64,
++        flags: u32,
++        usage: u32,
++        internal_flags: u16,
++        reserved: u16,
++    }
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct Extent {
++        top: u32,
++        left: u32,
++        width: u32,
++        height: u32,
++    }
++
++    #[repr(C)]
++    struct ResourceTag {
++        base: Base,
++        resource: *mut Resource,
++        kind: u32,
++        lifecycle: u32,
++        extent: Extent,
++    }
++
++    #[repr(C)]
++    struct ViewportHandle {
++        base: Base,
++        value: u32,
++    }
++
++    #[repr(C)]
++    struct AdapterInfo {
++        base: Base,
++        device_luid: *mut u8,
++        device_luid_size_in_bytes: u32,
++        vk_physical_device: *mut c_void,
++    }
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct Float2 {
++        x: f32,
++        y: f32,
++    }
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct Float3 {
++        x: f32,
++        y: f32,
++        z: f32,
++    }
++
++    #[repr(C)]
++    struct Constants {
++        base: Base,
++        camera_view_to_clip: [[f32; 4]; 4],
++        clip_to_camera_view: [[f32; 4]; 4],
++        clip_to_lens_clip: [[f32; 4]; 4],
++        clip_to_prev_clip: [[f32; 4]; 4],
++        prev_clip_to_clip: [[f32; 4]; 4],
++        jitter_offset: Float2,
++        mvec_scale: Float2,
++        camera_pinhole_offset: Float2,
++        camera_pos: Float3,
++        camera_up: Float3,
++        camera_right: Float3,
++        camera_fwd: Float3,
++        camera_near: f32,
++        camera_far: f32,
++        camera_fov: f32,
++        camera_aspect_ratio: f32,
++        motion_vectors_invalid_value: f32,
++        depth_inverted: u8,
++        camera_motion_included: u8,
++        motion_vectors_3d: u8,
++        reset: u8,
++        orthographic_projection: u8,
++        motion_vectors_dilated: u8,
++        motion_vectors_jittered: u8,
++        min_relative_linear_depth_object_separation: f32,
++    }
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct DlssOptions {
++        base: Base,
++        mode: u32,
++        output_width: u32,
++        output_height: u32,
++        sharpness: f32,
++        pre_exposure: f32,
++        exposure_scale: f32,
++        color_buffers_hdr: u8,
++        indicator_invert_axis_x: u8,
++        indicator_invert_axis_y: u8,
++        dlaa_preset: u32,
++        quality_preset: u32,
++        balanced_preset: u32,
++        performance_preset: u32,
++        ultra_performance_preset: u32,
++        ultra_quality_preset: u32,
++        use_auto_exposure: u8,
++        alpha_upscaling_enabled: u8,
++    }
++
++    #[repr(C)]
++    #[derive(Default)]
++    struct DlssOptimalSettings {
++        optimal_render_width: u32,
++        optimal_render_height: u32,
++        optimal_sharpness: f32,
++        render_width_min: u32,
++        render_height_min: u32,
++        render_width_max: u32,
++        render_height_max: u32,
++    }
++
++    #[repr(C)]
++    struct DlssOptimalSettingsS {
++        base: Base,
++        s: DlssOptimalSettings,
++    }
++
++    // the ABI checks the Streamline headers make in `sl::test::AbiValidation`
++    const _: () = {
++        assert!(std::mem::size_of::<Base>() == 32);
++        assert!(std::mem::size_of::<Preferences>() == 144);
++        assert!(std::mem::size_of::<Resource>() == 112);
++        assert!(std::mem::size_of::<ResourceTag>() == 64);
++        assert!(std::mem::size_of::<ViewportHandle>() == 40);
++        assert!(std::mem::size_of::<Constants>() == 456);
++        assert!(std::mem::size_of::<DlssOptions>() == 88);
++    };
++
++    type Fn0 = unsafe extern "C" fn() -> i32;
++    type FnInit = unsafe extern "C" fn(*const Preferences, u64) -> i32;
++    type FnIsFeatureSupported = unsafe extern "C" fn(u32, *const AdapterInfo) -> i32;
++    type FnIsFeatureLoaded = unsafe extern "C" fn(u32, *mut bool) -> i32;
++    type FnSetD3DDevice = unsafe extern "C" fn(*mut c_void) -> i32;
++    type FnGetFeatureFunction = unsafe extern "C" fn(u32, *const c_char, *mut *mut c_void) -> i32;
++    type FnGetNewFrameToken = unsafe extern "C" fn(*mut *const c_void, *const u32) -> i32;
++    type FnSetTagForFrame = unsafe extern "C" fn(*const c_void, *const ViewportHandle, *const ResourceTag, u32, *mut c_void) -> i32;
++    type FnSetConstants = unsafe extern "C" fn(*const Constants, *const c_void, *const ViewportHandle) -> i32;
++    type FnEvaluateFeature = unsafe extern "C" fn(u32, *const c_void, *const *const Base, u32, *mut c_void) -> i32;
++    type FnFreeResources = unsafe extern "C" fn(u32, *const ViewportHandle) -> i32;
++    type FnUpgradeInterface = unsafe extern "C" fn(*mut *mut c_void) -> i32;
++    type FnDlssGetOptimalSettings = unsafe extern "C" fn(*const DlssOptions, *mut DlssOptimalSettingsS) -> i32;
++    type FnDlssSetOptions = unsafe extern "C" fn(*const ViewportHandle, *const DlssOptions) -> i32;
++
++    /// `sl::Result` as text.
++    fn result_name(r: i32) -> &'static str {
++        const NAMES: [&str; 41] = [
++            "eOk", "eErrorIO", "eErrorDriverOutOfDate", "eErrorOSOutOfDate", "eErrorOSDisabledHWS", "eErrorDeviceNotCreated",
++            "eErrorNoSupportedAdapterFound", "eErrorAdapterNotSupported", "eErrorNoPlugins", "eErrorVulkanAPI", "eErrorDXGIAPI",
++            "eErrorD3DAPI", "eErrorNRDAPI", "eErrorNVAPI", "eErrorReflexAPI", "eErrorNGXFailed", "eErrorJSONParsing",
++            "eErrorMissingProxy", "eErrorMissingResourceState", "eErrorInvalidIntegration", "eErrorMissingInputParameter",
++            "eErrorNotInitialized", "eErrorComputeFailed", "eErrorInitNotCalled", "eErrorExceptionHandler",
++            "eErrorInvalidParameter", "eErrorMissingConstants", "eErrorDuplicatedConstants", "eErrorMissingOrInvalidAPI",
++            "eErrorCommonConstantsMissing", "eErrorUnsupportedInterface", "eErrorFeatureMissing", "eErrorFeatureNotSupported",
++            "eErrorFeatureMissingHooks", "eErrorFeatureFailedToLoad", "eErrorFeatureWrongPriority",
++            "eErrorFeatureMissingDependency", "eErrorFeatureManagerInvalidState", "eErrorInvalidState", "eWarnOutOfVRAM", "?",
++        ];
++        NAMES.get(r as usize).copied().unwrap_or("?")
++    }
++
++    fn check(what: &str, r: i32) -> Result<()> {
++        if r == 0 {
++            Ok(())
++        } else {
++            Err(anyhow!("Streamline {what}: {} ({r})", result_name(r)))
++        }
++    }
++
++    unsafe extern "C" fn sl_log(kind: u32, msg: *const c_char) {
++        if msg.is_null() {
++            return;
++        }
++        let text = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
++        let text = text.trim_end();
++        match kind {
++            2 => log::error!("Streamline: {text}"),
++            1 => log::warn!("Streamline: {text}"),
++            _ => log::debug!("Streamline: {text}"),
++        }
++    }
++
++    fn wide(s: &std::path::Path) -> Vec<u16> {
++        use std::os::windows::ffi::OsStrExt;
++        s.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
++    }
++
++    fn mode_code(mode: DlssMode) -> u32 {
++        // sl::DLSSMode: eOff, eMaxPerformance, eBalanced, eMaxQuality, eUltraPerformance,
++        // eUltraQuality, eDLAA
++        match mode {
++            DlssMode::Off => 0,
++            DlssMode::Performance => 1,
++            DlssMode::Balanced => 2,
++            DlssMode::Quality => 3,
++            DlssMode::UltraPerformance => 4,
++            DlssMode::Dlaa => 6,
++        }
++    }
++
++    fn dxgi_format(f: wgpu::TextureFormat) -> u32 {
++        use wgpu::TextureFormat as Tf;
++        (match f {
++            Tf::Bgra8UnormSrgb => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
++            Tf::Bgra8Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
++            Tf::Rgba8UnormSrgb => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
++            Tf::Rgba8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
++            Tf::Rgb10a2Unorm => DXGI_FORMAT_R10G10B10A2_UNORM,
++            Tf::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
++            Tf::Rg16Float => DXGI_FORMAT_R16G16_FLOAT,
++            Tf::Rg32Float => DXGI_FORMAT_R32G32_FLOAT,
++            Tf::R8Unorm => DXGI_FORMAT_R8_UNORM,
++            // (the depth is sampled too: wgpu makes it R32_TYPELESS, its view R32_FLOAT)
++            Tf::Depth32Float => DXGI_FORMAT_R32_FLOAT,
++            _ => DXGI_FORMAT_UNKNOWN,
++        })
++        .0 as u32
++    }
++
++    /// A swap chain that presents nothing. With manual hooking Streamline's end-of-frame work
++    /// (`presentCommon`: its frame counter, its garbage collection, the VRAM budget) runs in
++    /// the hooks of its own swap-chain proxy, and wgpu presents on its own swap chain;
++    /// Streamline's proxy around this one is presented once a frame instead.
++    #[windows::core::implement(IDXGISwapChain)]
++    struct PresentPacer {
++        device: ID3D12Device,
++    }
++
++    fn not_implemented<T>() -> windows::core::Result<T> {
++        Err(windows::Win32::Foundation::E_NOTIMPL.into())
++    }
++
++    impl IDXGIObject_Impl for PresentPacer_Impl {
++        fn SetPrivateData(&self, _: *const windows::core::GUID, _: u32, _: *const c_void) -> windows::core::Result<()> {
++            not_implemented()
++        }
++        fn SetPrivateDataInterface(&self, _: *const windows::core::GUID, _: windows::core::Ref<windows::core::IUnknown>) -> windows::core::Result<()> {
++            not_implemented()
++        }
++        fn GetPrivateData(&self, _: *const windows::core::GUID, _: *mut u32, _: *mut c_void) -> windows::core::Result<()> {
++            not_implemented()
++        }
++        fn GetParent(&self, _: *const windows::core::GUID, _: *mut *mut c_void) -> windows::core::Result<()> {
++            not_implemented()
++        }
++    }
++
++    impl IDXGIDeviceSubObject_Impl for PresentPacer_Impl {
++        fn GetDevice(&self, riid: *const windows::core::GUID, device: *mut *mut c_void) -> windows::core::Result<()> {
++            unsafe { self.device.query(riid, device) }.ok()
++        }
++    }
++
++    impl IDXGISwapChain_Impl for PresentPacer_Impl {
++        fn Present(&self, _: u32, _: DXGI_PRESENT) -> windows::core::HRESULT {
++            windows::Win32::Foundation::S_OK
++        }
++        fn GetBuffer(&self, _: u32, _: *const windows::core::GUID, _: *mut *mut c_void) -> windows::core::Result<()> {
++            not_implemented()
++        }
++        fn SetFullscreenState(&self, _: windows::core::BOOL, _: windows::core::Ref<IDXGIOutput>) -> windows::core::Result<()> {
++            not_implemented()
++        }
++        fn GetFullscreenState(&self, _: *mut windows::core::BOOL, _: windows::core::OutRef<IDXGIOutput>) -> windows::core::Result<()> {
++            not_implemented()
++        }
++        fn GetDesc(&self) -> windows::core::Result<DXGI_SWAP_CHAIN_DESC> {
++            not_implemented()
++        }
++        fn ResizeBuffers(&self, _: u32, _: u32, _: u32, _: DXGI_FORMAT, _: &DXGI_SWAP_CHAIN_FLAG) -> windows::core::Result<()> {
++            Ok(())
++        }
++        fn ResizeTarget(&self, _: *const DXGI_MODE_DESC) -> windows::core::Result<()> {
++            not_implemented()
++        }
++        fn GetContainingOutput(&self) -> windows::core::Result<IDXGIOutput> {
++            not_implemented()
++        }
++        fn GetFrameStatistics(&self, _: *mut DXGI_FRAME_STATISTICS) -> windows::core::Result<()> {
++            not_implemented()
++        }
++        fn GetLastPresentCount(&self) -> windows::core::Result<u32> {
++            not_implemented()
++        }
++    }
++
++    /// A D3D12 command list of ours, and when the GPU is done with it.
++    struct Slot {
++        allocator: ID3D12CommandAllocator,
++        list: ID3D12GraphicsCommandList,
++        done_at: u64,
++    }
++
++    pub struct Runtime {
++        module: HMODULE,
++        shutdown: Fn0,
++        get_new_frame_token: FnGetNewFrameToken,
++        set_tag_for_frame: FnSetTagForFrame,
++        set_constants: FnSetConstants,
++        evaluate_feature: FnEvaluateFeature,
++        free_resources: FnFreeResources,
++        get_optimal_settings: FnDlssGetOptimalSettings,
++        set_options: FnDlssSetOptions,
++        /// (the wide strings Streamline was handed at `slInit`)
++        _paths: (Vec<u16>, Vec<*const u16>),
++        viewport: ViewportHandle,
++        /// The options last handed to `slDLSSSetOptions`: (mode, output size).
++        options_set: Option<(DlssMode, (u32, u32))>,
++        /// Render sizes as Streamline said them: (mode, output) -> render size.
++        optimal: Vec<((DlssMode, (u32, u32)), (u32, u32))>,
++        frame: u32,
++        slots: Vec<Slot>,
++        next_slot: usize,
++        fence: ID3D12Fence,
++        fence_value: u64,
++        /// Whether DLSS allocated its resources for the viewport (they are freed on drop).
++        allocated: bool,
++        /// Streamline's proxy around a `PresentPacer` (None when Streamline would not make one).
++        pacer: Option<IDXGISwapChain>,
++    }
++
++    // (Streamline is used from the render thread only; the handles are plain pointers)
++    unsafe impl Send for Runtime {}
++
++    fn load_fn<T: Copy>(module: HMODULE, name: &CStr) -> Result<T> {
++        debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<usize>());
++        let f = unsafe { GetProcAddress(module, PCSTR(name.as_ptr().cast())) }
++            .ok_or_else(|| anyhow!("sl.interposer.dll has no {}", name.to_string_lossy()))?;
++        Ok(unsafe { std::mem::transmute_copy::<_, T>(&f) })
++    }
++
++    /// The folder Streamline's DLLs are looked for in: `OMSI_STREAMLINE_DIR`, else the
++    /// game's own folder.
++    fn runtime_dir() -> std::path::PathBuf {
++        if let Some(d) = omsi_cfg::env::var_os("OMSI_STREAMLINE_DIR") {
++            return d.into();
++        }
++        std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())).unwrap_or_else(|| ".".into())
++    }
++
++    impl Runtime {
++        /// Streamline with DLSS on wgpu's D3D12 device. An error says what is missing (the
++        /// DLLs, an RTX card, a newer driver, DirectX 12).
++        pub fn load(device: &wgpu::Device, _queue: &wgpu::Queue) -> Result<Runtime> {
++            let hal = unsafe { device.as_hal::<wgpu_hal::api::Dx12>() }.ok_or_else(|| anyhow!("DLSS needs the DirectX 12 graphics API (Settings → Graphics API)"))?;
++            let raw_device = hal.raw_device().clone();
++            drop(hal);
++            let dir = runtime_dir();
++            let missing: Vec<&str> = ["sl.interposer.dll", "sl.common.dll", "sl.dlss.dll", "nvngx_dlss.dll"].into_iter().filter(|f| !dir.join(f).is_file()).collect();
++            if !missing.is_empty() {
++                bail!("NVIDIA's Streamline runtime is not beside the game in {} (missing {}): copy the DLLs from the Streamline SDK's bin/x64 there", dir.display(), missing.join(", "));
++            }
++            let interposer = wide(&dir.join("sl.interposer.dll"));
++            let module = unsafe { LoadLibraryExW(PCWSTR(interposer.as_ptr()), None, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) }.context("load sl.interposer.dll")?;
++            match Self::start(module, &dir, raw_device) {
++                Ok(r) => Ok(r),
++                Err(e) => {
++                    unsafe {
++                        let _ = FreeLibrary(module);
++                    }
++                    Err(e)
++                }
++            }
++        }
++
++        fn start(module: HMODULE, dir: &std::path::Path, device: ID3D12Device) -> Result<Runtime> {
++            let init: FnInit = load_fn(module, c"slInit")?;
++            let shutdown: Fn0 = load_fn(module, c"slShutdown")?;
++            let is_supported: FnIsFeatureSupported = load_fn(module, c"slIsFeatureSupported")?;
++            let is_loaded: FnIsFeatureLoaded = load_fn(module, c"slIsFeatureLoaded")?;
++            let set_device: FnSetD3DDevice = load_fn(module, c"slSetD3DDevice")?;
++            let get_feature_function: FnGetFeatureFunction = load_fn(module, c"slGetFeatureFunction")?;
++            let get_new_frame_token: FnGetNewFrameToken = load_fn(module, c"slGetNewFrameToken")?;
++            let set_tag_for_frame: FnSetTagForFrame = load_fn(module, c"slSetTagForFrame")?;
++            let set_constants: FnSetConstants = load_fn(module, c"slSetConstants")?;
++            let evaluate_feature: FnEvaluateFeature = load_fn(module, c"slEvaluateFeature")?;
++            let free_resources: FnFreeResources = load_fn(module, c"slFreeResources")?;
++            let upgrade_interface: FnUpgradeInterface = load_fn(module, c"slUpgradeInterface")?;
++
++            let plugin_dir = wide(dir);
++            let plugin_paths = vec![plugin_dir.as_ptr()];
++            static FEATURES: [u32; 1] = [FEATURE_DLSS];
++            let engine_version = concat!("openOMSI ", env!("CARGO_PKG_VERSION"), "\0");
++            let project_id = omsi_cfg::env::var("OMSI_DLSS_PROJECT_ID").ok().and_then(|s| std::ffi::CString::new(s).ok());
++            let verbose = omsi_cfg::env::var_os("OMSI_DLSS_VERBOSE").is_some();
++            let prefs = Preferences {
++                base: Base::new(PREFERENCES, 1),
++                show_console: false,
++                // eDefault, or eVerbose for OMSI_DLSS_VERBOSE
++                log_level: if verbose { 2 } else { 1 },
++                paths_to_plugins: plugin_paths.as_ptr(),
++                num_paths_to_plugins: 1,
++                path_to_logs_and_data: std::ptr::null(),
++                allocate_callback: std::ptr::null(),
++                release_callback: std::ptr::null(),
++                log_message_callback: Some(sl_log),
++                // (wgpu's command lists are not Streamline's business: no state tracking, no
++                // hooks on the device, tags per frame)
++                flags: FLAG_DISABLE_CL_STATE_TRACKING | FLAG_DISABLE_DEBUG_TEXT | FLAG_USE_MANUAL_HOOKING | FLAG_FRAME_BASED_TAGGING,
++                features_to_load: FEATURES.as_ptr(),
++                num_features_to_load: 1,
++                application_id: 0,
++                // EngineType::eCustom, RenderAPI::eD3D12
++                engine: 0,
++                engine_version: engine_version.as_ptr().cast(),
++                project_id: project_id.as_deref().unwrap_or(PROJECT_ID).as_ptr(),
++                render_api: 1,
++            };
++            check("slInit", unsafe { init(&prefs, SDK_VERSION) })?;
++            // from here on Streamline is up: shut it down again on every way out
++            let up = |r: Result<Runtime>| -> Result<Runtime> {
++                if r.is_err() {
++                    unsafe { shutdown() };
++                }
++                r
++            };
++            up((|| {
++                check("slSetD3DDevice", unsafe { set_device(device.as_raw()) })?;
++                let mut luid = unsafe { device.GetAdapterLuid() };
++                let adapter = AdapterInfo {
++                    base: Base::new(ADAPTER_INFO, 1),
++                    device_luid: (&mut luid as *mut windows::Win32::Foundation::LUID).cast(),
++                    device_luid_size_in_bytes: std::mem::size_of::<windows::Win32::Foundation::LUID>() as u32,
++                    vk_physical_device: std::ptr::null_mut(),
++                };
++                check("DLSS support (a GeForce RTX card and a current driver are needed)", unsafe { is_supported(FEATURE_DLSS, &adapter) })?;
++                let mut loaded = false;
++                check("slIsFeatureLoaded", unsafe { is_loaded(FEATURE_DLSS, &mut loaded) })?;
++                if !loaded {
++                    bail!("Streamline did not load its DLSS plugin (sl.dlss.dll)");
++                }
++                let feature_fn = |name: &CStr| -> Result<*mut c_void> {
++                    let mut f: *mut c_void = std::ptr::null_mut();
++                    check(&format!("slGetFeatureFunction({})", name.to_string_lossy()), unsafe { get_feature_function(FEATURE_DLSS, name.as_ptr(), &mut f) })?;
++                    if f.is_null() {
++                        bail!("Streamline has no {}", name.to_string_lossy());
++                    }
++                    Ok(f)
++                };
++                let get_optimal_settings: FnDlssGetOptimalSettings = unsafe { std::mem::transmute(feature_fn(c"slDLSSGetOptimalSettings")?) };
++                let set_options: FnDlssSetOptions = unsafe { std::mem::transmute(feature_fn(c"slDLSSSetOptions")?) };
++                let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.context("D3D12 fence for DLSS")?;
++                let slots = (0..3)
++                    .map(|_| -> Result<Slot> {
++                        let allocator: ID3D12CommandAllocator = unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }?;
++                        let list: ID3D12GraphicsCommandList = unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None::<&ID3D12PipelineState>) }?;
++                        unsafe { list.Close() }?;
++                        Ok(Slot { allocator, list, done_at: 0 })
++                    })
++                    .collect::<Result<Vec<_>>>()
++                    .context("D3D12 command lists for DLSS")?;
++                let pacer: IDXGISwapChain = PresentPacer { device: device.clone() }.into();
++                let mut raw = pacer.as_raw();
++                let r = unsafe { upgrade_interface(&mut raw) };
++                let pacer = if r == 0 && !raw.is_null() && raw != pacer.as_raw() {
++                    // (the proxy, with one reference that is ours)
++                    Some(unsafe { IDXGISwapChain::from_raw(raw) })
++                } else {
++                    log::warn!("DLSS: Streamline made no swap-chain proxy ({}): its end-of-frame bookkeeping will not run", result_name(r));
++                    None
++                };
++                log::info!("DLSS: Streamline {}.{}.{} up with its DLSS plugin, from {}", SDK_VERSION >> 48, (SDK_VERSION >> 32) & 0xffff, (SDK_VERSION >> 16) & 0xffff, dir.display());
++                Ok(Runtime {
++                    module,
++                    shutdown,
++                    get_new_frame_token,
++                    set_tag_for_frame,
++                    set_constants,
++                    evaluate_feature,
++                    free_resources,
++                    get_optimal_settings,
++                    set_options,
++                    _paths: (plugin_dir.clone(), plugin_paths.clone()),
++                    viewport: ViewportHandle { base: Base::new(VIEWPORT_HANDLE, 1), value: 0 },
++                    options_set: None,
++                    optimal: Vec::new(),
++                    frame: 0,
++                    slots,
++                    next_slot: 0,
++                    fence,
++                    fence_value: 0,
++                    allocated: false,
++                    pacer,
++                })
++            })())
++        }
++
++        fn options(mode: DlssMode, (w, h): (u32, u32)) -> DlssOptions {
++            DlssOptions {
++                base: Base::new(DLSS_OPTIONS, 3),
++                mode: mode_code(mode),
++                output_width: w,
++                output_height: h,
++                sharpness: 0.0,
++                pre_exposure: 1.0,
++                exposure_scale: 1.0,
++                // the picture DLSS gets is the tone-mapped one (the HUD comes after it)
++                color_buffers_hdr: FALSE,
++                indicator_invert_axis_x: FALSE,
++                indicator_invert_axis_y: FALSE,
++                dlaa_preset: 0,
++                quality_preset: 0,
++                balanced_preset: 0,
++                performance_preset: 0,
++                ultra_performance_preset: 0,
++                ultra_quality_preset: 0,
++                use_auto_exposure: TRUE,
++                alpha_upscaling_enabled: FALSE,
++            }
++        }
++
++        /// The size the 3D picture is drawn at for this mode and window size: what
++        /// Streamline says is optimal, else NVIDIA's ratios.
++        pub fn render_size(&mut self, mode: DlssMode, out: (u32, u32)) -> (u32, u32) {
++            if mode == DlssMode::Dlaa {
++                return out;
++            }
++            if let Some((_, s)) = self.optimal.iter().find(|(k, _)| *k == (mode, out)) {
++                return *s;
++            }
++            let options = Self::options(mode, out);
++            let mut settings = DlssOptimalSettingsS { base: Base::new(DLSS_OPTIMAL_SETTINGS, 1), s: DlssOptimalSettings::default() };
++            let r = unsafe { (self.get_optimal_settings)(&options, &mut settings) };
++            let size = if r == 0 && settings.s.optimal_render_width > 0 && settings.s.optimal_render_height > 0 {
++                (settings.s.optimal_render_width.min(out.0), settings.s.optimal_render_height.min(out.1))
++            } else {
++                log::warn!("DLSS: no optimal render size for {mode:?} at {}x{} ({}); using NVIDIA's ratio", out.0, out.1, result_name(r));
++                fallback_render_size(mode, out)
++            };
++            log::info!("DLSS {mode:?}: {}x{} drawn for a {}x{} window", size.0, size.1, out.0, out.1);
++            self.optimal.push(((mode, out), size));
++            size
++        }
++
++        /// Record DLSS for this frame into a command list of ours and execute it on wgpu's
++        /// queue: call between the submit that drew `inputs` and the one that reads the
++        /// output.
++        pub fn evaluate(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mode: DlssMode, inputs: &Inputs, c: &FrameConstants) -> Result<()> {
++            let queue_hal = unsafe { queue.as_hal::<wgpu_hal::api::Dx12>() }.ok_or_else(|| anyhow!("wgpu did not expose its DX12 queue"))?;
++            let raw_queue = queue_hal.as_raw().clone();
++            drop(queue_hal);
++            let _ = device;
++            if self.options_set != Some((mode, inputs.output_size)) {
++                // (a new size: what Streamline keeps for the old one goes, as when a swap chain
++                // is resized)
++                if let (Some(p), Some(_)) = (&self.pacer, self.options_set) {
++                    let _ = unsafe { p.ResizeBuffers(0, inputs.output_size.0, inputs.output_size.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0)) };
++                }
++                let options = Self::options(mode, inputs.output_size);
++                check("slDLSSSetOptions", unsafe { (self.set_options)(&self.viewport, &options) })?;
++                self.options_set = Some((mode, inputs.output_size));
++            }
++            // the command list whose last use the GPU has finished
++            let slot = &mut self.slots[self.next_slot];
++            self.next_slot = (self.next_slot + 1) % 3;
++            if unsafe { self.fence.GetCompletedValue() } < slot.done_at {
++                // (no event: the call waits until the fence gets there)
++                unsafe { self.fence.SetEventOnCompletion(slot.done_at, HANDLE::default()) }.context("wait for DLSS command list")?;
++            }
++            unsafe {
++                slot.allocator.Reset()?;
++                slot.list.Reset(&slot.allocator, None::<&ID3D12PipelineState>)?;
++            }
++            let raw = |t: &wgpu::Texture| -> Result<ID3D12Resource> {
++                let h = unsafe { t.as_hal::<wgpu_hal::api::Dx12>() }.ok_or_else(|| anyhow!("a DLSS texture is not a DX12 one"))?;
++                Ok(unsafe { h.raw_resource() }.clone())
++            };
++            let (color, depth, motion, bias, output) = (raw(inputs.color)?, raw(inputs.depth)?, raw(inputs.motion)?, raw(inputs.bias)?, raw(inputs.output)?);
++            let (rw, rh) = inputs.render_size;
++            let (ow, oh) = inputs.output_size;
++            // (the states of their last use in the scene's submit, see `render_inner`)
++            let resource = |r: &ID3D12Resource, state: D3D12_RESOURCE_STATES, format: wgpu::TextureFormat, (w, h): (u32, u32)| Resource {
++                base: Base::new(RESOURCE, 1),
++                // ResourceType::eTex2d
++                kind: 0,
++                native: r.as_raw(),
++                memory: std::ptr::null_mut(),
++                view: std::ptr::null_mut(),
++                state: state.0 as u32,
++                width: w,
++                height: h,
++                native_format: dxgi_format(format),
++                mip_levels: 1,
++                array_layers: 1,
++                gpu_virtual_address: 0,
++                flags: 0,
++                usage: 0,
++                internal_flags: 0,
++                reserved: 0,
++            };
++            let mut res = [
++                resource(&color, D3D12_RESOURCE_STATE_RENDER_TARGET, inputs.color.format(), (rw, rh)),
++                resource(&depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, inputs.depth.format(), (rw, rh)),
++                resource(&motion, D3D12_RESOURCE_STATE_RENDER_TARGET, inputs.motion.format(), (rw, rh)),
++                resource(&output, D3D12_RESOURCE_STATE_RENDER_TARGET, inputs.output.format(), (ow, oh)),
++                resource(&bias, D3D12_RESOURCE_STATE_RENDER_TARGET, inputs.bias.format(), (rw, rh)),
++            ];
++            let render_extent = Extent { top: 0, left: 0, width: rw, height: rh };
++            let output_extent = Extent { top: 0, left: 0, width: ow, height: oh };
++            let [c0, c1, c2, c3, c4] = &mut res;
++            let tag = |r: &mut Resource, kind: u32, extent: Extent| ResourceTag { base: Base::new(RESOURCE_TAG, 1), resource: r, kind, lifecycle: VALID_UNTIL_EVALUATE, extent };
++            let tags = [
++                tag(c0, BUFFER_SCALING_INPUT_COLOR, render_extent),
++                tag(c1, BUFFER_DEPTH, render_extent),
++                tag(c2, BUFFER_MOTION_VECTORS, render_extent),
++                tag(c3, BUFFER_SCALING_OUTPUT_COLOR, output_extent),
++                tag(c4, BUFFER_BIAS_CURRENT_COLOR_HINT, render_extent),
++            ];
++            let mut token: *const c_void = std::ptr::null();
++            self.frame = self.frame.wrapping_add(1);
++            check("slGetNewFrameToken", unsafe { (self.get_new_frame_token)(&mut token, &self.frame) })?;
++            if token.is_null() {
++                bail!("Streamline gave no frame token");
++            }
++            let f2 = |v: [f32; 2]| Float2 { x: v[0], y: v[1] };
++            let f3 = |v: [f32; 3]| Float3 { x: v[0], y: v[1], z: v[2] };
++            let identity = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
++            let constants = Constants {
++                base: Base::new(CONSTANTS, 2),
++                camera_view_to_clip: c.view_to_clip,
++                clip_to_camera_view: c.clip_to_view,
++                clip_to_lens_clip: identity,
++                clip_to_prev_clip: c.clip_to_prev_clip,
++                prev_clip_to_clip: c.prev_clip_to_clip,
++                jitter_offset: f2(c.jitter),
++                // (the motion vectors are in pixels of the render size)
++                mvec_scale: f2([1.0 / rw as f32, 1.0 / rh as f32]),
++                camera_pinhole_offset: f2([0.0, 0.0]),
++                camera_pos: f3(c.camera_pos),
++                camera_up: f3(c.camera_up),
++                camera_right: f3(c.camera_right),
++                camera_fwd: f3(c.camera_fwd),
++                camera_near: c.near,
++                camera_far: c.far,
++                camera_fov: c.fov,
++                camera_aspect_ratio: c.aspect,
++                motion_vectors_invalid_value: 0.0,
++                depth_inverted: TRUE,
++                camera_motion_included: TRUE,
++                motion_vectors_3d: FALSE,
++                reset: if c.reset { TRUE } else { FALSE },
++                orthographic_projection: FALSE,
++                motion_vectors_dilated: FALSE,
++                motion_vectors_jittered: FALSE,
++                min_relative_linear_depth_object_separation: 40.0,
++            };
++            let list_ptr = slot.list.as_raw();
++            let recorded = (|| -> Result<()> {
++                check("slSetConstants", unsafe { (self.set_constants)(&constants, token, &self.viewport) })?;
++                check("slSetTagForFrame", unsafe { (self.set_tag_for_frame)(token, &self.viewport, tags.as_ptr(), tags.len() as u32, list_ptr) })?;
++                let inputs: [*const Base; 1] = [&self.viewport.base];
++                check("slEvaluateFeature(DLSS)", unsafe { (self.evaluate_feature)(FEATURE_DLSS, token, inputs.as_ptr(), 1, list_ptr) })?;
++                Ok(())
++            })();
++            // (the list is closed and executed either way: an empty one is harmless, and
++            // the slot's fence value stays true)
++            unsafe { slot.list.Close() }?;
++            let list: ID3D12CommandList = slot.list.cast()?;
++            unsafe { raw_queue.ExecuteCommandLists(&[Some(list)]) };
++            self.fence_value += 1;
++            unsafe { raw_queue.Signal(&self.fence, self.fence_value) }?;
++            slot.done_at = self.fence_value;
++            recorded?;
++            self.allocated = true;
++            // the frame's end for Streamline
++            if let Some(p) = &self.pacer {
++                let _ = unsafe { p.Present(0, DXGI_PRESENT(0)) };
++            }
++            Ok(())
++        }
++    }
++
++    impl Drop for Runtime {
++        fn drop(&mut self) {
++            unsafe {
++                // DLSS's resources may still be in use on the GPU
++                if self.fence.GetCompletedValue() < self.fence_value {
++                    let _ = self.fence.SetEventOnCompletion(self.fence_value, HANDLE::default());
++                }
++                if self.allocated {
++                    let _ = (self.free_resources)(FEATURE_DLSS, &self.viewport);
++                }
++                self.slots.clear();
++                self.pacer = None;
++                let r = (self.shutdown)();
++                if r != 0 {
++                    log::warn!("DLSS: slShutdown: {}", result_name(r));
++                }
++                let _ = FreeLibrary(self.module);
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn modes_read_back_and_scale() {
++        for m in [DlssMode::Off, DlssMode::Dlaa, DlssMode::Quality, DlssMode::Balanced, DlssMode::Performance, DlssMode::UltraPerformance] {
++            assert_eq!(DlssMode::parse(m.as_str()), m);
++        }
++        assert_eq!(DlssMode::parse("Ultra Performance"), DlssMode::UltraPerformance);
++        assert_eq!(DlssMode::parse(""), DlssMode::Off);
++        assert_eq!(fallback_render_size(DlssMode::Dlaa, (2560, 1440)), (2560, 1440));
++        assert_eq!(fallback_render_size(DlssMode::Performance, (3840, 2160)), (1920, 1080));
++    }
++}
+diff --git a/crates/omsi-render/src/dlss_motion.wgsl b/crates/omsi-render/src/dlss_motion.wgsl
+new file mode 100644
+index 0000000..88bf1fc
+--- /dev/null
++++ b/crates/omsi-render/src/dlss_motion.wgsl
+@@ -0,0 +1,155 @@
++// DLSS's motion passes (see `DlssState` in lib.rs), appended to the scene module only where
++// it reads its arrays from storage buffers (`scene_shader_source`): DLSS runs on DirectX 12,
++// never on the chips that read them from textures, and its last-frame matrices are one more
++// storage buffer in the vertex stage.
++
++struct Motion {
++    // this frame's view-projection without the sub-pixel jitter
++    vp: mat4x4<f32>,
++    // last frame's, for last frame's model matrices (relative to last frame's render origin)
++    vp_prev: mat4x4<f32>,
++    // last frame's, relative to this frame's render origin: the sky, and the entries without
++    // a matrix of last frame
++    vp_prev_here: mat4x4<f32>,
++    // the inverse of `vp` (the sky's directions)
++    vp_inv: mat4x4<f32>,
++    // xy: the render size in pixels, z: 1 when `prev_models` holds last frame's matrices,
++    // w: how many entries it holds
++    params: vec4<f32>,
++};
++@group(3) @binding(0) var<uniform> motion: Motion;
++// last frame's model matrices, as `models`
++@group(3) @binding(1) var<storage, read> prev_models: array<vec4<f32>>;
++
++struct MotionOut {
++    @builtin(position) @invariant clip: vec4<f32>,
++    @location(0) world: vec3<f32>,
++    @location(1) normal: vec3<f32>,
++    @location(2) uv: vec2<f32>,
++    @location(3) params: vec4<f32>,
++    @location(4) params2: vec4<f32>,
++    // (without the jitter) this frame's and last frame's clip position
++    @location(5) cur: vec4<f32>,
++    @location(6) prev: vec4<f32>,
++};
++// (the fragment side of MotionOut, without the invariant: see FsIn)
++struct MotionFsIn {
++    @builtin(position) clip: vec4<f32>,
++    @location(0) world: vec3<f32>,
++    @location(1) normal: vec3<f32>,
++    @location(2) uv: vec2<f32>,
++    @location(3) params: vec4<f32>,
++    @location(4) params2: vec4<f32>,
++    @location(5) cur: vec4<f32>,
++    @location(6) prev: vec4<f32>,
++};
++
++@vertex
++fn vs_motion(in: VsIn) -> MotionOut {
++    let v = vertex_main(in.pos, in.normal, in.uv, in.inst);
++    let e = draw_list[in.inst];
++    let local = vec4<f32>(in.pos, 1.0);
++    let wp = model_matrix(e) * local;
++    var out: MotionOut;
++    out.clip = v.clip;
++    out.world = v.world;
++    out.normal = v.normal;
++    out.uv = v.uv;
++    out.params = v.params;
++    out.params2 = v.params2;
++    out.cur = motion.vp * wp;
++    if (motion.params.z > 0.5 && f32(e) < motion.params.w) {
++        let k = e * 4u;
++        let pm = mat4x4<f32>(prev_models[k], prev_models[k + 1u], prev_models[k + 2u], prev_models[k + 3u]);
++        out.prev = motion.vp_prev * (pm * local);
++    } else {
++        out.prev = motion.vp_prev_here * wp;
++    }
++    return out;
++}
++
++// From this pixel to where the same point was last frame, in pixels (x right, y down).
++fn motion_pixels(cur: vec4<f32>, prev: vec4<f32>) -> vec4<f32> {
++    if (prev.w <= 1e-4 || cur.w <= 1e-4) {
++        return vec4<f32>(0.0);
++    }
++    let d = (prev.xy / prev.w - cur.xy / cur.w) * vec2<f32>(0.5, -0.5) * motion.params.xy;
++    return vec4<f32>(d, 0.0, 0.0);
++}
++
++@fragment
++fn fs_motion(in: MotionFsIn) -> @location(0) vec4<f32> {
++    return motion_pixels(in.cur, in.prev);
++}
++
++@fragment
++fn fs_motion_test(in: MotionFsIn) -> @location(0) vec4<f32> {
++    if (!cutout_covers(in.uv, in.params)) {
++        discard;
++    }
++    return motion_pixels(in.cur, in.prev);
++}
++
++@fragment
++fn fs_motion_transmap(in: MotionFsIn) -> @location(0) vec4<f32> {
++    if (!transmap_covers(in.uv, in.params)) {
++        discard;
++    }
++    return motion_pixels(in.cur, in.prev);
++}
++
++// A pane's film of water (`rain_glass`, as the colour pass draws it): where a drop covers
++// the pixel, the pane's own motion - the drops go with the bus, not with the street seen
++// through them, which DLSS dragged them along with as streaks. Between the drops the pixel
++// keeps the motion of what lies behind the glass.
++@fragment
++fn fs_motion_rain(in: MotionFsIn) -> @location(0) vec4<f32> {
++    let in_cab = inside_vehicle(camera.cam_pos.xyz) * near_player_vehicle(in.world) > 0.5;
++    let g = rain_glass(in.world, in.uv - in.params.zw, in.normal, in.params.x, camera.post.y, in_cab);
++    // (fading out with the distance, as the colour pass does)
++    let near = 1.0 - smoothstep(5.0, 15.0, distance(in.world, camera.cam_pos.xyz));
++    if (g.cover * near < 0.35) {
++        discard;
++    }
++    return motion_pixels(in.cur, in.prev);
++}
++
++// How far DLSS takes the current picture over its history (its `BiasCurrentColor` mask):
++// through a drop the street moves while the drop stays on the pane, one motion cannot be
++// right for both, and the history showed the drops twice once DLSS scaled up. Where a drop
++// covers the pixel, the current picture.
++@fragment
++fn fs_bias_rain(in: MotionFsIn) -> @location(1) f32 {
++    let in_cab = inside_vehicle(camera.cam_pos.xyz) * near_player_vehicle(in.world) > 0.5;
++    let g = rain_glass(in.world, in.uv - in.params.zw, in.normal, in.params.x, camera.post.y, in_cab);
++    let near = 1.0 - smoothstep(5.0, 15.0, distance(in.world, camera.cam_pos.xyz));
++    let bias = smoothstep(0.05, 0.5, g.cover * near);
++    if (bias <= 0.0) {
++        discard;
++    }
++    return bias;
++}
++
++// The sky (whatever the prepass leaves uncovered): a point on the far plane, drawn first.
++struct SkyMotionOut {
++    @builtin(position) clip: vec4<f32>,
++    @location(0) ndc: vec2<f32>,
++};
++
++@vertex
++fn vs_motion_sky(@builtin(vertex_index) i: u32) -> SkyMotionOut {
++    let x = f32(i32(i & 1u) * 4 - 1);
++    let y = f32(i32(i >> 1u) * 4 - 1);
++    var out: SkyMotionOut;
++    // (reversed Z: depth 0 is the far plane)
++    out.clip = vec4<f32>(x, y, 0.0, 1.0);
++    out.ndc = vec2<f32>(x, y);
++    return out;
++}
++
++@fragment
++fn fs_motion_sky(in: SkyMotionOut) -> @location(0) vec4<f32> {
++    let far = motion.vp_inv * vec4<f32>(in.ndc, 0.0, 1.0);
++    let wp = vec4<f32>(far.xyz / far.w, 1.0);
++    return motion_pixels(vec4<f32>(in.ndc, 0.0, 1.0), motion.vp_prev_here * wp);
++}
+diff --git a/crates/omsi-render/src/lib.rs b/crates/omsi-render/src/lib.rs
+index f99b93f..4416511 100644
+--- a/crates/omsi-render/src/lib.rs
++++ b/crates/omsi-render/src/lib.rs
+@@ -2,6 +2,7 @@
+ 
+ pub mod atmosphere;
+ pub mod clouds;
++pub mod dlss;
+ mod puddles;
+ 
+ use anyhow::{anyhow, Context, Result};
+@@ -195,6 +196,8 @@ const SUN_RADIUS: f32 = 0.0065;
+ /// The textures of the ambient-occlusion pass for one target size.
+ struct AoTargets {
+     size: (u32, u32),
++    /// (the texture too: DLSS reads it as the picture's depth)
++    depth: wgpu::Texture,
+     depth_view: wgpu::TextureView,
+     ao_view: wgpu::TextureView,
+     blur_view: wgpu::TextureView,
+@@ -202,6 +205,118 @@ struct AoTargets {
+     blur_bg: wgpu::BindGroup,
+ }
+ 
++/// DLSS's motion vectors: pixels of the render size from each pixel to where its point was
++/// last frame.
++const DLSS_MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
++/// DLSS's result at the window's size (a storage texture: sRGB formats cannot be one).
++const DLSS_OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
++/// DLSS's `BiasCurrentColor` mask: 1 where the current picture goes before the history (the
++/// rain films' drops).
++const DLSS_BIAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
++
++/// `Motion` in shader.wgsl.
++#[repr(C)]
++#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
++struct MotionUniform {
++    vp: [[f32; 4]; 4],
++    vp_prev: [[f32; 4]; 4],
++    vp_prev_here: [[f32; 4]; 4],
++    vp_inv: [[f32; 4]; 4],
++    params: [f32; 4],
++}
++
++/// The DLSS depth prepass: [plain, alpha-tested, transmap] x [two-sided, culled] as the
++/// ordinary prepass, writing motion beside depth, and the sky's motion.
++struct DlssPipelines {
++    prepass: [wgpu::RenderPipeline; 6],
++    sky: wgpu::RenderPipeline,
++    /// The drops of the rain films: their motion (`fs_motion_rain`) and the bias mask
++    /// (`fs_bias_rain`).
++    rain: wgpu::RenderPipeline,
++    rain_bias: wgpu::RenderPipeline,
++    motion_layout: wgpu::BindGroupLayout,
++}
++
++/// What DLSS reads and writes for one window size and mode.
++struct DlssTargets {
++    render: (u32, u32),
++    output: (u32, u32),
++    /// The 3D picture at the render size (the renderer's format), with the upscale bind group
++    /// the rain on the glass reads it by.
++    color: wgpu::Texture,
++    color_view: wgpu::TextureView,
++    color_bg: wgpu::BindGroup,
++    motion: wgpu::Texture,
++    motion_view: wgpu::TextureView,
++    /// DLSS's `BiasCurrentColor` mask.
++    bias: wgpu::Texture,
++    bias_view: wgpu::TextureView,
++    /// DLSS's result, and the bind group that draws it into the window.
++    output_tex: wgpu::Texture,
++    output_view: wgpu::TextureView,
++    output_bg: wgpu::BindGroup,
++}
++
++/// Last frame's camera, for the motion vectors and DLSS's `clipToPrevClip`.
++#[derive(Clone, Copy)]
++struct DlssPrev {
++    camera: Camera,
++    aspect: f32,
++    origin: DVec3,
++    render: (u32, u32),
++    output: (u32, u32),
++    mode: DlssMode,
++}
++
++/// DLSS once Streamline is up: its runtime, targets, and what the last frame left for the
++/// next one's motion vectors.
++struct DlssState {
++    runtime: dlss::Runtime,
++    targets: Option<DlssTargets>,
++    /// Textures DLSS read in the last frames: a texture wgpu lets go of when its last submit is
++    /// done, and DLSS's command list comes after that submit.
++    keep: std::collections::VecDeque<Vec<wgpu::Texture>>,
++    motion_buf: wgpu::Buffer,
++    /// Blit parameters of the result into the window (`upscale.wgsl` at the window's size).
++    blit_buf: wgpu::Buffer,
++    /// Last frame's model matrices (copied at the end of each frame) and its bind group with
++    /// `motion_buf`.
++    prev_models: Option<(wgpu::Buffer, wgpu::BindGroup)>,
++    /// The scene's model layout (`Scene::model_epoch`) and entry count the copy was made with.
++    prev_epoch: u64,
++    prev_entries: u32,
++    prev: Option<DlssPrev>,
++    frame: u64,
++}
++
++/// What a DLSS frame hands on from its camera to DLSS (after the scene's submit).
++struct DlssFrame {
++    /// This frame's view-projection without the jitter, and last frame's relative to this
++    /// frame's render origin.
++    vp: Mat4,
++    vp_prev_here: Mat4,
++    /// The offset the projection was moved by, in pixels.
++    jitter: [f32; 2],
++    reset: bool,
++    aspect: f32,
++}
++
++/// The Halton sequence's `i`th value (from 1) in `base`, 0..1.
++fn halton(mut i: u32, base: u32) -> f32 {
++    let (mut f, mut r) = (1.0f32, 0.0f32);
++    while i > 0 {
++        f /= base as f32;
++        r += f * (i % base) as f32;
++        i /= base;
++    }
++    r
++}
++
++/// Matrices as DLSS takes them: Streamline's rows are glam's columns (row vectors).
++fn sl_matrix(m: Mat4) -> [[f32; 4]; 4] {
++    m.to_cols_array_2d()
++}
++
+ #[repr(C)]
+ #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+ struct SsaoUniform {
+@@ -1046,6 +1161,9 @@ pub struct Scene {
+     /// are appended to the buffers instead of rebuilding them, as long as they fit.
+     uploaded_instances: usize,
+     uploaded_entries: u32,
++    /// Counts the times every entry was laid out anew (`prepare`): last frame's matrices of
++    /// an entry are only its own while this stays (DLSS's motion vectors).
++    model_epoch: u64,
+     /// Instances whose transform or parameters changed since the last `prepare`: only
+     /// their entries are rewritten. Rebuilding the whole per-draw buffer for 17 000 objects
+     /// because one bus moved was the biggest single CPU cost of a frame.
+@@ -1219,7 +1337,8 @@ impl GpuArray {
+             return GpuArray::Buffer(device.create_buffer(&wgpu::BufferDescriptor {
+                 label: Some(label),
+                 size: size.max(16).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT),
+-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
++                // (copied from: DLSS's motion vectors keep last frame's model matrices)
++                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                 mapped_at_creation: false,
+             }));
+         }
+@@ -1440,6 +1559,13 @@ pub struct Renderer {
+     /// The same, multisampled: the enhanced main pass's own depth laid first (see
+     /// `render_inner`), so that its costly shading runs once per visible surface.
+     prepass_msaa_pipelines: Option<[wgpu::RenderPipeline; 6]>,
++    /// DLSS: the depth prepass with motion vectors (made when DLSS is asked for), Streamline
++    /// and its targets once the first frame started it, whether it could not, and whether the
++    /// picture being drawn is the window's own (`render`: the one DLSS is for).
++    dlss_pipes: Option<DlssPipelines>,
++    dlss: Option<DlssState>,
++    dlss_failed: bool,
++    dlss_window: bool,
+     /// Ambient occlusion and its blur; none on OpenGL (GLES), whose shading language cannot
+     /// read a depth texture texel by texel - the pipelines failed there, AO off or not (#422).
+     ssao_pipeline: Option<wgpu::RenderPipeline>,
+@@ -1644,8 +1770,14 @@ pub struct RenderOptions {
+     /// Mali and Adreno drivers before the first frame, #364, #333, #316, #371). Asked for,
+     /// they are built on every device and graphics API; a computer always builds them.
+     pub no_enhanced: bool,
++    /// NVIDIA DLSS (or DLAA) instead of multisampling, FXAA and the render scale: DirectX 12
++    /// on a GeForce RTX with Streamline's DLLs beside the game (see `dlss`). Elsewhere, or
++    /// when it cannot start, the picture is drawn as without it.
++    pub dlss: DlssMode,
+ }
+ 
++pub use dlss::DlssMode;
++
+ impl Default for RenderOptions {
+     fn default() -> Self {
+         Self {
+@@ -1662,6 +1794,7 @@ impl Default for RenderOptions {
+             shadow_blobs: true,
+             reflections: true,
+             no_enhanced: false,
++            dlss: DlssMode::Off,
+         }
+     }
+ }
+@@ -1844,6 +1977,17 @@ impl Renderer {
+         } else {
+             options
+         };
++        // DLSS takes the place of multisampling. It needs DirectX 12 on an NVIDIA card
++        // (whether this one is an RTX with a driver new enough, Streamline says at the
++        // first frame, see `DlssState`).
++        let options = if options.dlss.is_on() && !(cfg!(windows) && info.backend == wgpu::Backend::Dx12 && info.vendor == 0x10de) {
++            log::warn!("DLSS ({:?}) was asked for, but {} on {:?} cannot do it (a GeForce RTX card on DirectX 12 is needed); drawing without it", options.dlss, info.name, info.backend);
++            RenderOptions { dlss: DlssMode::Off, ..options }
++        } else if options.dlss.is_on() {
++            RenderOptions { msaa: 1, ..options }
++        } else {
++            options
++        };
+         let shadow_size = options
+             .shadow_size
+             .clamp(512, if intel_vulkan_safe { 2048 } else { 8192 });
+@@ -2008,7 +2152,7 @@ impl Renderer {
+         let compress =
+             bc && options.compress_textures && omsi_cfg::env::var_os("OMSI_NO_TEXCOMPRESS").is_none();
+         omsi_texture::set_gpu_options(omsi_texture::GpuOptions { bc, compress });
+-        log::info!("renderer: {} ({:?}), {:?}, {}x MSAA{}, anisotropy {}, shadow map {}, SSAO {}, render scale {}, textures {}", info.name, info.backend, format, options.msaa, if adapter_table { " (adapter format table)" } else { "" }, options.anisotropy, options.shadow_size, options.ssao, if options.render_scale > 0.0 { format!("{:.2}", options.render_scale.clamp(0.5, 1.0)) } else { "auto".to_string() }, match (bc, compress) { (false, _) => "RGBA (no BC on this device)", (true, false) => "DXT as blocks, others RGBA", (true, true) => "DXT as blocks, others compressed where close" });
++        log::info!("renderer: {} ({:?}), {:?}, {}x MSAA{}, DLSS {}, anisotropy {}, shadow map {}, SSAO {}, render scale {}, textures {}", info.name, info.backend, format, options.msaa, if adapter_table { " (adapter format table)" } else { "" }, options.dlss.as_str(), options.anisotropy, options.shadow_size, options.ssao, if options.render_scale > 0.0 { format!("{:.2}", options.render_scale.clamp(0.5, 1.0)) } else { "auto".to_string() }, match (bc, compress) { (false, _) => "RGBA (no BC on this device)", (true, false) => "DXT as blocks, others RGBA", (true, true) => "DXT as blocks, others compressed where close" });
+         // Anything that still fails to validate with multisampling (a driver whose table
+         // promises more than it takes) is caught here, and the renderer is built again
+         // without it instead of the default handler's abort.
+@@ -3276,6 +3420,143 @@ impl Renderer {
+             make_prepass(2, false),
+             make_prepass(2, true),
+         ];
++        // DLSS: the same prepass writing each pixel's motion beside its depth, and the sky's
++        // motion laid first (see `DlssState`)
++        // (the motion passes are in the scene module only with the arrays in storage buffers)
++        let dlss_pipes = (options.dlss.is_on() && array_path() == ArrayPath::Storage).then(|| {
++            let motion_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                label: Some("dlss motion"),
++                entries: &[
++                    wgpu::BindGroupLayoutEntry {
++                        binding: 0,
++                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
++                        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
++                        count: None,
++                    },
++                    wgpu::BindGroupLayoutEntry {
++                        binding: 1,
++                        visibility: wgpu::ShaderStages::VERTEX,
++                        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
++                        count: None,
++                    },
++                ],
++            });
++            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++                label: Some("dlss prepass"),
++                // (group 2 is the vehicle reflection's in shader.wgsl: DLSS's motion is group 3)
++                bind_group_layouts: &[Some(&camera_layout), Some(&material_layout), None, Some(&motion_layout)],
++                immediate_size: 0,
++            });
++            let target = |format, write_mask| Some(wgpu::ColorTargetState { format, blend: None, write_mask });
++            // (the prepass's two targets: the motion, and the bias mask only the drops write)
++            let motion_target = [target(DLSS_MOTION_FORMAT, wgpu::ColorWrites::ALL), target(DLSS_BIAS_FORMAT, wgpu::ColorWrites::empty())];
++            let bias_target = [target(DLSS_MOTION_FORMAT, wgpu::ColorWrites::empty()), target(DLSS_BIAS_FORMAT, wgpu::ColorWrites::ALL)];
++            let make = |kind: u8, cull: bool| {
++                let fragment = match kind {
++                    0 => "fs_motion",
++                    1 => "fs_motion_test",
++                    2 => "fs_motion_transmap",
++                    _ => unreachable!(),
++                };
++                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                    label: Some("dlss depth prepass"),
++                    layout: Some(&pl),
++                    vertex: wgpu::VertexState {
++                        module: &shader,
++                        entry_point: Some("vs_motion"),
++                        buffers: &[vertex_layout.clone()],
++                        compilation_options: Default::default(),
++                    },
++                    primitive: one_sided_primitive(cull),
++                    depth_stencil: Some(wgpu::DepthStencilState {
++                        format: DEPTH_FORMAT,
++                        depth_write_enabled: Some(true),
++                        depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
++                        stencil: Default::default(),
++                        bias: Default::default(),
++                    }),
++                    multisample: Default::default(),
++                    fragment: Some(wgpu::FragmentState {
++                        module: &shader,
++                        entry_point: Some(fragment),
++                        targets: &motion_target,
++                        compilation_options: Default::default(),
++                    }),
++                    multiview_mask: None,
++                    cache: None,
++                })
++            };
++            let sky_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++                label: Some("dlss sky motion"),
++                bind_group_layouts: &[None, None, None, Some(&motion_layout)],
++                immediate_size: 0,
++            });
++            let sky = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                label: Some("dlss sky motion"),
++                layout: Some(&sky_pl),
++                vertex: wgpu::VertexState {
++                    module: &shader,
++                    entry_point: Some("vs_motion_sky"),
++                    buffers: &[],
++                    compilation_options: Default::default(),
++                },
++                primitive: wgpu::PrimitiveState::default(),
++                depth_stencil: Some(wgpu::DepthStencilState {
++                    format: DEPTH_FORMAT,
++                    depth_write_enabled: Some(false),
++                    depth_compare: Some(wgpu::CompareFunction::Always),
++                    stencil: Default::default(),
++                    bias: Default::default(),
++                }),
++                multisample: Default::default(),
++                fragment: Some(wgpu::FragmentState {
++                    module: &shader,
++                    entry_point: Some("fs_motion_sky"),
++                    targets: &motion_target,
++                    compilation_options: Default::default(),
++                }),
++                multiview_mask: None,
++                cache: None,
++            });
++            // the rain films' drops: their pane's motion over what the prepass left, the depth
++            // DLSS reads untouched
++            let rain_pipeline = |label, entry, targets: &[Option<wgpu::ColorTargetState>]| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                label: Some(label),
++                layout: Some(&pl),
++                vertex: wgpu::VertexState {
++                    module: &shader,
++                    entry_point: Some("vs_motion"),
++                    buffers: &[vertex_layout.clone()],
++                    compilation_options: Default::default(),
++                },
++                primitive: one_sided_primitive(false),
++                depth_stencil: Some(wgpu::DepthStencilState {
++                    format: DEPTH_FORMAT,
++                    depth_write_enabled: Some(false),
++                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
++                    stencil: Default::default(),
++                    bias: Default::default(),
++                }),
++                multisample: Default::default(),
++                fragment: Some(wgpu::FragmentState {
++                    module: &shader,
++                    entry_point: Some(entry),
++                    targets,
++                    compilation_options: Default::default(),
++                }),
++                multiview_mask: None,
++                cache: None,
++            });
++            let rain = rain_pipeline("dlss rain motion", "fs_motion_rain", &motion_target);
++            let rain_bias = rain_pipeline("dlss rain bias", "fs_bias_rain", &bias_target);
++            DlssPipelines {
++                prepass: [make(0, false), make(0, true), make(1, false), make(1, true), make(2, false), make(2, true)],
++                sky,
++                rain,
++                rain_bias,
++                motion_layout,
++            }
++        });
+         // (not on Apple's GPUs: their tile renderer drops hidden opaque fragments by itself,
+         // and the extra pass only cost what it saved)
+         let prepass_msaa_pipelines = (msaa > 1 && !cfg!(target_vendor = "apple")).then(|| {
+@@ -4039,6 +4320,10 @@ impl Renderer {
+             ao_layout,
+             ao_buf,
+             prepass_pipelines,
++            dlss_pipes,
++            dlss: None,
++            dlss_failed: false,
++            dlss_window: false,
+             prepass_msaa_pipelines,
+             ssao_pipeline,
+             blur_pipeline,
+@@ -4139,7 +4424,16 @@ impl Renderer {
+     }
+ 
+     /// The size the 3D scene is drawn at for a window of this size.
++    /// (With DLSS: the size its quality mode draws at, by NVIDIA's ratios.)
+     pub fn scene_size(&self, width: u32, height: u32) -> (u32, u32) {
++        if self.options.dlss.is_on() && self.dlss_pipes.is_some() && !self.dlss_failed {
++            return dlss::fallback_render_size(self.options.dlss, (width, height));
++        }
++        self.render_scale_size(width, height)
++    }
++
++    /// The size the render scale draws a window of this size at.
++    fn render_scale_size(&self, width: u32, height: u32) -> (u32, u32) {
+         let s = self.scene_scale(width, height);
+         if s >= 0.999 {
+             return (width, height);
+@@ -4150,6 +4444,112 @@ impl Renderer {
+         )
+     }
+ 
++    /// Another DLSS quality while the game runs: the next frame is drawn at its size (DLSS
++    /// on or off is not changed here - its pipelines are made when the renderer is). True
++    /// when it was taken.
++    pub fn set_dlss_mode(&mut self, mode: DlssMode) -> bool {
++        if !(self.options.dlss.is_on() && mode.is_on() && self.dlss_pipes.is_some()) {
++            return false;
++        }
++        if self.options.dlss != mode {
++            log::info!("DLSS: {} from now on", mode.as_str());
++            self.options.dlss = mode;
++        }
++        true
++    }
++
++    /// Whether DLSS draws this window frame: Streamline started at the first one that asks
++    /// (once; when it cannot, the game says why and draws as without DLSS).
++    fn dlss_start(&mut self) -> bool {
++        if self.dlss.is_some() {
++            return true;
++        }
++        if self.dlss_failed || self.dlss_pipes.is_none() || !self.options.dlss.is_on() {
++            return false;
++        }
++        match dlss::Runtime::load(&self.device, &self.queue) {
++            Ok(runtime) => {
++                let buf = |label: &str, size: u64| {
++                    self.device.create_buffer(&wgpu::BufferDescriptor {
++                        label: Some(label),
++                        size,
++                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++                        mapped_at_creation: false,
++                    })
++                };
++                self.dlss = Some(DlssState {
++                    runtime,
++                    targets: None,
++                    keep: Default::default(),
++                    motion_buf: buf("dlss motion", std::mem::size_of::<MotionUniform>() as u64),
++                    blit_buf: buf("dlss blit", 16),
++                    prev_models: None,
++                    prev_epoch: u64::MAX,
++                    prev_entries: 0,
++                    prev: None,
++                    frame: 0,
++                });
++                log::info!("DLSS {} on: {}", self.options.dlss.as_str(), self.adapter_name);
++                true
++            }
++            Err(e) => {
++                log::warn!("DLSS cannot start: {e:#}; drawing without it");
++                self.dlss_failed = true;
++                false
++            }
++        }
++    }
++
++    /// DLSS's targets for this render and window size (made anew when either changes).
++    fn dlss_targets(&mut self, render: (u32, u32), output: (u32, u32)) {
++        let Some(blit_buf) = self.dlss.as_ref().filter(|d| !d.targets.as_ref().is_some_and(|t| t.render == render && t.output == output)).map(|d| d.blit_buf.clone()) else {
++            return;
++        };
++        let tex = |label: &str, (w, h): (u32, u32), format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
++            self.device.create_texture(&wgpu::TextureDescriptor {
++                label: Some(label),
++                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
++                mip_level_count: 1,
++                sample_count: 1,
++                dimension: wgpu::TextureDimension::D2,
++                format,
++                usage,
++                view_formats: &[],
++            })
++        };
++        let targets = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
++        // (copied from by the rain on the glass, as the render scale's target)
++        let color = tex("dlss scene", render, self.format, targets | wgpu::TextureUsages::COPY_SRC);
++        let motion = tex("dlss motion vectors", render, DLSS_MOTION_FORMAT, targets);
++        let output_tex = tex("dlss output", output, DLSS_OUTPUT_FORMAT, targets | wgpu::TextureUsages::STORAGE_BINDING);
++        let color_view = color.create_view(&Default::default());
++        let motion_view = motion.create_view(&Default::default());
++        let bias = tex("dlss bias mask", render, DLSS_BIAS_FORMAT, targets);
++        let bias_view = bias.create_view(&Default::default());
++        let output_view = output_tex.create_view(&Default::default());
++        let upscale_bg = |buf: &wgpu::Buffer, view: &wgpu::TextureView| {
++            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                label: Some("dlss upscale"),
++                layout: &self.upscale_layout,
++                entries: &[
++                    wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
++                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
++                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.post_sampler) },
++                ],
++            })
++        };
++        let color_bg = upscale_bg(&self.upscale_buf, &color_view);
++        let output_bg = upscale_bg(&blit_buf, &output_view);
++        let d = self.dlss.as_mut().expect("dlss state");
++        // (the old ones may still be read by DLSS's last command list; the history belongs to
++        // the old size)
++        if let Some(old) = d.targets.take() {
++            d.keep.push_back(vec![old.color, old.motion, old.bias, old.output_tex]);
++        }
++        d.prev = None;
++        d.targets = Some(DlssTargets { render, output, color, color_view, color_bg, motion, motion_view, bias, bias_view, output_tex, output_view, output_bg });
++    }
++
+     /// The smaller colour target of the render scale for this size, with its bind group.
+     fn scale_target(&mut self, w: u32, h: u32) -> (wgpu::TextureView, wgpu::BindGroup) {
+         self.target_use.insert((w, h), std::time::Instant::now());
+@@ -4227,6 +4627,7 @@ impl Renderer {
+             bounds_dirty: false,
+             uploaded_instances: 0,
+             uploaded_entries: 0,
++            model_epoch: 0,
+             cpu_models: Vec::new(),
+             cpu_params: Vec::new(),
+             last_grid: Vec::new(),
+@@ -6086,6 +6487,7 @@ impl Renderer {
+         let blur_bg = bg("ssao blur", &ao_view);
+         self.ao = Some(AoTargets {
+             size: (w, h),
++            depth,
+             depth_view,
+             ao_view,
+             blur_view,
+@@ -6663,6 +7065,7 @@ impl Renderer {
+         }
+         scene.changed.clear();
+         scene.changed_mark.clear();
++        scene.model_epoch += 1;
+         // one entry per (instance, material slot) so every draw call has its own parameters
+         let mut mats: Vec<[[f32; 4]; 4]> = Vec::new();
+         let mut params: Vec<[f32; 4]> = Vec::new();
+@@ -7273,7 +7676,11 @@ impl Renderer {
+         camera: &Camera,
+         lighting: &Lighting,
+     ) {
++        // (DLSS is for the window's own picture: not for the mirrors, the headset's eyes or
++        // a picture drawn into a texture)
++        self.dlss_window = true;
+         self.render_inner(scene, target, width, height, camera, lighting, true, None, None, false);
++        self.dlss_window = false;
+     }
+ 
+     /// Render one OpenXR view using the headset's asymmetric projection matrix.
+@@ -7492,8 +7899,17 @@ impl Renderer {
+         // from here on `width` and `height` are the size of the picture, `full_*` the
+         // window's (the HUD is drawn at that size). Mirrors keep their own size.
+         let (full_w, full_h) = (width, height);
+-        let (width, height) = if with_overlays {
+-            self.scene_size(full_w, full_h)
++        // DLSS: the window's own picture (not a mirror's, an eye's or one for a texture), at
++        // the size DLSS brings up to the window; it takes the place of FXAA and the render
++        // scale, and draws the HUD over its result
++        let dlss_mode = self.options.dlss;
++        let dlss_frame = with_overlays && projection.is_none() && self.dlss_window && self.texture_aspect.is_none() && self.dlss_start();
++        let (width, height) = if dlss_frame {
++            let size = self.dlss.as_mut().expect("dlss state").runtime.render_size(dlss_mode, (full_w, full_h));
++            self.dlss_targets(size, (full_w, full_h));
++            size
++        } else if with_overlays {
++            self.render_scale_size(full_w, full_h)
+         } else {
+             (full_w, full_h)
+         };
+@@ -7501,6 +7917,7 @@ impl Renderer {
+         // edges (the Enhanced path has it in its post passes): the picture is drawn into a
+         // texture of the window's size and smoothed on its way to the window, the HUD after
+         let vanilla_fxaa = with_overlays
++            && !dlss_frame
+             && (width, height) == (full_w, full_h)
+             && self.options.fxaa
+             && self.options.msaa <= 1
+@@ -7513,8 +7930,10 @@ impl Renderer {
+             && scene.glass_slot.is_some()
+             && (lighting.rain > 0.001 || lighting.wetness > 0.02)
+             && omsi_cfg::env::var_os("OMSI_NO_GLASS_PICTURE").is_none();
+-        let scaled = (width, height) != (full_w, full_h) || vanilla_fxaa || (glass_on && !enhanced_view);
+-        let scene_target: Option<(wgpu::TextureView, wgpu::BindGroup)> = if scaled {
++        let scaled = (width, height) != (full_w, full_h) || vanilla_fxaa || (glass_on && !enhanced_view) || dlss_frame;
++        let scene_target: Option<(wgpu::TextureView, wgpu::BindGroup)> = if dlss_frame {
++            self.dlss.as_ref().and_then(|d| d.targets.as_ref()).map(|t| (t.color_view.clone(), t.color_bg.clone()))
++        } else if scaled {
+             Some(self.scale_target(width, height))
+         } else {
+             None
+@@ -7554,7 +7973,8 @@ impl Renderer {
+         let ao_on = with_overlays && self.options.ssao && self.ssao_pipeline.is_some() && omsi_cfg::env::var_os("OMSI_NO_AO").is_none();
+         // the enhanced path's shading is costly: the depth prepass keeps it to the visible
+         // surface (without multisampling, see `share_depth`)
+-        let prepass_on = ao_on || puddles_wanted || glass_on || (enhanced && (with_overlays || xr_view));
++        // (DLSS reads the prepass's depth, and the prepass writes its motion vectors)
++        let prepass_on = ao_on || puddles_wanted || glass_on || (enhanced && (with_overlays || xr_view)) || dlss_frame;
+         if prepass_on && self.ensure_ao(width, height) {
+             // a new AO texture: the camera bind group must point at it
+             scene.dirty = true;
+@@ -7751,6 +8171,74 @@ impl Renderer {
+             let v: [f32; 4] = [(lx - ro.x) as f32, (ly - ro.y) as f32, side as f32, if side > 0.0 { 1.0 } else { 0.0 }];
+             self.queue.write_buffer(&self.lm_uniform, 0, bytemuck::cast_slice(&v));
+         }
++        // DLSS: every frame the projection is moved by another sub-pixel offset (Halton 2, 3;
++        // the more DLSS scales up, the more phases), from which DLSS puts the finer picture
++        // together; the motion vectors are worked out without it
++        let vp_plain = vp_mat;
++        let mut dlss_frame_info: Option<DlssFrame> = None;
++        let vp_mat = if dlss_frame {
++            let d = self.dlss.as_mut().expect("dlss state");
++            d.frame += 1;
++            let ratio = (full_w as f32 / width.max(1) as f32).max(1.0);
++            let phases = ((8.0 * ratio * ratio).round() as u32).clamp(8, 64);
++            let i = (d.frame % phases as u64) as u32 + 1;
++            // (OMSI_DLSS_JITTER_SIGN=-1 tells DLSS the offset the other way round: for trying
++            // which way this driver reads it)
++            let sign = omsi_cfg::env::var("OMSI_DLSS_JITTER_SIGN").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0).signum();
++            let jitter = [halton(i, 2) - 0.5, halton(i, 3) - 0.5];
++            // (in pixels, x right and y down)
++            let shift = Mat4::from_translation(Vec3::new(2.0 * jitter[0] / width as f32, -2.0 * jitter[1] / height as f32, 0.0));
++            // last frame's camera, when it is this picture's history
++            let prev = d.prev.filter(|p| p.render == (width, height) && p.output == (full_w, full_h) && p.mode == dlss_mode);
++            let jumped = prev.is_some_and(|p| (p.camera.position - camera.position).length() > 30.0 || p.camera.forward().dot(camera.forward()) < 0.8);
++            let (vp_prev, vp_prev_here) = match prev {
++                Some(p) => (p.camera.view_proj(p.aspect, p.origin), p.camera.view_proj(p.aspect, ro)),
++                None => (vp_plain, vp_plain),
++            };
++            // last frame's model matrices: a buffer as big as the models buffer, copied into
++            // at the end of each frame
++            // (a buffer: DLSS draws on DirectX 12, never on the chips that read the models
++            // from a texture)
++            if let Some(GpuArray::Buffer(models)) = scene.model_buf.as_ref() {
++                if d.prev_models.as_ref().is_none_or(|(b, _)| b.size() < models.size()) {
++                    let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
++                        label: Some("dlss last models"),
++                        size: models.size(),
++                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
++                        mapped_at_creation: false,
++                    });
++                    let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                        label: Some("dlss motion"),
++                        layout: &self.dlss_pipes.as_ref().expect("dlss pipelines").motion_layout,
++                        entries: &[
++                            wgpu::BindGroupEntry { binding: 0, resource: d.motion_buf.as_entire_binding() },
++                            wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
++                        ],
++                    });
++                    d.prev_models = Some((buf, bg));
++                    d.prev_epoch = u64::MAX;
++                }
++            }
++            let models_ok = prev.is_some() && d.prev_epoch == scene.model_epoch && d.prev_models.is_some();
++            let mu = MotionUniform {
++                vp: vp_plain.to_cols_array_2d(),
++                vp_prev: vp_prev.to_cols_array_2d(),
++                vp_prev_here: vp_prev_here.to_cols_array_2d(),
++                vp_inv: vp_plain.inverse().to_cols_array_2d(),
++                params: [width as f32, height as f32, if models_ok { 1.0 } else { 0.0 }, d.prev_entries as f32],
++            };
++            self.queue.write_buffer(&d.motion_buf, 0, bytemuck::bytes_of(&mu));
++            dlss_frame_info = Some(DlssFrame {
++                vp: vp_plain,
++                vp_prev_here,
++                jitter: [sign * jitter[0], sign * jitter[1]],
++                reset: prev.is_none() || jumped,
++                aspect,
++            });
++            shift * vp_mat
++        } else {
++            vp_mat
++        };
+         let cu = CameraUniform {
+             post: [
+                 if enhanced { 1.0 } else { 0.0 },
+@@ -8755,10 +9243,23 @@ impl Renderer {
+             self.queue
+                 .write_buffer(&self.ao_buf, 0, bytemuck::bytes_of(&u));
+             let ao = self.ao.as_ref().unwrap();
++            // DLSS: the prepass writes each pixel's motion beside its depth
++            let dlss_prepass = if dlss_frame {
++                self.dlss_pipes.as_ref().zip(self.dlss.as_ref()).and_then(|(p, d)| Some((p, d.targets.as_ref()?, &d.prev_models.as_ref()?.1)))
++            } else {
++                None
++            };
++            let cleared = |view| wgpu::RenderPassColorAttachment {
++                view,
++                depth_slice: None,
++                resolve_target: None,
++                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
++            };
++            let motion_colors = [dlss_prepass.map(|(_, t, _)| cleared(&t.motion_view)), dlss_prepass.map(|(_, t, _)| cleared(&t.bias_view))];
+             {
+                 let mut pass = prepass_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                     label: Some("depth prepass"),
+-                    color_attachments: &[],
++                    color_attachments: if motion_colors[0].is_some() { &motion_colors[..] } else { &[] },
+                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                         view: &ao.depth_view,
+                         depth_ops: Some(wgpu::Operations {
+@@ -8771,10 +9272,21 @@ impl Renderer {
+                     occlusion_query_set: None,
+                     multiview_mask: None,
+                 });
++                if let Some((p, _, bg)) = dlss_prepass {
++                    // the sky's motion under everything, then the scene's over it
++                    pass.set_bind_group(3, bg, &[]);
++                    pass.set_pipeline(&p.sky);
++                    pass.draw(0..3, 0..1);
++                }
+                 pass.set_bind_group(0, scene.camera_bind_group.as_ref().unwrap(), &[]);
+-                encode_batches(&mut pass, scene, &prepass_batches, |pipe| {
+-                    &self.prepass_pipelines[pipe as usize]
++                encode_batches(&mut pass, scene, &prepass_batches, |pipe| match dlss_prepass {
++                    Some((p, _, _)) => &p.prepass[pipe as usize],
++                    None => &self.prepass_pipelines[pipe as usize],
+                 });
++                if let Some((p, _, _)) = dlss_prepass.filter(|_| !rain_batches.is_empty()) {
++                    encode_batches(&mut pass, scene, &rain_batches, |_| &p.rain);
++                    encode_batches(&mut pass, scene, &rain_batches, |_| &p.rain_bias);
++                }
+             }
+             for (pipe, bg, target, pass_label) in [
+                 (&self.ssao_pipeline, &ao.ssao_bg, &ao.ao_view, "ssao"),
+@@ -9282,7 +9794,8 @@ impl Renderer {
+             self.queue
+                 .write_buffer(&self.post_buf, 0, bytemuck::bytes_of(&pu));
+             // (a mirror's small picture goes without FXAA)
+-            let fxaa = with_overlays && self.options.fxaa && omsi_cfg::env::var_os("OMSI_NO_FXAA").is_none();
++            // (nor a picture for DLSS: it smooths the edges itself, from the jittered frames)
++            let fxaa = with_overlays && !dlss_frame && self.options.fxaa && omsi_cfg::env::var_os("OMSI_NO_FXAA").is_none();
+             if let Some(h) = self.hdr_targets.get(&(width, height)) {
+                 let puddles = h.puddles.as_ref().filter(|_| puddles_on);
+                 let levels = h.down.len();
+@@ -9402,33 +9915,28 @@ impl Renderer {
+                 0,
+                 bytemuck::cast_slice(&[width as f32, height as f32, sharpen.clamp(0.0, 0.8), if vanilla_fxaa { 1.0 } else { 0.0 }]),
+             );
+-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+-                label: Some("upscale"),
+-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                    view: target,
+-                    depth_slice: None,
+-                    resolve_target: None,
+-                    ops: wgpu::Operations {
+-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+-                        store: wgpu::StoreOp::Store,
+-                    },
+-                })],
+-                depth_stencil_attachment: None,
+-                timestamp_writes: pass_timer(tset.as_ref(), &mut timed, "upscale"),
+-                occlusion_query_set: None,
+-                multiview_mask: None,
+-            });
+-            pass.set_pipeline(&self.upscale_pipeline);
+-            pass.set_bind_group(0, bg, &[]);
+-            pass.draw(0..3, 0..1);
+-            if !overlays.is_empty() {
+-                pass.set_pipeline(&self.overlay_pipeline_1x);
+-                for (k, _) in overlays.iter().enumerate() {
+-                    if let Some((_, _, bg, _)) = scene.overlay_res.get(k) {
+-                        pass.set_bind_group(0, bg, &[]);
+-                        pass.draw(0..6, 0..1);
+-                    }
+-                }
++            if dlss_frame {
++                // DLSS reads the picture after this submit, and the HUD is drawn over its
++                // result after DLSS (see `dlss_present`)
++                self.dlss_end_of_scene(&mut encoder, scene);
++            } else {
++                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                    label: Some("upscale"),
++                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                        view: target,
++                        depth_slice: None,
++                        resolve_target: None,
++                        ops: wgpu::Operations {
++                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                            store: wgpu::StoreOp::Store,
++                        },
++                    })],
++                    depth_stencil_attachment: None,
++                    timestamp_writes: pass_timer(tset.as_ref(), &mut timed, "upscale"),
++                    occlusion_query_set: None,
++                    multiview_mask: None,
++                });
++                self.encode_upscale_hud(&mut pass, bg, scene, overlays.len());
+             }
+         }
+         stage(self, "encode", "mirror.encode");
+@@ -9516,6 +10024,9 @@ impl Renderer {
+         stage(self, "finish", "mirror.finish");
+         self.queue
+             .submit([shadow_commands, prepass_commands].into_iter().chain(part_commands).chain([commands]));
++        if let Some(frame) = dlss_frame_info.filter(|_| dlss_frame) {
++            self.dlss_present(scene, target, camera, ro, frame, (width, height), (full_w, full_h), overlays.len());
++        }
+         stage(self, "submit", "mirror.submit");
+         if let (Some(t), false) = (
+             self.gpu_timers[with_overlays as usize].as_mut(),
+@@ -9526,6 +10037,139 @@ impl Renderer {
+         }
+     }
+ 
++    /// The picture scaled up into the window (`bg`: the upscale bind group of its target),
++    /// and the HUD over it at the window's size.
++    fn encode_upscale_hud(&self, pass: &mut wgpu::RenderPass<'_>, bg: &wgpu::BindGroup, scene: &Scene, overlays: usize) {
++        pass.set_pipeline(&self.upscale_pipeline);
++        pass.set_bind_group(0, bg, &[]);
++        pass.draw(0..3, 0..1);
++        if overlays > 0 {
++            pass.set_pipeline(&self.overlay_pipeline_1x);
++            for k in 0..overlays {
++                if let Some((_, _, bg, _)) = scene.overlay_res.get(k) {
++                    pass.set_bind_group(0, bg, &[]);
++                    pass.draw(0..6, 0..1);
++                }
++            }
++        }
++    }
++
++    /// The end of a DLSS frame's scene commands: this frame's model matrices kept for the
++    /// next one's motion vectors, and each texture DLSS reads left in the state DLSS is told
++    /// (`dlss::Runtime::evaluate`): wgpu leaves a texture in the state of its last use, and
++    /// these passes of nothing but their attachments are that last use - colour targets,
++    /// the depth written.
++    fn dlss_end_of_scene(&mut self, encoder: &mut wgpu::CommandEncoder, scene: &Scene) {
++        let Some(d) = self.dlss.as_mut() else { return };
++        // (the prepass read last frame's copy before this: its commands come first)
++        if let (Some(GpuArray::Buffer(models)), Some((prev, _))) = (scene.model_buf.as_ref(), d.prev_models.as_ref()) {
++            let bytes = (scene.uploaded_entries as u64 * 64).min(models.size()).min(prev.size());
++            if bytes > 0 {
++                encoder.copy_buffer_to_buffer(models, 0, prev, 0, bytes);
++            }
++            d.prev_epoch = scene.model_epoch;
++            d.prev_entries = (bytes / 64) as u32;
++        }
++        let (Some(t), Some(ao)) = (d.targets.as_ref(), self.ao.as_ref()) else { return };
++        let keep = |view| {
++            Some(wgpu::RenderPassColorAttachment {
++                view,
++                depth_slice: None,
++                resolve_target: None,
++                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
++            })
++        };
++        drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++            label: Some("dlss inputs"),
++            color_attachments: &[keep(&t.color_view), keep(&t.motion_view), keep(&t.bias_view)],
++            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                view: &ao.depth_view,
++                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
++                stencil_ops: None,
++            }),
++            timestamp_writes: None,
++            occlusion_query_set: None,
++            multiview_mask: None,
++        }));
++        drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++            label: Some("dlss output"),
++            color_attachments: &[keep(&t.output_view)],
++            depth_stencil_attachment: None,
++            timestamp_writes: None,
++            occlusion_query_set: None,
++            multiview_mask: None,
++        }));
++    }
++
++    /// After a DLSS frame's scene submit: DLSS on wgpu's queue, then its result drawn into
++    /// the window with the HUD over it. When DLSS fails, the picture is scaled up as without
++    /// it, and DLSS stays off from then on.
++    #[allow(clippy::too_many_arguments)]
++    fn dlss_present(&mut self, scene: &Scene, target: &wgpu::TextureView, camera: &Camera, ro: DVec3, frame: DlssFrame, render: (u32, u32), full: (u32, u32), overlays: usize) {
++        let mode = self.options.dlss;
++        let (Some(d), Some(ao)) = (self.dlss.as_mut(), self.ao.as_ref()) else { return };
++        let Some(t) = d.targets.as_ref() else { return };
++        let fov = camera.fov_deg.to_radians();
++        let proj = Mat4::perspective_rh(fov, frame.aspect, camera.far, camera.near);
++        let constants = dlss::FrameConstants {
++            view_to_clip: sl_matrix(proj),
++            clip_to_view: sl_matrix(proj.inverse()),
++            clip_to_prev_clip: sl_matrix(frame.vp_prev_here * frame.vp.inverse()),
++            prev_clip_to_clip: sl_matrix(frame.vp * frame.vp_prev_here.inverse()),
++            jitter: frame.jitter,
++            camera_pos: (camera.position - ro).as_vec3().to_array(),
++            camera_up: camera.up().to_array(),
++            camera_right: camera.right().to_array(),
++            camera_fwd: camera.forward().to_array(),
++            near: camera.near,
++            far: camera.far,
++            fov,
++            aspect: frame.aspect,
++            reset: frame.reset,
++        };
++        let inputs = dlss::Inputs { color: &t.color, depth: &ao.depth, motion: &t.motion, bias: &t.bias, output: &t.output_tex, render_size: render, output_size: full };
++        let ok = match d.runtime.evaluate(&self.device, &self.queue, mode, &inputs, &constants) {
++            Ok(()) => true,
++            Err(e) => {
++                log::error!("DLSS failed: {e:#}; drawing without it from now on");
++                false
++            }
++        };
++        d.keep.push_back(vec![t.color.clone(), ao.depth.clone(), t.motion.clone(), t.bias.clone(), t.output_tex.clone()]);
++        while d.keep.len() > 4 {
++            d.keep.pop_front();
++        }
++        d.prev = Some(DlssPrev { camera: *camera, aspect: frame.aspect, origin: ro, render, output: full, mode });
++        // (2: DLSS hands back the sRGB-encoded values it read: the blit decodes them, or the
++        // window's sRGB target encoded them a second time - a grey veil over everything; a
++        // window of a plain format stores what it is given, so they go in as they are)
++        let decode = if self.format.is_srgb() { 2.0 } else { 0.0 };
++        self.queue.write_buffer(&d.blit_buf, 0, bytemuck::cast_slice(&[full.0 as f32, full.1 as f32, 0.0, decode]));
++        // (without DLSS's result: the picture scaled up as the render scale does it)
++        let bg = if ok { t.output_bg.clone() } else { t.color_bg.clone() };
++        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dlss hud") });
++        {
++            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                label: Some("dlss hud"),
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: target,
++                    depth_slice: None,
++                    resolve_target: None,
++                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
++                })],
++                depth_stencil_attachment: None,
++                timestamp_writes: None,
++                occlusion_query_set: None,
++                multiview_mask: None,
++            });
++            self.encode_upscale_hud(&mut pass, &bg, scene, overlays);
++        }
++        self.queue.submit(Some(encoder.finish()));
++        if !ok {
++            self.dlss_failed = true;
++        }
++    }
++
+     /// Render off-screen and return RGBA8 pixels.
+     pub fn render_to_image(
+         &mut self,
+@@ -9990,7 +10634,13 @@ fn sky_input_differs(a: &atmosphere::SkyInput, b: &atmosphere::SkyInput) -> bool
+ /// is what `s_tile`'s clamp to edge gives; reading `t_trans`/`t_night` through both
+ /// samplers fails the whole module ("Conflicting samplers").
+ fn scene_shader_source(gl: bool) -> String {
+-    arrays_as_textures(&scene_shader_text(gl), array_path())
++    let mut src = scene_shader_text(gl);
++    // (DLSS's motion passes: DirectX 12 only, with the arrays in storage buffers)
++    if !gl && array_path() == ArrayPath::Storage {
++        src.push_str("\n");
++        src.push_str(include_str!("dlss_motion.wgsl"));
++    }
++    arrays_as_textures(&src, array_path())
+ }
+ 
+ /// The scene module with its arrays read as `path` has them (see `ArrayPath`): each
+@@ -11780,6 +12430,18 @@ mod tests {
+         assert!(res.is_ok(), "renderer should initialize on noop backend: {:?}", res.err());
+     }
+ 
++    #[test]
++    fn dlss_jitter_is_halton() {
++        assert_eq!(halton(1, 2), 0.5);
++        assert_eq!(halton(2, 2), 0.25);
++        assert_eq!(halton(3, 2), 0.75);
++        assert!((halton(1, 3) - 1.0 / 3.0).abs() < 1e-6);
++        assert!((halton(2, 3) - 2.0 / 3.0).abs() < 1e-6);
++        // Streamline's rows are glam's columns: a translation sits in the last row
++        let rows = sl_matrix(Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0)));
++        assert_eq!(rows[3], [1.0, 2.0, 3.0, 1.0]);
++    }
++
+     #[test]
+     fn omsi_render_phases_are_monotonic_and_complete() {
+         assert_eq!(
+@@ -11943,6 +12605,7 @@ mod tests {
+             ("PointLight", std::mem::size_of::<GpuPointLight>()),
+             ("Camera", std::mem::size_of::<CameraUniform>()),
+             ("MaterialParams", std::mem::size_of::<MaterialUniform>()),
++            ("Motion", std::mem::size_of::<MotionUniform>()),
+         ];
+         let mut checked = std::collections::HashSet::new();
+         for (name, src) in &modules {
+diff --git a/crates/omsi-render/src/shader.wgsl b/crates/omsi-render/src/shader.wgsl
+index 054c388..b8b1417 100644
+--- a/crates/omsi-render/src/shader.wgsl
++++ b/crates/omsi-render/src/shader.wgsl
+@@ -460,9 +460,15 @@ fn vertex_specular(wp: vec3<f32>, n: vec3<f32>) -> array<vec3<f32>, 2> {
+ 
+ @vertex
+ fn vs_main(in: VsIn) -> VsOut {
+-    let e = draw_list[in.inst];
++    return vertex_main(in.pos, in.normal, in.uv, in.inst);
++}
++
++// (the scene vertex of `vs_main`; the DLSS prepass's `vs_motion` takes the same, so that its
++// depth is the main pass's to the last bit)
++fn vertex_main(in_pos: vec3<f32>, in_normal: vec3<f32>, in_uv: vec2<f32>, in_inst: u32) -> VsOut {
++    let e = draw_list[in_inst];
+     let m = model_matrix(e);
+-    let wp = m * vec4<f32>(in.pos, 1.0);
++    let wp = m * vec4<f32>(in_pos, 1.0);
+     var out: VsOut;
+     // Legacy surfaces are pulled towards the eye along the line of sight. OMSI splines and
+     // [surface] objects use a fixed 8 cm world lift; ordered scenery phases use their authored
+@@ -480,12 +486,12 @@ fn vs_main(in: VsIn) -> VsOut {
+     }
+     out.clip = camera.view_proj * vec4<f32>(cp, 1.0);
+     out.world = wp.xyz;
+-    out.normal = safe_normal((m * vec4<f32>(in.normal, 0.0)).xyz);
++    out.normal = safe_normal((m * vec4<f32>(in_normal, 0.0)).xyz);
+     let sp = vertex_specular(wp.xyz, out.normal);
+     out.spec_sun = sp[0];
+     out.spec_sky = sp[1];
+     let pr = inst_params[e * 2u];
+-    out.uv = in.uv + pr.zw;
++    out.uv = in_uv + pr.zw;
+     out.params = pr;
+     out.params2 = inst_params[e * 2u + 1u];
+     if (pr.y < 0.5) {
+@@ -639,9 +645,16 @@ fn fs_puddle_glass_depth(in: FsIn) {
+ 
+ @fragment
+ fn fs_shadow_test(in: FsIn) {
+-    var duv = tex_address(in.uv);
++    if (!cutout_covers(in.uv, in.params)) {
++        discard;
++    }
++}
++
++// Whether an alpha-tested material covers its pixel in the depth passes (`fs_shadow_test`).
++fn cutout_covers(in_uv: vec2<f32>, in_params: vec4<f32>) -> bool {
++    var duv = tex_address(in_uv);
+     if (material.extra.x > 0.5) {
+-        duv = in.uv * material.extra.z;
++        duv = in_uv * material.extra.z;
+     }
+     // Use the light-pass footprint for cutout coverage. Forcing mip 0 here aliases dense
+     // foliage and alpha layers into a checkerboard when the light projection moves by a
+@@ -653,12 +666,10 @@ fn fs_shadow_test(in: FsIn) {
+     var a = select(diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv).a, 1.0, material.params.x > 1.5 && material.params.z < 0.5);
+     if (material.params.z > 0.5) {
+         // (the transmap stays where it is: [texcoordtransX/Y] only moves the diffuse stage)
+-        let tm = sample_transmap(tex_address(in.uv - in.params.zw));
++        let tm = sample_transmap(tex_address(in_uv - in_params.zw));
+         a = select(1.0, tm.a, material.params.w > 0.5);
+     }
+-    if (a < 0.5) {
+-        discard;
+-    }
++    return a >= 0.5;
+ }
+ 
+ // Roads with feathered alpha borders stay blended while their overlaps compose.
+@@ -683,19 +694,21 @@ fn fs_surface_depth(in: FsIn) -> @location(0) vec4<f32> {
+ // remain out of the prepass and are composited normally.
+ @fragment
+ fn fs_transmap_depth(in: FsIn) {
+-    if (material.params.z < 0.5) {
++    if (!transmap_covers(in.uv, in.params)) {
+         discard;
+     }
+-    let tm = sample_transmap(tex_address(in.uv - in.params.zw));
+-    let a = select(1.0, tm.a, material.params.w > 0.5) * in.params.x;
++}
++
++// Whether the opaque part of a blended transmap covers its pixel (`fs_transmap_depth`).
++fn transmap_covers(in_uv: vec2<f32>, in_params: vec4<f32>) -> bool {
++    let tm = sample_transmap(tex_address(in_uv - in_params.zw));
++    let a = select(1.0, tm.a, material.params.w > 0.5) * in_params.x;
+     // Only what the colour pass will cover completely may hide what lies behind it: a
+     // texel that is merely more opaque than not (the dimmer and anti-aliased dots of a
+     // display's text layer, whose transmap is its script texture) wrote depth here, the
+     // display's backplate behind it was then rejected, and the half-transparent text was
+     // blended over the sky - holes in the display.
+-    if (a < 0.99) {
+-        discard;
+-    }
++    return material.params.z > 0.5 && a >= 0.99;
+ }
+ 
+ // 1 = lit by the sun, 0 = in shadow. Two cascades: the near one (sharp, around the camera)
+diff --git a/crates/omsi-render/src/upscale.wgsl b/crates/omsi-render/src/upscale.wgsl
+index b180de1..4de9de7 100644
+--- a/crates/omsi-render/src/upscale.wgsl
++++ b/crates/omsi-render/src/upscale.wgsl
+@@ -5,7 +5,9 @@
+ // what the smaller picture lost, most where the picture is flat and least on hard edges.
+ struct Params {
+     // xy: size of the source picture, z: sharpening 0..1, w: 1 = the picture at the window's
+-    // own size smoothed by FXAA instead (the plain graphics without multisampling)
++    // own size smoothed by FXAA instead (the plain graphics without multisampling); 2 = DLSS's
++    // result, which holds the sRGB-encoded values it read from the picture: decoded here, as
++    // the window's sRGB target encodes what it is given
+     src: vec4<f32>,
+ };
+ @group(0) @binding(0) var<uniform> p: Params;
+@@ -164,7 +166,7 @@ fn fs_copy(in: VsOut) -> @location(0) vec4<f32> {
+ @fragment
+ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+     let size = p.src.xy;
+-    if (p.src.w > 0.5) {
++    if (p.src.w > 0.5 && p.src.w < 1.5) {
+         return vec4<f32>(fxaa(in.uv, 1.0 / size), 1.0);
+     }
+     let px = 1.0 / size;
+@@ -190,5 +192,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+         let wgt = amp * peak;
+         col = clamp((col + (n + s + w + e) * wgt) / (vec3<f32>(1.0) + 4.0 * wgt), vec3<f32>(0.0), vec3<f32>(1.0));
+     }
++    if (p.src.w > 1.5) {
++        col = srgb_to_linear(col);
++    }
+     return vec4<f32>(col, 1.0);
+ }
++
++fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
++    let x = max(c, vec3<f32>(0.0));
++    return select(pow((x + 0.055) / 1.055, vec3<f32>(2.4)), x / 12.92, x <= vec3<f32>(0.04045));
++}
+diff --git a/docs/USER_GUIDE.md b/docs/USER_GUIDE.md
+index 8b92fa5..dfcf4f4 100644
+--- a/docs/USER_GUIDE.md
++++ b/docs/USER_GUIDE.md
+@@ -244,6 +244,24 @@ on the Controllers page, by name, separated by `|`) and `language` (`ENG`, `DEU`
+ in). The file also carries a `version`; older files that say
+ `boarding=pay` because that was the launcher's old default are read as `auto`.
+ 
++`dlss` (Settings → Anti-aliasing → **DLSS / DLAA**, its quality in the row below; the same in
++the game menu's Options → Graphics, where another quality is taken at once) draws the
++picture with NVIDIA DLSS Super Resolution instead of MSAA, FXAA and the render scale: `off`
++(default), `dlaa` (the window's own resolution, DLSS as anti-aliasing only), `quality`,
++`balanced`, `performance` or `ultra_performance` (about 67 %, 58 %, 50 % and 33 % of the
++window's width and height, scaled up by DLSS; the HUD stays at full resolution). It needs
++Windows, DirectX 12 (the game takes it when DLSS is on) and a GeForce RTX card with a
++current driver, and NVIDIA's Streamline runtime beside `openomsi.exe` - openOMSI ships none
++of NVIDIA's files: copy `sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll` and
++`nvngx_dlss.dll` from the [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline)'s
++`bin/x64` (or point `OMSI_STREAMLINE_DIR` at them). Without any of that the game says why
++in its log and draws as without DLSS, with the `msaa` the settings hold. The picture DLSS
++gets is the tone-mapped one; each frame the projection moves by a sub-pixel offset, and the
++depth prepass writes every pixel's motion (the camera's and each object's, from last
++frame's model matrices). The drops of the rain on the windscreen get their pane's motion and
++DLSS's bias mask (the current picture before the history), so they neither streak nor show
++twice; at Ultra performance they flicker a little, drawn from a ninth of the pixels.
++
+ `drive_keys` is a control preset: `simple` (W/S/A/D and the arrow keys drive; the default),
+ `wasd`, `arrows`, or `omsi` ("Custom controls") - only the layout of `Inputs/keyboard.cfg`
+ (OMSI's Shift + numpad, or what the Controls page made of it), nothing added. **T** sells the ticket a passenger asks for on a bus without a
+@@ -451,6 +469,9 @@ Environment variables, all off unless set. The useful ones:
+ | `OMSI_NO_BRIDGE=1` | a LAN host leaves the internet alone (no UPnP port forward, no address posting) - for tests |
+ | `OMSI_NO_LAN_MODS=1` | a LAN host serves no mods and a joining game fetches none |
+ | `OMSI_BACKEND=vulkan\|dx12\|gl` | the graphics interface to ask first (the log lists every adapter each one offers) |
++| `OMSI_DLSS=off\|dlaa\|quality\|balanced\|performance\|ultra_performance` | DLSS whatever the settings say |
++| `OMSI_STREAMLINE_DIR=dir`, `OMSI_DLSS_VERBOSE=1` | where Streamline's DLLs are (the game's folder by default), and all of Streamline's log |
++| `OMSI_DLSS_JITTER_SIGN=-1` | tell DLSS the sub-pixel offset the other way round (a picture that shimmers or smears on every edge with DLSS) |
+ | `OMSI_GPU_LIMITS=default\|downlevel` | pretend the graphics card can only do this much (tests of old cards) |
+ | `OMSI_GPU_ARRAYS=textures\|nostorage` | read the scene's arrays from textures, as on OpenGL chips without storage buffers in the vertex shader (or without any: no per-pixel lamp light) - tests of old cards |
+ | `OMSI_RENDER_OCCLUDED=1` | draw even while the window is hidden (tests) |
+-- 
+2.54.0.windows.1
+

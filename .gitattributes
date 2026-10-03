@@ -8,3 +8,7 @@
 # (see .github/workflows/sync-upstream.yml) and leaves the newest release where it was, which is
 # the right outcome: that one wants a person.
 CHANGELOG.md merge=union
+
+# The DLSS patch is a patch: it has to come out of a checkout byte for byte, with its own
+# line endings, or `git am` on it would carry CRLF into the files it applies to.
+FORK-DLSS.patch -text

@@ -5,6 +5,10 @@ It exists for one reason: the Windows build here carries a small workaround that
 `main` plus the DLSS Super Resolution / DLAA pull request
 ([#942](https://github.com/openOMSI-Project/openOMSI/pull/942)), which is not merged upstream yet.
 
+That change is also kept in this repository on its own - as a patch, a branch and a tag - so
+that closing or deleting the pull request cannot lose it, and so that it can be brought onto
+a newer project version in one merge: see `FORK-DLSS.md`.
+
 Nothing of NVIDIA's is included. The DLSS runtime (Streamline's `sl.interposer.dll`,
 `sl.common.dll`, `sl.dlss.dll` and `nvngx_dlss.dll`) has to be supplied by the player, exactly as
 the project's own documentation says.
