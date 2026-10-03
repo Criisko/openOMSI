@@ -1,0 +1,54 @@
+# Keeps this fork's main in step with the project's main.
+#
+# The fork exists so that a player's own update check can hand them the newest project code
+# together with the one local change it carries: the ReShade workaround in the Windows release
+# (see windows.yml). That only holds while the fork's main is a *merge* of the project's main -
+# the fork's own commits (the DLSS pull request, windows.yml, FORK.md) have to stay. So this
+# never discards anything and never force-pushes: it merges, or it does nothing at all.
+#
+# A merge that conflicts fails this job and changes nothing, which leaves the newest release
+# where it was: the fork is never left in a state nobody chose. (Then it wants a look by hand.)
+name: Sync with the project
+
+on:
+  schedule:
+    # (the project moves all day; once a night is enough for an update button)
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Merge the project's main
+        id: merge
+        run: |
+          set -eu
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/openOMSI-Project/openOMSI.git
+          git fetch --no-tags upstream main:refs/remotes/upstream/main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo 'the project has nothing newer than this fork'
+            echo 'merged=no' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git merge --no-edit upstream/main
+          git push origin HEAD:main
+          echo 'merged=yes' >> "$GITHUB_OUTPUT"
+
+      # A push made with the workflow's own token does not start another workflow, so the
+      # release build has to be asked for here by name.
+      - name: Build and publish the release
+        if: steps.merge.outputs.merged == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run windows.yml --repo "$GITHUB_REPOSITORY"
