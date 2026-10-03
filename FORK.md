@@ -25,9 +25,15 @@ games and not here.
 
 ## Releases
 
-Windows x64 only. Every push to `main` builds one and publishes it, so the launcher can update
-itself from this repository (`OMSI_UPDATE_URL` points at these releases). The archive keeps the
-name the launcher's updater looks for.
+Windows x64 only. Every push to `main` builds one and publishes it, and the build's own update
+check asks *this* repository for it (`crates/omsi-app/src/updater.rs`, `LATEST_API`), so the
+launcher hands the player the newest project code together with the workaround above. Nothing to
+set up on the player's machine: `OMSI_UPDATE_URL` only overrides the address for tests. What has
+to stay current is `main`, and `.github/workflows/sync-upstream.yml` merges the project's `main`
+into it every night - a merge that conflicts fails that job and leaves the fork exactly where it
+was.
+
+The archive keeps the name the launcher's updater looks for.
 
 The fork keeps the project's own pipeline (`.github/workflows/release.yml`) renamed to
 `release.yml.off`: its Android job wants `secrets.ANDROID_KEYSTORE_B64`, which a fork does not
