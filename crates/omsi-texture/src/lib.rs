@@ -15,6 +15,9 @@ pub mod dds;
 pub mod gpu;
 pub mod tga;
 
+#[cfg(test)]
+mod format_tests;
+
 /// The widest and tallest texture any decoder accepts (what Direct3D 9 cards held).
 pub const MAX_DIMENSION: usize = 16384;
 

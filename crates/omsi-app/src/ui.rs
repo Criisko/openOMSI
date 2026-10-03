@@ -22,9 +22,15 @@ struct Label {
     used: u64,
 }
 
+/// Or'ed into a label's pixel size: the text in the bold weight.
+const BOLD: u32 = 1 << 31;
+
 /// Texts rendered into textures, kept while they are used.
 pub struct TextCache {
     font: FontVec,
+    /// The same Roboto at 700: the menu's titles and its primary button, as the launcher
+    /// draws them (`Weight::Bold`); asked for with `BOLD` in the size.
+    bold: FontVec,
     labels: hashbrown::HashMap<(String, u32, [u8; 4]), Label>,
     frame: u64,
     /// How strongly the background plates are drawn this frame (`backdrop`).
@@ -39,7 +45,9 @@ impl TextCache {
         // a little heavier than the regular 400: light text on a dark panel is thin and
         // greyish at menu sizes otherwise
         let _ = font.set_variation(b"wght", 500.0);
-        Some(TextCache { font, labels: hashbrown::HashMap::new(), frame: 0, backdrop: 1.0, flat: false })
+        let mut bold = FontVec::try_from_vec(ROBOTO.to_vec()).ok()?;
+        let _ = bold.set_variation(b"wght", 700.0);
+        Some(TextCache { font, bold, labels: hashbrown::HashMap::new(), frame: 0, backdrop: 1.0, flat: false })
     }
 
     /// The texture of `text` at `px` pixels in `color` (alpha = opacity of the outline), and
@@ -53,7 +61,8 @@ impl TextCache {
             l.used = self.frame;
             return *l;
         }
-        let img = render_text(&self.font, text, px as f32, color);
+        let font = if px & BOLD != 0 { &self.bold } else { &self.font };
+        let img = render_text(font, text, (px & !BOLD) as f32, color);
         let tex = r.add_texture(scene, &img, false);
         let l = Label { tex, w: img.width, h: img.height, used: self.frame };
         self.labels.insert(key, l);
@@ -66,11 +75,21 @@ impl TextCache {
         self.width_raw(text, px)
     }
 
+    /// `width` of a text drawn in the bold weight (`BOLD`).
+    pub fn width_bold(&self, text: &str, px: f32) -> f32 {
+        let text = &*omsi_ui::tr(text);
+        self.width_in(&self.bold, text, px)
+    }
+
     fn width_raw(&self, text: &str, px: f32) -> f32 {
+        self.width_in(&self.font, text, px)
+    }
+
+    fn width_in(&self, base: &FontVec, text: &str, px: f32) -> f32 {
         let mut w = 0.0;
         let mut prev: Option<(ab_glyph::GlyphId, *const FontVec)> = None;
         for c in text.chars() {
-            let font = font_for(&self.font, c);
+            let font = font_for(base, c);
             let f = font.as_scaled(PxScale::from(px));
             let id = f.glyph_id(c);
             if let Some((p, pf)) = prev {
@@ -974,11 +993,25 @@ const BORDER: [u8; 4] = [255, 255, 255, 15];
 const ACCENT: [u8; 4] = [232, 160, 48, 255];
 const ACCENT_SOFT: [u8; 4] = [232, 160, 48, 34];
 const DANGER: [u8; 4] = [222, 78, 68, 255];
-/// A line under the mouse, and the line chosen.
-const LIT: [u8; 4] = [255, 255, 255, 16];
-const SELECTED: [u8; 4] = [255, 255, 255, 24];
-const LIT_DANGER: [u8; 4] = [222, 78, 68, 44];
-const CHIP: [u8; 4] = [255, 255, 255, 20];
+/// A line under the mouse, and the line chosen: the launcher's `HOVER` and `SELECTED`, as
+/// solid greys. (They were white at 6 % and 9 %, which the overlays blend in linear light:
+/// on the 22-grey card that came out 73 and 92, twice as light as the launcher's 38 and 44.)
+const LIT: [u8; 4] = [38, 38, 38, 255];
+const SELECTED: [u8; 4] = [44, 44, 44, 255];
+/// "End the session" under the mouse: the danger colour at 14 % on the card, solid.
+const LIT_DANGER: [u8; 4] = [50, 30, 28, 255];
+/// A stepper's or a button's field: the launcher's `FIELD`.
+const CHIP: [u8; 4] = [31, 31, 31, 255];
+/// A switch's track when off, a slider's empty track, their knob (the launcher's).
+const TRACK_OFF: [u8; 4] = [62, 62, 62, 255];
+const SLIDER_TRACK: [u8; 4] = [58, 58, 58, 255];
+const KNOB: [u8; 4] = [240, 240, 240, 255];
+/// A scroll bar's thumb, idle and with the mouse over its list (the launcher's white at
+/// 10 % and 35 %; no track, no accent).
+const THUMB: [u8; 4] = [255, 255, 255, 26];
+const THUMB_HOT: [u8; 4] = [255, 255, 255, 90];
+/// The small capitals over a title (the launcher's section headings: 11 px, bold, dim).
+const DIM: [u8; 4] = [142, 142, 142, 0];
 /// The accent's fill under the mouse, and the ink on it (the launcher's primary button).
 const ACCENT_HOT: [u8; 4] = [246, 182, 84, 255];
 const ON_ACCENT: [u8; 4] = [18, 14, 8, 0];
@@ -1019,6 +1052,48 @@ fn fade(c: [u8; 4], k: f32) -> [u8; 4] {
 /// `c` as a text colour (no outline).
 fn txt(c: [u8; 4]) -> [u8; 4] {
     [c[0], c[1], c[2], 0]
+}
+
+/// The game menu's size: the screen's scale times the interface size (`Frame::ui_scale`, the
+/// "Interface size" setting and the growth with tall windows, as the rest of the HUD has it),
+/// held where the settings window (880 x 600 as designed) would no longer fit the window -
+/// but never below the screen's scale alone, the size it always had.
+fn menu_scale(f: &Frame) -> f32 {
+    menu_scale_for(f.scale, f.ui_scale, f.width, f.height, f.vr)
+}
+
+fn menu_scale_for(scale: f32, ui_scale: f32, width: f32, height: f32, vr: bool) -> f32 {
+    let base = scale.max(0.5);
+    if vr {
+        return base;
+    }
+    let fit = (width / (880.0 + 24.0)).min(height * 0.94 / 600.0);
+    (base * ui_scale.max(0.5)).min(fit.max(base))
+}
+
+/// A list line `"<code>  <name>"` (a number, maybe padded in front, two spaces, a name): its
+/// code and name.
+fn code_and_name(label: &str) -> Option<(&str, &str)> {
+    let (code, name) = label.trim_start().split_once("  ")?;
+    (!code.is_empty() && code.chars().all(|c| c.is_ascii_digit()) && !name.trim().is_empty()).then(|| (code, name.trim()))
+}
+
+/// The cursor is in `rect`.
+fn over_rect(c: (f32, f32), rect: [f32; 4]) -> bool {
+    c.0 >= rect[0] && c.0 <= rect[2] && c.1 >= rect[1] && c.1 <= rect[3]
+}
+
+/// `text` clipped to `width` pixels in the bold weight (with "...").
+fn clip_bold(tc: &TextCache, text: &str, px: f32, width: f32) -> String {
+    let text = &*omsi_ui::tr(text);
+    if tc.width_bold(text, px) <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().collect();
+    while !out.is_empty() && tc.width_bold(&format!("{out}…"), px) > width {
+        out.pop();
+    }
+    format!("{}…", out.trim_end())
 }
 
 /// The distance of the point (`px`, `py`) from the rounded rectangle at (`x0`, `y0`) of
@@ -1082,6 +1157,21 @@ impl Ui {
         l.w as f32
     }
 
+    /// A scroll bar's thumb in `track` for `shown` of `n` lines from `first`, as the
+    /// launcher's: no track, a thin white bar that lightens while the mouse is over its list
+    /// (`hot`), at least 28 px long. Returns the rect drawn.
+    #[allow(clippy::too_many_arguments)]
+    fn thumb(&mut self, r: &Renderer, scene: &mut Scene, track: [f32; 4], first: usize, shown: usize, n: usize, hot: bool, s: f32) -> [f32; 4] {
+        let th = track[3] - track[1];
+        let n = n.max(1) as f32;
+        let len = (th * shown as f32 / n).max((28.0 * s).min(th));
+        let t0 = track[1] + (th - len) * (first as f32 / (n - shown as f32).max(1.0)).clamp(0.0, 1.0);
+        let thumb = [track[0], t0, track[2], t0 + len];
+        let a = self.easeq((16, "thumb", track[0] as usize), if hot { 1.0 } else { 0.0 }, 1.0 / FADE_SECS);
+        self.text.rounded(r, scene, thumb, 2.0 * s, mix(THUMB, THUMB_HOT, a));
+        thumb
+    }
+
     /// The accent bar at the left edge of a line, growing from its middle as `k` goes 0 to 1.
     fn accent_bar(&mut self, r: &Renderer, scene: &mut Scene, rect: [f32; 4], k: f32, danger: bool, s: f32) {
         let full = (rect[3] - rect[1] - 20.0 * s).max(10.0 * s);
@@ -1096,10 +1186,13 @@ impl Ui {
     fn menu_header(&mut self, r: &Renderer, scene: &mut Scene, x: f32, y: f32, w: f32, header_h: f32, title: &str, sub: &str, s: f32) -> f32 {
         let left = x + (PAD + TEXT_IN) * s;
         // (the game's name in the accent; the list names above are in capitals)
-        let (eyebrow, eyebrow_ink) = if sub.is_empty() { ("OPENOMSI".to_string(), txt(ACCENT)) } else { (sub.to_uppercase(), MUTED) };
-        let e = self.text.label(r, scene, &eyebrow, (12.0 * s) as u32, eyebrow_ink);
-        let title = clip_to(&self.text, title, 24.0 * s, w - (PAD + TEXT_IN) * 2.0 * s - 80.0 * s);
-        let t = self.text.label(r, scene, &title, (24.0 * s) as u32, WHITE);
+        // (as the launcher's section headings: small bold capitals, dim; the title bold)
+        let eyebrow = if sub.is_empty() { "OPENOMSI".to_string() } else { sub.to_uppercase() };
+        let room = w - (PAD + TEXT_IN) * 2.0 * s;
+        let eyebrow = clip_bold(&self.text, &eyebrow, 11.0 * s, room);
+        let e = self.text.label(r, scene, &eyebrow, (11.0 * s) as u32 | BOLD, DIM);
+        let title = clip_bold(&self.text, title, 22.0 * s, room);
+        let t = self.text.label(r, scene, &title, (22.0 * s) as u32 | BOLD, WHITE);
         let band = header_h - 6.0 * s;
         let top = y + (band - (e.h as f32 + t.h as f32 - 2.0 * s)) * 0.5;
         scene.overlays.push((e.tex, [left, top, left + e.w as f32, top + e.h as f32]));
@@ -1151,7 +1244,7 @@ impl Ui {
             self.menu_overlay_range = overlay_start..scene.overlays.len();
             return;
         }
-        let s = f.scale.max(0.5);
+        let s = menu_scale(f);
         let kind = f.menu_kind;
         // the picture dimmed behind the menu (the first overlay: the headset's menu takes it
         // for the backdrop)
@@ -1230,14 +1323,10 @@ impl Ui {
         let scrolls = nl > rows;
         if scrolls {
             let top = y + header_h;
-            let track = [list_r - 11.0 * s, top, list_r - 8.0 * s, top + row_h * rows as f32 - 4.0 * s];
+            let track = [list_r - 12.0 * s, top, list_r - 8.0 * s, top + row_h * rows as f32 - 4.0 * s];
             self.menu_scroll_track = Some(track);
-            self.text.rounded(r, scene, track, 1.5 * s, [255, 255, 255, 22]);
-            let th = track[3] - track[1];
-            let t0 = track[1] + th * start as f32 / nl as f32;
-            let t1 = track[1] + th * (start + rows) as f32 / nl as f32;
-            let thumb = [track[0], t0, track[2], t1];
-            self.text.rounded(r, scene, thumb, 1.5 * s, ACCENT);
+            let hot = over_rect(f.cursor, [x, y, list_r, y + h]);
+            let thumb = self.thumb(r, scene, track, start, rows, nl, hot, s);
             // (a wider grip than the drawn thumb: three pixels are hard to hit)
             self.menu_scroll_thumb = Some([thumb[0] - 6.0 * s, thumb[1], thumb[2] + 6.0 * s, thumb[3]]);
         }
@@ -1256,6 +1345,17 @@ impl Ui {
             for &(_, label) in items.iter() {
                 if let Some(n) = label.strip_prefix(line_pre.as_str()).and_then(|rest| rest.rsplit_once("  (")).map(|(n, _)| n) {
                     sign_w = sign_w.max(self.text.width(n, 15.0 * s) + 22.0 * s);
+                }
+            }
+        }
+        // (a list of codes and names - the destinations, `"{code:>3}  {name}"` - in two
+        // columns: the codes right-aligned in one as wide as the widest, the names after it.
+        // Padded with spaces, the proportional font left them ragged.)
+        let mut code_w = 0.0f32;
+        if kind == MenuKind::List {
+            for &(_, label) in items[..nl].iter() {
+                if let Some((c, _)) = code_and_name(label) {
+                    code_w = code_w.max(self.text.width(c, px as f32));
                 }
             }
         }
@@ -1328,6 +1428,15 @@ impl Ui {
                         self.put(r, scene, "›", px + 2, mix(MUTED, ACCENT_HOT, glow), rx - d * 0.5 - aw * 0.5, cy - 1.0 * s);
                         let info = clip_to(&self.text, info, px as f32, rx - d - 12.0 * s - tx);
                         self.put(r, scene, &info, px, ink, tx, cy);
+                        done = true;
+                    }
+                }
+                MenuKind::List if code_w > 0.0 => {
+                    if let Some((code, name)) = code_and_name(label) {
+                        self.put_right(r, scene, code, px, mix(MUTED, ACCENT_HOT, glow), lx + code_w, cy);
+                        let nx = lx + code_w + 12.0 * s;
+                        let name = clip_to(&self.text, name, px as f32, rx - nx);
+                        self.put(r, scene, &name, px, ink, nx, cy);
                         done = true;
                     }
                 }
@@ -1462,12 +1571,8 @@ impl Ui {
                 self.menu_pane_box = Some([px0, py0, px1, py1]);
                 // (a long list of stops: a thin scroll bar at the pane's edge)
                 if n > fit {
-                    let (tt, tb) = (top, go[1] - 10.0 * s);
-                    let th = tb - tt;
-                    self.text.rounded(r, scene, [px1 - 6.0 * s, tt, px1 - 3.0 * s, tb], 1.5 * s, [255, 255, 255, 22]);
-                    let t0 = tt + th * first as f32 / n as f32;
-                    let t1 = tt + th * (first + fit) as f32 / n as f32;
-                    self.text.rounded(r, scene, [px1 - 6.0 * s, t0, px1 - 3.0 * s, t1], 1.5 * s, ACCENT);
+                    let hot = over([px0, py0, px1, py1]);
+                    self.thumb(r, scene, [px1 - 7.0 * s, top, px1 - 3.0 * s, go[1] - 10.0 * s], first, fit, n, hot, s);
                 }
                 let time_w = p.rows.iter().skip(first).take(fit).map(|row| self.text.width(&row.1, rpx as f32)).fold(0.0f32, f32::max);
                 for (i, (what, when)) in p.rows.iter().enumerate().skip(first).take(fit) {
@@ -1492,7 +1597,7 @@ impl Ui {
                 // the button that starts the trip
                 let a_go = self.easeq((13, "go", 0), if over(go) { 1.0 } else { 0.0 }, 1.0 / FADE_SECS);
                 self.text.rounded(r, scene, go, ROW_R * s, mix(ACCENT, ACCENT_HOT, a_go));
-                let l = self.text.label(r, scene, button, (14.0 * s) as u32, ON_ACCENT);
+                let l = self.text.label(r, scene, button, (14.0 * s) as u32 | BOLD, ON_ACCENT);
                 let (gx, gy) = (go[0] + (go[2] - go[0] - l.w as f32) * 0.5, (go[1] + go[3]) * 0.5 - l.h as f32 * 0.5);
                 scene.overlays.push((l.tex, [gx, gy, gx + l.w as f32, gy + l.h as f32]));
                 self.menu_pane_go = Some(go);
@@ -1538,7 +1643,7 @@ impl Ui {
     /// `c` a stepper (value between arrows), `o` opens a list, `a` a button (its text is the
     /// value), `i` information.
     fn draw_settings(&mut self, r: &Renderer, scene: &mut Scene, f: &Frame, sel: usize, items: &[(&str, &str)]) {
-        let s = f.scale.max(0.5);
+        let s = menu_scale(f);
         let dim = self.text.plate(r, scene, 6);
         let sep = self.text.plate(r, scene, 9);
         scene.overlays.push((dim, [0.0, 0.0, f.width, f.height]));
@@ -1634,14 +1739,10 @@ impl Ui {
         let cx1 = x + w - pad - if scrolls { 8.0 * s } else { 0.0 };
         if scrolls {
             let top = y + header_h;
-            let track = [x + w - 12.0 * s, top, x + w - 9.0 * s, top + row_h * rows as f32 - 4.0 * s];
+            let track = [x + w - 12.0 * s, top, x + w - 8.0 * s, top + row_h * rows as f32 - 4.0 * s];
             self.menu_scroll_track = Some(track);
-            self.text.rounded(r, scene, track, 1.5 * s, [255, 255, 255, 22]);
-            let th = track[3] - track[1];
-            let t0 = track[1] + th * start as f32 / items.len() as f32;
-            let t1 = track[1] + th * (start + rows) as f32 / items.len() as f32;
-            let thumb = [track[0], t0, track[2], t1];
-            self.text.rounded(r, scene, thumb, 1.5 * s, ACCENT);
+            let hot = over_rect(f.cursor, [x + side_w, y + header_h, x + w, y + h]);
+            let thumb = self.thumb(r, scene, track, start, rows, items.len(), hot, s);
             self.menu_scroll_thumb = Some([thumb[0] - 6.0 * s, thumb[1], thumb[2] + 6.0 * s, thumb[3]]);
         }
         // the rows
@@ -1683,19 +1784,18 @@ impl Ui {
                 // a switch
                 "s" => {
                     let on = value == "on";
-                    let (tw, th) = (44.0 * s, 24.0 * s);
+                    // (the launcher's switch - 34 x 18, a white knob 6 px smaller than the
+                    // track - a tenth larger for the menu's larger text)
+                    let (tw, th) = (38.0 * s, 20.0 * s);
                     let tx = rx - tw;
                     let track = [tx, cy - th * 0.5, tx + tw, cy + th * 0.5];
                     // (the knob slides over and the track changes its colour)
                     let t = self.ease((5, id, k), if on { 1.0 } else { 0.0 }, 1.0 / FADE_SECS);
                     let tq = quant(t);
-                    if tq < 1.0 {
-                        self.text.rounded(r, scene, [track[0] - 1.0, track[1] - 1.0, track[2] + 1.0, track[3] + 1.0], th * 0.5 + 1.0, fade([255, 255, 255, 44], 1.0 - tq));
-                    }
-                    self.text.rounded(r, scene, track, th * 0.5, mix([62, 62, 62, 255], ACCENT, tq));
-                    let kn = 18.0 * s;
+                    self.text.rounded(r, scene, track, th * 0.5, mix(TRACK_OFF, ACCENT, tq));
+                    let kn = th - 6.0 * s;
                     let kx = tx + 3.0 * s + (tw - kn - 6.0 * s) * t;
-                    self.text.rounded(r, scene, [kx, cy - kn * 0.5, kx + kn, cy + kn * 0.5], kn * 0.5, mix([142, 142, 142, 255], [240, 240, 240, 255], tq));
+                    self.text.rounded(r, scene, [kx, cy - kn * 0.5, kx + kn, cy + kn * 0.5], kn * 0.5, KNOB);
                     tx
                 }
                 // a slider: the track with its knob, the value right of it
@@ -1706,15 +1806,15 @@ impl Ui {
                     let x1 = rx - vw - 10.0 * s;
                     let x0 = x1 - tw;
                     let th = 4.0 * s;
-                    self.text.rounded(r, scene, [x0, cy - th * 0.5, x1, cy + th * 0.5], th * 0.5, [255, 255, 255, 34]);
+                    self.text.rounded(r, scene, [x0, cy - th * 0.5, x1, cy + th * 0.5], th * 0.5, SLIDER_TRACK);
                     // (the knob glides to its place and grows a little under the mouse)
                     let fr = self.ease((6, id, k), frac.unwrap_or(0.0).clamp(0.0, 1.0), 2.0 / FADE_SECS);
                     let fx = x0 + tw * fr;
                     if fx - x0 >= 1.0 {
                         self.text.rounded(r, scene, [x0, cy - th * 0.5, fx, cy + th * 0.5], th * 0.5, ACCENT);
                     }
-                    let kn = (13.0 + 4.0 * a) * s;
-                    self.text.rounded(r, scene, [fx - kn * 0.5, cy - kn * 0.5, fx + kn * 0.5, cy + kn * 0.5], kn * 0.5, mix([200, 200, 200, 255], [240, 240, 240, 255], a));
+                    let kn = (13.0 + 2.0 * a) * s;
+                    self.text.rounded(r, scene, [fx - kn * 0.5, cy - kn * 0.5, fx + kn * 0.5, cy + kn * 0.5], kn * 0.5, KNOB);
                     ctl = Some([x0, rect[1], x1, rect[3]]);
                     x0
                 }
@@ -1788,7 +1888,9 @@ impl Ui {
             self.dd_rows = n_vis;
             let rad = (CARD_R * s).min(10.0 * s);
             self.text.shadow(r, scene, panel, rad, 18.0 * s, 6.0 * s, 150);
-            self.text.rounded(r, scene, panel, rad, [38, 38, 38, 255]);
+            // (the launcher's popup: the field's grey, a hairline round it)
+            self.text.rounded(r, scene, [panel[0] - 1.0, panel[1] - 1.0, panel[2] + 1.0, panel[3] + 1.0], rad + 1.0, BORDER);
+            self.text.rounded(r, scene, panel, rad, PANEL_ALT);
             let more = dd.items.len() > n_vis;
             let dpx = (14.0 * s) as u32;
             let tin = TEXT_IN * s;
@@ -1799,10 +1901,10 @@ impl Ui {
                 let hot = over(rect) || (idx == dd.sel && f.menu_kbd && !over(panel));
                 let a = self.easeq((15, "dropdown", idx), if hot { 1.0 } else { 0.0 }, 1.0 / FADE_SECS);
                 if cur {
-                    self.text.rounded(r, scene, rect, ROW_R * s, SELECTED);
+                    self.text.rounded(r, scene, rect, ROW_R * s, LIT);
                 }
                 if a > 0.0 {
-                    self.text.rounded(r, scene, rect, ROW_R * s, fade(LIT, a));
+                    self.text.rounded(r, scene, rect, ROW_R * s, fade(SELECTED, a));
                 }
                 if cur {
                     self.accent_bar(r, scene, rect, 1.0, false, s);
@@ -1812,11 +1914,8 @@ impl Ui {
                 self.dd_rects.push(rect);
             }
             if more {
-                let track = [px1 - 7.0 * s, py0 + inner, px1 - 4.0 * s, py0 + ph - inner];
-                self.text.rounded(r, scene, track, 1.5 * s, [255, 255, 255, 22]);
-                let th = track[3] - track[1];
-                let n = dd.items.len() as f32;
-                self.text.rounded(r, scene, [track[0], track[1] + th * top as f32 / n, track[2], track[1] + th * (top + n_vis) as f32 / n], 1.5 * s, ACCENT);
+                let track = [px1 - 8.0 * s, py0 + inner, px1 - 4.0 * s, py0 + ph - inner];
+                self.thumb(r, scene, track, top, n_vis, dd.items.len(), over(panel), s);
             }
         }
     }
@@ -2040,6 +2139,26 @@ mod tests {
         assert!((backdrop(0.425) - 0.5).abs() < 1e-6);
         assert_eq!(backdrop(0.2), 0.3);
         assert!(backdrop(1.0) > 1.0);
+    }
+
+    #[test]
+    fn the_game_menu_grows_with_the_interface_size_as_far_as_it_fits() {
+        // (it ignored the setting: 1.5 drew the menu as 1.0 while the HUD grew)
+        assert_eq!(super::menu_scale_for(1.0, 1.0, 1280.0, 720.0, false), 1.0);
+        let s = super::menu_scale_for(1.0, 1.5, 1280.0, 720.0, false);
+        assert!(s > 1.1 && s < 1.5 && 880.0 * s + 24.0 <= 1280.0 && 600.0 * s <= 720.0 * 0.94 + 0.01, "{s}");
+        assert_eq!(super::menu_scale_for(1.0, 1.5, 3840.0, 2160.0, false), 1.5);
+        // never smaller than it always was, and the headset keeps its own size
+        assert_eq!(super::menu_scale_for(1.0, 1.5, 800.0, 500.0, false), 1.0);
+        assert_eq!(super::menu_scale_for(1.0, 1.5, 1920.0, 1080.0, true), 1.0);
+    }
+
+    #[test]
+    fn destinations_split_into_code_and_name() {
+        assert_eq!(super::code_and_name(" 13  BETRIEBSFAHRT"), Some(("13", "BETRIEBSFAHRT")));
+        assert_eq!(super::code_and_name("1001  Blanko.tga"), Some(("1001", "Blanko.tga")));
+        assert_eq!(super::code_and_name("Route number: 5..."), None);
+        assert_eq!(super::code_and_name("Line 76  (1 tours)"), None);
     }
 
     #[test]

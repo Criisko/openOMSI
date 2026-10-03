@@ -2334,6 +2334,38 @@ fn probe_tile(
     }
 }
 
+/// What is drawn at world (x, y) under `top`: the highest face of the splines and surface
+/// objects (as lifted for drawing) and the terrain where it is not cut away - the picture's
+/// ground, without any of the wheel rules of [`drive_probe`] (`OMSI_GROUND_GAP` measures the
+/// tyres against it).
+pub fn drawn_ground(
+    terrains: &RwLock<HashMap<(i32, i32), Arc<Terrain>>>,
+    surfaces: &RwLock<HashMap<(i32, i32), Arc<TileSurface>>>,
+    x: f64,
+    y: f64,
+    top: f64,
+) -> Option<f64> {
+    let key = tile_key(x, y);
+    let lx = (x - key.0 as f64 * tile_size()) as f32;
+    let ly = (y - key.1 as f64 * tile_size()) as f32;
+    let surface = surfaces.read().get(&key).cloned();
+    let terrain = terrains.read().get(&key).cloned();
+    let mut best: Option<f32> = None;
+    if let Some(s) = surface.as_deref() {
+        let a = s.drive.probe(lx, ly, top as f32).below;
+        let b = s.drive.probe_walls(lx, ly, top as f32).below;
+        best = a.into_iter().chain(b).reduce(f32::max);
+    }
+    if let Some(t) = terrain.as_deref() {
+        let h = omsi_geometry::terrain_height(t, lx, ly);
+        let cut = surface.as_deref().is_some_and(|s| s.cut_at(lx, ly, h, surface_flush()));
+        if !cut && h <= top as f32 {
+            best = Some(best.map_or(h, |b| b.max(h)));
+        }
+    }
+    best.map(|z| z as f64)
+}
+
 /// How far a road face may lie under drawn ground before it counts as buried (m): far more
 /// than the ground poking through the asphalt that the road is there to keep out.
 const BURIED_FACE: f32 = 1.0;
@@ -9727,7 +9759,7 @@ fn material_extra(
     MaterialExtra {
         env_mask,
         no_z_write: ov.iter().any(|o| o.no_z_write),
-        depth_guess: false,
+        writes_depth: false,
         // `[matl_noZcheck]` leaves Omsi.exe's depth test on: its draw of the slot (0x7fd6c4)
         // never reads the flag, which only adds a colourless stencil pass marking the panes
         // for the raindrops (0x7c32c4 -> 0x7fc58c, ZENABLE 1, blend ZERO/ONE). Taken as "no
@@ -11476,7 +11508,7 @@ impl World {
                 .iter()
                 .filter_map(|(_, _, slot)| inst.materials.get(*slot as usize))
                 .filter_map(|&m| scene.materials.get(m))
-                .map(|m| (m.alpha, !m.no_z_write && !m.no_z_check))
+                .map(|m| (m.alpha, (!m.no_z_write || m.writes_depth) && !m.no_z_check))
                 .collect()
         };
         let mut blended_first = false;
@@ -11838,9 +11870,13 @@ impl World {
                     // though their alpha mode is Blend. They are transparent colour layers,
                     // not solid shadow casters; letting them into the shadow map paints the
                     // bus shadow with the pane/film texture (the striped triangular artifact).
+                    // (Its depth is still written as Omsi.exe writes it, whenever the model
+                    // blends the slot by [matl_alpha] 2 without [matl_noZwrite] - a dirt
+                    // film's as well: see `MaterialExtra::writes_depth`. Left out of the
+                    // depth buffer, the stacked panes of a door blended over each other
+                    // whichever lay in front, #211.)
                     if (transparent_layer_hint || see_through) && alpha == AlphaMode::Blend {
-                        // (written by Omsi.exe unless the model says [matl_noZwrite])
-                        extra.depth_guess = !extra.no_z_write && !dirt_overlay;
+                        extra.writes_depth = declared_alpha == AlphaMode::Blend && !ov.iter().any(|o| o.no_z_write) && !def.is_shadow;
                         extra.no_z_write = true;
                     }
                     // Name the pane explicitly for the shader. A plain blended window has

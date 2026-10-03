@@ -11,6 +11,42 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
   Anti-aliasing → DLSS / DLAA, with its quality (DLAA, Quality, Balanced, Performance,
   Ultra performance) in the row below. NVIDIA's Streamline DLLs go beside the game (see the
   user guide); without them, or on another card, the game draws as before.
+## 0.1.1166 - 2026-10-02
+
+### Graphics
+- A vehicle's blended layers write depth unless `[matl_noZwrite]`, exactly as Omsi.exe sets its
+  states (0x7fd6c4), and are drawn in model order with no reordering: stacked panes (door glass
+  with dirt, decals on glass) no longer see through each other. The vehicle the camera is in is
+  drawn after the whole scene and its own lamp flares after it, as in Omsi.exe. [#211](https://github.com/openOMSI-Project/openOMSI/issues/211) [#596](https://github.com/openOMSI-Project/openOMSI/issues/596)
+- A 16-bit TGA keeps its alpha bit (A1R5G5B5, as D3DX reads it).
+
+### Sound
+- Sounds are mixed as in Omsi.exe's sound update (0x750340): the volume is checked against
+  0 dB after the distance factor (DirectSound keeps the last volume when asked for more), a loop's
+  pitch outside 100-200,000 Hz is refused and the last rate kept (the LiAZ and trolleybus
+  "whine" played 30x too fast), AI vehicles use viewpoint 4, sounds of other vehicles heard from
+  the cab are x(0.2 + Snd_OutsideVol) with no invented filter, only `[3d]` sounds are panned
+  (5 dB at most), Doppler only on loop sounds, conditions compared exactly.
+
+### Passengers and cash desk
+- Coins lie flat on the change tray at random spots and turns, as Omsi.exe places them, instead
+  of a tower that grew 3 mm a coin.
+- People come from one pool, as in Omsi.exe: `ai_max_humans` (OMSI's `[AIMaxCountRandom]`,
+  200 by default), walkers at most half of it. A waiting place another stop's person stands on
+  is not free, so no two people stand inside each other.
+- A duty moves on to the next trip when the bus stands at its first stop a minute before
+  departure, so the IBIS is no longer left on the old terminus with riders refusing to board.
+
+### Physics
+- AI wheels each stand on the highest drawn face up to 3 m above them, as Omsi.exe's ground
+  query (0x7a0814): no more cars sunk into cambered roads or hidden inside roads above the lane.
+- A wheel no longer falls through the hair-wide seam between two spline segments (an 18 cm drop).
+
+### Menu and website
+- The pause menu uses the launcher's greys, switches, sliders and scroll bars, follows the
+  Interface size, and lists destination codes in a column.
+- The website has a light theme (and a theme button), readable colours, and no sideways
+  scrolling on phones.
 
 ## 0.1.1120 - 2026-10-02
 

@@ -1507,8 +1507,10 @@ impl Player {
             ss.set_muffled(inside);
             ss.set_listener_vehicle(listener_follows_bus);
             // how open the bus is to the outside (doors, driver's window) for every outside
-            // sound heard in it - this bus's own and the traffic's
-            omsi_audio::soundset::set_outside_open(if inside { v.var("Snd_OutsideVol") } else { None });
+            // sound heard in it - this bus's own and the traffic's: Omsi.exe reads the
+            // player's bus's `Snd_OutsideVol` whatever the camera does (0 when no script
+            // writes it)
+            omsi_audio::soundset::set_outside_open(Some(v.var("Snd_OutsideVol").unwrap_or(0.0)));
             // (the last time a trigger fired this frame: its sounds start with that moment)
             let at_fire = |t: &str, n: &str| -> Option<f32> {
                 let vals = &fired_vars.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(t))?.1;

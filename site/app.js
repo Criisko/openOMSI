@@ -210,8 +210,8 @@ let issueState = "open", issueQuery = "";
 async function issues(number) {
   if (number) return issue(number);
   view.innerHTML = `<div class="content"><h1>Issues</h1>
-    <p class="lead">Bugs and wishes. To report one, you need a GitHub account:
-      <a class="btn btn-contained" href="https://github.com/${REPO}/issues/new"><span class="material-icons">add</span>New issue</a></p>
+    <p class="lead">Bugs and wishes. To report one, you need a GitHub account.</p>
+    <p class="issue-new"><a class="btn btn-contained" href="https://github.com/${REPO}/issues/new"><span class="material-icons">add</span>New issue</a></p>
     <div class="issue-bar">
       <div class="tabs"><button data-s="open">Open</button><button data-s="closed">Closed</button><button data-s="all">All</button></div>
       <input id="iq" type="search" placeholder="Filter by title or label" value="${esc(issueQuery)}">
@@ -250,7 +250,7 @@ async function issue(n) {
   catch (e) { box.innerHTML = `<p>${esc(e.message)}</p>`; return; }
   document.title = `#${i.number} ${i.title} · openOMSI`;
   const post = (who, when, body) => `<div class="card elevation-1 comment"><div class="comment-head"><img src="${esc(who?.avatar_url)}&s=48" alt=""><b>${esc(who?.login)}</b><span class="muted">${ago(when)}</span></div><div class="doc">${md(body) || "<p class='muted'>No description.</p>"}</div></div>`;
-  box.innerHTML = `<h1>${esc(i.title)} <span class="muted">#${i.number}</span></h1>
+  box.innerHTML = `<h1 class="issue-head">${esc(i.title)} <span class="muted">#${i.number}</span></h1>
     <p><span class="label" style="--lc:${i.state === "open" ? "#2da44e" : "#8250df"}">${i.state === "open" ? "Open" : "Closed"}</span> ${labelChips(i.labels)}</p>
     ${post(i.user, i.created_at, i.body)}${comments.map(c => post(c.user, c.created_at, c.body)).join("")}
     <p><a class="btn btn-outlined" href="${esc(i.html_url)}"><span class="material-icons">reply</span>Comment on GitHub</a></p>`;
@@ -271,6 +271,29 @@ function route() {
   return home();
 }
 window.addEventListener("hashchange", route);
+
+// Theme: the app bar button goes system -> light -> dark -> system; the choice is kept in
+// localStorage (applied before the first paint by the script in <head>)
+(() => {
+  const btn = document.getElementById("theme-btn");
+  if (!btn) return;
+  const root = document.documentElement;
+  const names = { "": "Theme: system", light: "Theme: light", dark: "Theme: dark" };
+  const icons = { "": "brightness_auto", light: "light_mode", dark: "dark_mode" };
+  const show = () => {
+    const t = root.dataset.theme || "";
+    btn.querySelector(".material-icons").textContent = icons[t];
+    btn.title = names[t];
+    btn.setAttribute("aria-label", names[t]);
+  };
+  btn.onclick = () => {
+    const next = { "": "light", light: "dark", dark: "" }[root.dataset.theme || ""];
+    if (next) root.dataset.theme = next; else delete root.dataset.theme;
+    try { next ? localStorage.setItem("theme", next) : localStorage.removeItem("theme"); } catch {}
+    show();
+  };
+  show();
+})();
 route();
 
 // Donate: the button opens its menu upwards; a click elsewhere, Escape or a choice closes it

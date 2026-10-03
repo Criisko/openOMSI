@@ -1073,6 +1073,25 @@ mod tests {
         assert!(r.transform_vector3(Vec3::Y).x > 0.99);
     }
 
+    /// Two road segments whose seam vertices came out 3 mm apart: a wheel's point in
+    /// the sliver between them stands on the road (it fell through to the ground under it),
+    /// while a point a few centimetres past the road's edge still does not.
+    #[test]
+    fn a_wheel_does_not_fall_through_a_seam() {
+        let mut g = DriveGrid::default();
+        let quad = |g: &mut DriveGrid, y0: f32, y1: f32| {
+            g.push([Vec3::new(0.0, y0, 1.0), Vec3::new(8.0, y0, 1.0), Vec3::new(0.0, y1, 1.0)]);
+            g.push([Vec3::new(8.0, y0, 1.0), Vec3::new(8.0, y1, 1.0), Vec3::new(0.0, y1, 1.0)]);
+        };
+        quad(&mut g, 0.0, 10.0);
+        quad(&mut g, 10.003, 20.0);
+        g.build(300.0);
+        assert_eq!(g.probe(4.0, 10.0015, 2.0).below, Some(1.0));
+        assert_eq!(g.surface_below(4.0, 10.0015, 2.0).map(|(z, _)| z), Some(1.0));
+        assert_eq!(g.probe(8.03, 5.0, 2.0).below, None);
+        assert_eq!(g.probe(4.0, 20.03, 2.0).below, None);
+    }
+
     /// A kerb: road at 0, pavement at 0.15 from x = 10 on, a bridge deck at 6 m over it all.
     #[test]
     fn drive_grid_probes_the_face_under_the_axle() {
@@ -1736,6 +1755,37 @@ impl Probe {
     }
 }
 
+/// How far outside a road face a wheel's point may lie and still stand on it (m). Two spline
+/// segments meeting end to end each work out their seam's vertices for themselves, and the
+/// two edges come out a fraction of a millimetre apart: a point that fell into that sliver met
+/// neither face and dropped through to whatever lay under the road (a car's wheel fell 18 cm
+/// onto the ground for a frame where Spandau's Falkenseer Chaussee joins its next segment, and
+/// the cars bounced at the seam). Omsi.exe's own meshes are drawn without such gaps showing;
+/// a few millimetres closes them and is lost in a tyre's footprint.
+pub const SEAM_TOLERANCE: f32 = 0.005;
+
+/// The barycentric weights of (x, y) in the plan view of triangle `a b c`, when the point
+/// lies inside it or no farther than `tol` metres outside any of its edges.
+fn plan_weights(a: Vec3, b: Vec3, c: Vec3, x: f32, y: f32, tol: f32) -> Option<(f32, f32, f32)> {
+    let d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+    if d.abs() < 1e-9 {
+        return None;
+    }
+    let l1 = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / d;
+    let l2 = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / d;
+    let l3 = 1.0 - l1 - l2;
+    // a hair of tolerance so that a point on a shared edge is never missed
+    const EPS: f32 = -1e-4;
+    if l1 >= EPS && l2 >= EPS && l3 >= EPS {
+        return Some((l1, l2, l3));
+    }
+    // the distance outside each edge: the weight times the height of the triangle over it
+    let edge = |p: Vec3, q: Vec3| ((p.x - q.x).powi(2) + (p.y - q.y).powi(2)).sqrt().max(1e-6);
+    let area2 = d.abs();
+    let out = |l: f32, len: f32| l * area2 / len >= -tol;
+    (out(l1, edge(b, c)) && out(l2, edge(c, a)) && out(l3, edge(a, b))).then_some((l1, l2, l3))
+}
+
 /// Upward-facing triangles of one tile (tile-local x/y in metres, absolute z), bucketed on a
 /// coarse grid so that a wheel asks only the few faces around it.
 #[derive(Debug, Clone, Default)]
@@ -1787,8 +1837,10 @@ impl DriveGrid {
         let mut keep_ridge = Vec::with_capacity(self.tris.len());
         self.ridge.resize(self.tris.len(), false);
         for (t, r) in self.tris.iter().zip(self.ridge.iter()) {
-            let (lo_x, hi_x) = (t[0].x.min(t[1].x).min(t[2].x), t[0].x.max(t[1].x).max(t[2].x));
-            let (lo_y, hi_y) = (t[0].y.min(t[1].y).min(t[2].y), t[0].y.max(t[1].y).max(t[2].y));
+            // (bucketed with the seam tolerance round it: a point that close is on it)
+            let e = SEAM_TOLERANCE;
+            let (lo_x, hi_x) = (t[0].x.min(t[1].x).min(t[2].x) - e, t[0].x.max(t[1].x).max(t[2].x) + e);
+            let (lo_y, hi_y) = (t[0].y.min(t[1].y).min(t[2].y) - e, t[0].y.max(t[1].y).max(t[2].y) + e);
             if hi_x < 0.0 || hi_y < 0.0 || lo_x > tile || lo_y > tile {
                 continue;
             }
@@ -1843,12 +1895,7 @@ impl DriveGrid {
         for &i in &self.items[self.start[k] as usize..self.start[k + 1] as usize] {
             if self.ridge.get(i as usize).copied().unwrap_or(false) { continue; }
             let [a, b, c] = self.tris[i as usize];
-            let d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
-            if d.abs() < 1e-9 { continue; }
-            let l1 = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / d;
-            let l2 = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / d;
-            let l3 = 1.0 - l1 - l2;
-            if l1.min(l2).min(l3) < -1e-4 { continue; }
+            let Some((l1, l2, l3)) = plan_weights(a, b, c, x, y, SEAM_TOLERANCE) else { continue };
             let z = l1 * a.z + l2 * b.z + l3 * c.z;
             if z <= top && best.is_none_or(|(old, _)| z > old) {
                 let n = (b - a).cross(c - a).normalize();
@@ -1878,18 +1925,7 @@ impl DriveGrid {
                 continue;
             }
             let [a, b, c] = self.tris[i as usize];
-            let d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
-            if d.abs() < 1e-9 {
-                continue;
-            }
-            let l1 = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / d;
-            let l2 = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / d;
-            let l3 = 1.0 - l1 - l2;
-            // a hair of tolerance so that a point on a shared edge is never missed
-            const EPS: f32 = -1e-4;
-            if l1 < EPS || l2 < EPS || l3 < EPS {
-                continue;
-            }
+            let Some((l1, l2, l3)) = plan_weights(a, b, c, x, y, SEAM_TOLERANCE) else { continue };
             out = out.merge(Probe::of(l1 * a.z + l2 * b.z + l3 * c.z, z_top));
         }
         out

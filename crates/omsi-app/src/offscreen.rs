@@ -364,6 +364,10 @@ pub(crate) fn run_offscreen(
             l.clock_speed = *speed;
         }
     }
+    let mut ground_gap = crate::ground_gap::GroundGap::from_env();
+    if let Some(t) = traffic.as_ref() {
+        crate::ground_gap::check_lanes(&world, t);
+    }
     for i in 0..total_frames {
         let t_s = i as f32 * dt;
         if server {
@@ -895,6 +899,9 @@ pub(crate) fn run_offscreen(
                 }
             }
         }
+        if let Some(g) = ground_gap.as_mut() {
+            g.frame(&world, t_s, player.as_ref().map(|p| &p.vehicle), traffic.as_ref());
+        }
         if let Some(h) = humans_off.as_mut() {
             // keep density and time_of_day up to date every tick, as app_events.rs does
             // (stop_target = enter_mean * density; without this it stays at the startup
@@ -1210,6 +1217,9 @@ pub(crate) fn run_offscreen(
             }
             None => log::warn!("--follow: car {id} not found"),
         }
+    }
+    if let Some(g) = ground_gap.take() {
+        g.report();
     }
     if let Some(t) = traffic.as_mut() {
         t.sync(&world, &renderer, &mut scene);
@@ -2278,6 +2288,31 @@ pub(crate) fn run_offscreen(
                     p.y,
                     p.z
                 );
+            }
+        }
+    }
+    // OMSI_PROBE_GRID=x,y,half,step: the wheels' ground on a square grid around (x, y), as
+    // rows of centimetres relative to the middle ('.' where it is the same, '#' where the
+    // ground there is more than 5 cm lower: a gap in the road the wheels fall through)
+    if let Ok(spec) = omsi_cfg::env::var("OMSI_PROBE_GRID") {
+        let v: Vec<f64> = spec.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        if v.len() >= 4 {
+            let (cx, cy, half, step) = (v[0], v[1], v[2], v[3].max(0.001));
+            let mid = scene::drive_probe(&world.terrains, &world.surfaces, cx, cy, 1e6).below.unwrap_or(0.0);
+            let n = (half / step).round() as i64;
+            for j in (-n..=n).rev() {
+                let row: String = (-n..=n)
+                    .map(|i| {
+                        let (x, y) = (cx + i as f64 * step, cy + j as f64 * step);
+                        match scene::drive_probe(&world.terrains, &world.surfaces, x, y, mid + 1.0).below {
+                            Some(z) if z < mid - 0.05 => '#',
+                            Some(z) if (z - mid).abs() <= 0.02 => '.',
+                            Some(_) => '+',
+                            None => ' ',
+                        }
+                    })
+                    .collect();
+                log::info!("grid {:.3}: {row}", cy + j as f64 * step);
             }
         }
     }

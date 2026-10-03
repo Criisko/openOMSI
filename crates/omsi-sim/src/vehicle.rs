@@ -2949,7 +2949,7 @@ pub const SHADOW_LIFT: f32 = 0.02;
 
 /// How far over the wheel's own plane the face it stands on may lie for a `[isshadow]`
 /// blob's plane (m): a kerb or a ramp, the step the AI's wheels climb
-/// (`ai_motion::AI_STEP_UP`).
+/// (as much as an AI car's wheels used to climb).
 const SHADOW_STEP_UP: f64 = 0.6;
 /// How far under it (m). Loose: the model's origin plane is the contact plane of the
 /// *unloaded* springs, so a body at rest stands its ground 10-16 cm below its own plane,

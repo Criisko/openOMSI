@@ -1451,7 +1451,7 @@ fn until_connected(c: &mut LanSession, host: &mut LanSession) -> bool {
 
 #[test]
 fn a_client_that_gave_up_comes_back_when_the_host_does() {
-    let port = 27961;
+    let port = 27993;
     // nobody hosts yet: the client gives up
     let mut c = LanSession::join(&format!("127.0.0.1:{port}"), "c", world("m"), Duration::from_millis(10))
         .unwrap();

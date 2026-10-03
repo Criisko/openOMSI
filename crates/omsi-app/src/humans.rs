@@ -1463,6 +1463,12 @@ pub struct Humans {
     stamped: Vec<BusId>,
     /// Pedestrians to keep strolling near the player (scaled by `density`).
     pub pedestrians: usize,
+    /// Omsi.exe's people (`[AIMaxCountRandom]`'s second line, the `ai_max_humans` setting):
+    /// it makes that many at the start (0x709274) and draws everybody waiting at a stop,
+    /// walking the pavements or riding from them - never more; at most half of them walk
+    /// the pavements (0x62463c). Here people are made as they are wanted, so they are
+    /// counted against it instead.
+    pub max_people: usize,
     stroll_timer: f32,
     /// Passengers pay the exact fare: no change is ever due.
     pub exact_fare: bool,
@@ -1686,6 +1692,7 @@ impl Humans {
             stop_names: None,
             stamped: Vec::new(),
             pedestrians: 14,
+            max_people: crate::settings::Settings::load().ai_max_humans.max(1) as usize,
             stroll_timer: 0.0,
             exact_fare: true,
             boarding: "auto".into(),
@@ -1854,6 +1861,33 @@ impl Humans {
                 }
                 dist < 3.0 || d.dot(e.fwd) / dist > e.cos_half
             }
+        }
+    }
+
+    /// The people of OMSI's pool there are now (everybody but avatars and other players'
+    /// people mirrored here).
+    fn pool_used(&self) -> usize {
+        self.people.iter().filter(|p| p.puppet.is_none() && !p.remote).count()
+    }
+
+    /// Room in the pool for one more person; when it is full somebody walking the street out
+    /// of sight is taken for it, as Omsi.exe takes a task-8 person for a stop (0x61bd44).
+    fn pool_room(&mut self) -> bool {
+        if self.pool_used() < self.max_people {
+            return true;
+        }
+        let free = (0..self.people.len()).find(|&i| {
+            let p = &self.people[i];
+            p.puppet.is_none() && !p.remote && matches!(p.state, State::Strolling(_) | State::Standing) && !self.seen(p.position)
+        });
+        match free {
+            Some(i) => {
+                self.release(i);
+                let p = self.people.swap_remove(i);
+                self.retire(&p);
+                true
+            }
+            None => false,
         }
     }
 
@@ -2422,7 +2456,10 @@ impl Humans {
             let want = {
                 let s = &self.stops[&id];
                 let mean = (s.enter_max + s.enter_min) / 2.0;
-                let w = (self.density.max(0.0) * mean * s.factor).round().max(0.0) as usize;
+                // (0x61bf94: with a timetable, times the share of the trips due there - at a
+                // stop no trip leaves from, nobody)
+                let served = if self.stop_targets.is_some() && s.lines.is_empty() { 0.0 } else { 1.0 };
+                let w = (self.density.max(0.0) * mean * s.factor * served).round().max(0.0) as usize;
                 forced.unwrap_or(w).min(s.spots.len())
             };
             let s = self.stops.get_mut(&id).unwrap();
@@ -2472,6 +2509,9 @@ impl Humans {
     /// A person put at a free waiting place of stop `id` (sub_626044) with a destination
     /// drawn from the stop's (sub_61baa8); they settle there as task 6 does.
     fn spawn_waiting(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, id: i64) -> Option<usize> {
+        if self.stops.get(&id)?.taken.iter().all(|t| *t) || !self.pool_room() {
+            return None;
+        }
         let k = self.take_spot(id)?;
         let sp = self.stops[&id].spots[k].clone();
         let (dest, line) = self.draw_dest(id);
@@ -2535,6 +2575,9 @@ impl Humans {
         let crowd = (lanes.len() as f32 / 120.0).clamp(0.6, 3.0);
         let target =
             (self.pedestrians as f32 * crowd * self.density.clamp(0.0, 3.0)).round() as usize;
+        // (0x62463c: walking the pavements only while fewer than half the pool do, and never
+        // past the pool)
+        let target = target.min(self.max_people / 2).min((self.max_people + self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count()).saturating_sub(self.pool_used()));
         let have = self
             .people
             .iter()
@@ -4501,6 +4544,24 @@ impl Humans {
                         p.vel.x,
                         p.vel.y
                     );
+                }
+            }
+        }
+        // OMSI_CHECK_TPOSE=1: everybody drawn with the arms out (the file's rest pose): the
+        // skinned mesh wider than 1.3 m from hand to hand
+        if omsi_cfg::env::var_os("OMSI_CHECK_TPOSE").is_some() {
+            for p in &self.people {
+                let Some((pos, _)) = p.skins.first() else {
+                    log::info!("t-pose? {} {}: never skinned", p.label(), p.state_name());
+                    continue;
+                };
+                let (lo, hi) = pos.iter().fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v.x), hi.max(v.x)));
+                if hi - lo > 1.3 {
+                    let pax = match &p.state {
+                        State::Pax(x) => format!("pax_state {} speed {:.2} seat_h {:.2} room {:.2} st {}", x.pax_state, x.speed, x.seat_h, x.room, x.st),
+                        _ => String::new(),
+                    };
+                    log::info!("t-pose: {} {} width {:.2} skinned {} {pax}", p.label(), p.state_name(), hi - lo, p.skinned);
                 }
             }
         }

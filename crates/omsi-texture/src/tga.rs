@@ -86,14 +86,16 @@ pub fn decode(b: &[u8]) -> Result<Image, String> {
                 let r = ((v >> 10) & 31) as u32;
                 let g = ((v >> 5) & 31) as u32;
                 let bl = (v & 31) as u32;
-                let a = if bits == 16 && v & 0x8000 == 0 && false { 0 } else { 255 };
+                // D3DX picks its format by the depth alone: 16 bits are A1R5G5B5 (the top
+                // bit is the alpha, whatever the descriptor says), 15 bits X1R5G5B5
+                let a = if bits == 16 && v & 0x8000 == 0 { 0 } else { 255 };
                 [((r * 255) / 31) as u8, ((g * 255) / 31) as u8, ((bl * 255) / 31) as u8, a]
             }
             _ => [p[0], p[0], p[0], 255],
         }
     };
     let mut rgba = vec![0u8; n * 4];
-    let has_alpha = (base == 2 && bpp == 32) || (base == 1 && cmap_bpp == 32) || (base == 3 && px_bytes == 2);
+    let has_alpha = (base == 2 && matches!(bpp, 16 | 32)) || (base == 1 && matches!(cmap_bpp, 16 | 32)) || (base == 3 && px_bytes == 2);
     for y in 0..height {
         for x in 0..width {
             let i = y * width + x;

@@ -1297,6 +1297,11 @@ impl Humans {
                 };
                 let sp = stop.zip(spot).and_then(|(s, k)| self.stops.get(&s).and_then(|s| s.spots.get(k)).cloned());
                 let stop_pos = stop.and_then(|s| self.stops.get(&s)).map(|s| s.pos);
+                // (no place free: at the stop's point - spread along the kerb by who they
+                // are, or everybody without a place stood in one another there)
+                let along = ((self.people[i].id % 7) as f64 - 3.0) * 0.7;
+                let fwd = stop.and_then(|s| self.stops.get(&s)).map(|s| { let h = s.heading.to_radians(); DVec3::new(h.sin(), h.cos(), 0.0) }).unwrap_or(DVec3::ZERO);
+                let stop_pos = stop_pos.map(|q| q + fwd * along);
                 let p = self.pax_mut(i).unwrap();
                 p.spot = spot;
                 p.target_bus = false;
@@ -1385,7 +1390,27 @@ impl Humans {
 
     /// sub_61c8d8: a free waiting place of the stop, at random.
     pub(super) fn take_spot(&mut self, stop: i64) -> Option<usize> {
-        let free: Vec<usize> = self.stops.get(&stop)?.taken.iter().enumerate().filter(|(_, t)| !**t).map(|(k, _)| k).collect();
+        // Stops a few metres apart (both sides of a bus station's platform, a stop and its
+        // copy for another line) find the same objects' places, and each kept its own list of
+        // who stands where (as Omsi.exe's 0x61c8d8 does), so two or three people stood in
+        // one another. A place somebody of another stop stands on is not free (nor one of the
+        // stop's own a few centimetres from a taken one: objects placed twice).
+        let s = self.stops.get(&stop)?;
+        let (pos, reach) = (s.pos, 40.0_f64.max(s.length as f64 + 15.0) * 2.0);
+        let elsewhere: Vec<DVec3> = self
+            .stops
+            .iter()
+            .filter(|(_, o)| (o.pos - pos).length() < reach)
+            .flat_map(|(_, o)| o.spots.iter().zip(&o.taken).filter(|(_, t)| **t).map(|(sp, _)| sp.pos))
+            .collect();
+        let s = self.stops.get(&stop)?;
+        let free: Vec<usize> = s
+            .taken
+            .iter()
+            .enumerate()
+            .filter(|(k, t)| !**t && !elsewhere.iter().any(|q| (*q - s.spots[*k].pos).truncate().length() < 0.4))
+            .map(|(k, _)| k)
+            .collect();
         if free.is_empty() {
             return None;
         }
@@ -1415,7 +1440,15 @@ impl Humans {
         match p.task {
             Task::WaitingForBus => {
                 let Some(stop) = p.stop else { return };
-                let Some(b) = self.bus_for(i, stop, buses, bus_ix) else { return };
+                let Some(b) = self.bus_for(i, stop, buses, bus_ix) else {
+                    if super::debug_pax() && (self.time * 2.0).fract() < (dt as f64 * 2.0) {
+                        let s = &self.stops[&stop];
+                        let listed: Vec<String> = s.buses.iter().map(|(id, inbox)| format!("{id:?} box {inbox} shows {:?}", bus_ix.get(id).and_then(|k| buses[*k].terminus.clone()))).collect();
+                        let termini = p.line.and_then(|k| s.lines.get(k)).map(|l| l.1.iter().cloned().collect::<Vec<_>>());
+                        log::info!("t={:.1} pax {} at stop {stop} for {:?} (line {:?} termini {:?}): no bus; listed {:?}", self.time, self.people[i].label(), p.dest, p.line, termini, listed);
+                    }
+                    return;
+                };
                 let Some(bn) = bus_ix.get(&b).map(|k| &buses[*k]) else { return };
                 self.pax_mut(i).unwrap().bus = Some(b);
                 // still rolling in, or standing in the stop's box: to the gather point

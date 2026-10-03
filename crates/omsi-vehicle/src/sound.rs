@@ -10,28 +10,45 @@ pub struct VolCurve {
     pub points: Vec<(f32, f32)>,
 }
 
-/// `[conditionSingle]`: the sound is heard only while `variable <relation> value` holds.
-/// The file gives the variable, the value, then the relation: 0 `<>`, 1 `=`, 2 `<`, 3 `>`,
-/// 4 `<=`, 5 `>=` - `engine_n 200 3` (the engine runs), `velocity 2 2` (standing),
-/// `antrieb_getr_aktugang 2 4` (first or second gear), `cockpit_hupe_volume 3 0` (always).
+/// `[conditionSingle]` / `[conditionInt]` / `[conditionBool]`: the sound is heard only while
+/// `variable <relation> value` holds. The file gives the variable, the value, then the
+/// relation: 0 `<>`, 1 `=`, 2 `<`, 3 `>`, 4 `<=`, 5 `>=` - `engine_n 200 3` (the engine runs),
+/// `velocity 2 2` (standing), `antrieb_getr_aktugang 2 4` (first or second gear).
+///
+/// Omsi.exe (`TBoolClass` check 0x7effc8) compares exactly, without a tolerance; a
+/// `[conditionInt]` has an integer value and knows the relations 0 to 3 only (4 and 5 leave
+/// it out of the check), and a `[conditionBool]` (no relation line) holds when the variable
+/// is non-zero for a value of 1 and zero for any other value.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Condition {
     pub variable: String,
     pub value: f32,
     pub relation: i32,
+    pub kind: ConditionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConditionKind {
+    #[default]
+    Single,
+    Int,
+    Bool,
 }
 
 impl Condition {
     pub fn holds(&self, v: f32) -> bool {
-        let eq = (v - self.value).abs() < 1.0e-4;
-        match self.relation {
-            0 => !eq,
-            1 => eq,
-            2 => v < self.value,
-            3 => v > self.value,
-            4 => v <= self.value || eq,
-            5 => v >= self.value || eq,
-            _ => true,
+        match self.kind {
+            ConditionKind::Bool => (v != 0.0) == (self.value == 1.0),
+            ConditionKind::Int if self.relation > 3 => true,
+            _ => match self.relation {
+                0 => v != self.value,
+                1 => v == self.value,
+                2 => v < self.value,
+                3 => v > self.value,
+                4 => v <= self.value,
+                5 => v >= self.value,
+                _ => true,
+            },
         }
     }
 }
@@ -191,11 +208,16 @@ impl SoundCfg {
                 }
                 "conditionsingle" | "conditionint" | "conditionbool" => {
                     let variable = r.str().to_string();
-                    let value = r.f32();
-                    // (a bool has no relation: it is compared for equality)
-                    let relation = if k == "conditionsingle" || k == "conditionint" { r.f32() as i32 } else { 1 };
+                    let kind = match k.as_str() {
+                        "conditionint" => ConditionKind::Int,
+                        "conditionbool" => ConditionKind::Bool,
+                        _ => ConditionKind::Single,
+                    };
+                    // (an int's value is StrToInt, a bool's StrToInt = 1; a bool has no relation)
+                    let value = if kind == ConditionKind::Single { r.f32() } else { r.str().trim().parse::<i32>().unwrap_or(0) as f32 };
+                    let relation = if kind == ConditionKind::Bool { 1 } else { r.f32() as i32 };
                     if let Some(s) = c.sounds.last_mut() {
-                        s.conditions.push(Condition { variable, value, relation });
+                        s.conditions.push(Condition { variable, value, relation, kind });
                     }
                 }
                 "trigger" => {
@@ -238,6 +260,19 @@ mod tests {
         assert!(conds[1].holds(0.0) && !conds[1].holds(1.0));
         assert!(conds[2].holds(1.0) && conds[2].holds(2.0) && !conds[2].holds(3.0));
         assert!(conds[3].holds(0.5) && !conds[3].holds(2.0));
+    }
+
+    #[test]
+    fn conditions_compare_exactly_as_omsi_does() {
+        let text = "[sound]\na.wav\n1\n[conditionBool]\nlight\n1\n[conditionInt]\ngear\n2\n4\n[conditionSingle]\nv\n0.5\n1\n";
+        let c = SoundCfg::parse(&CfgFile::from_str("sound.cfg", text));
+        let conds = &c.sounds[0].conditions;
+        // a bool of 1: any non-zero value
+        assert!(conds[0].holds(2.0) && conds[0].holds(-1.0) && !conds[0].holds(0.0));
+        // an int knows the relations 0 to 3 only
+        assert!(conds[1].holds(7.0));
+        // no tolerance
+        assert!(conds[2].holds(0.5) && !conds[2].holds(0.50001));
     }
 
     #[test]

@@ -136,13 +136,13 @@ struct Wheel {
     c: f32,
 }
 
-/// How far over its way an AI car's wheel climbs onto what is drawn there (m), and how far
-/// under the way it goes down to it: the road drawn higher than the lane the map laid out
-/// (the car sank into it), not a deck overhead; and below the lane only a little - a lane
-/// running along the edge of a junction plate had its outer wheels drop onto the terrain
-/// beside it and the car leaned over by ten degrees (see `AiBody::settle`).
-const AI_STEP_UP: f64 = 0.6;
-const AI_STEP_DOWN: f64 = 0.1;
+/// How far over an AI car's wheel its ground is looked for (m): Omsi.exe casts the ray of its
+/// ground query from 3 m over the point (0x7c40c8) and takes the highest face under that.
+pub const AI_RAY_UP: f64 = 3.0;
+/// A face this far under the wheel's lane is not this wheel's ground (m): the road under the
+/// bridge the lane crosses, or the ground beyond the edge of the road, which the wheel hangs
+/// over on its spring rather than drops onto (the lane stays its height there).
+const AI_DROP: f64 = 0.3;
 
 #[derive(Debug, Clone)]
 pub struct AiBody {
@@ -193,11 +193,8 @@ pub struct AiBody {
     /// Per axle (left, right): how far the wheel hangs below its rest position against
     /// the body (m, the `Axle_Suspension_*` convention: negative = compressed).
     pub suspension: Vec<[f32; 2]>,
-    /// Each wheel's contact height, followed smoothly (NaN until the first frame). Taken
-    /// raw from the road raster, a wheel's travel jumped by its texel steps and by the
-    /// sample slipping in and out of the few centimetres around the way from frame to
-    /// frame: the wheels of every AI car twitched up and down in their arches while the
-    /// body on its springs rode smoothly.
+    /// Each wheel's contact height last frame (NaN until the first frame): where its next
+    /// ground query starts from.
     contact_z: Vec<f64>,
 }
 
@@ -408,75 +405,41 @@ impl AiBody {
         let fwd = dir(self.heading);
         let right = DVec2::new(fwd.y, -fwd.x);
         let origin = self.position.truncate();
-        // the way's own height at each axle: the road the map says is there, which also
-        // decides when a sampled height belongs to something else (a bridge over the road)
+        // the way's own height at each axle: the road the map says is there (where nothing
+        // is drawn under a wheel, and what tells another level from this one)
         let mut axle_z = vec![f64::NAN; self.axle_count];
-        // (lateral, longitudinal, axle, way height, what is drawn there)
-        let mut samples: Vec<(f32, f32, usize, f64, Option<f64>)> = Vec::with_capacity(self.wheels.len());
-        for w in &self.wheels {
+        if self.contact_z.len() != self.wheels.len() {
+            self.contact_z = vec![f64::NAN; self.wheels.len()];
+        }
+        let mut contacts: Vec<(f32, f32, f64)> = Vec::with_capacity(self.wheels.len());
+        for (k, w) in self.wheels.iter().enumerate() {
             if axle_z[w.axle].is_nan() {
                 axle_z[w.axle] = way(w.long).z;
             }
             let path_z = axle_z[w.axle];
             let p = origin + right * w.lat as f64 + fwd * w.long as f64;
-            // What the wheel stands on, as Omsi.exe stands an AI car's wheels (its AI cars
-            // are bodies on the same wheel physics as the player's bus, 0x7d5124 ->
-            // 0x7e2574, asking the ground under each wheel, 0x7aec3c): the drawn road, the
-            // surface objects, the terrain beside them - up to `AI_STEP_UP` over the way and
-            // down to `AI_STEP_DOWN` under it (farther is another level: a bridge over the
-            // road, the road under a bridge). Without it the plain height sampler, which
-            // knows no levels.
+            // What the wheel stands on, as Omsi.exe stands an AI car's wheels: its AI cars
+            // are bodies on the same wheel physics as the player's bus (0x7d5124 ->
+            // 0x7e2574), asking the ground under each wheel (0x7aec3c -> 0x7a0814): a ray
+            // from 3 m over the wheel (0x7c40c8 adds 3 to z) down into the terrain, the
+            // splines and the first mesh of the `[surface]` objects, and the highest face it
+            // meets is the ground. Each wheel on its own face: a car on a cambered road, a
+            // kerb or a junction plate tilted on a hill leans with it. (Kept to the lane's
+            // height, the least of an axle's wheels and only a few centimetres off that,
+            // every car stood up to 5 cm in the asphalt wherever the road was drawn higher
+            // than its lane or one wheel stood lower than the other, and one whose lane ran
+            // under the drawn road drove through it with only its roof showing.) The ray
+            // starts over the wheel's last contact, or over the lane where it has none yet.
+            // Without the world's faces, the plain height sampler.
+            let last = self.contact_z[k];
+            let from = if last.is_finite() && (last - path_z).abs() < AI_RAY_UP { last.max(path_z) } else { path_z };
             let drawn = match contact {
-                Some(c) => c.probe(p.x, p.y, path_z + AI_STEP_UP).below.filter(|g| *g >= path_z - AI_STEP_DOWN),
-                None => ground.and_then(|g| g(p.x, p.y)),
+                Some(c) => c.probe(p.x, p.y, from + AI_RAY_UP).below.filter(|g| *g >= path_z - AI_DROP),
+                None => ground.and_then(|g| g(p.x, p.y)).filter(|g| (*g - path_z).abs() < AI_RAY_UP),
             };
-            samples.push((w.lat, w.long, w.axle, path_z, drawn));
-        }
-        // How far each axle's road lies over its way (from what is drawn under its wheels):
-        // kept to the way alone, a car whose lane lay under the drawn road - a spline on a
-        // grade, a junction plate tilted on a hill - drove through the asphalt with only its
-        // roof showing. Per axle, not per wheel, and the least of its wheels: a wheel off
-        // the edge of the road or on the kerb would tip the car over, or lift it, when its
-        // neighbour stands on the way.
-        let mut lift = vec![f64::INFINITY; self.axle_count];
-        for &(_, _, a, path_z, drawn) in &samples {
-            let up = if contact.is_some() { drawn.map_or(0.0, |g| g - path_z) } else { 0.0 };
-            lift[a] = lift[a].min(up);
-        }
-        let contacts: Vec<(f32, f32, f64)> = samples
-            .iter()
-            .map(|&(lat, long, a, path_z, drawn)| {
-                let base = path_z + lift[a].clamp(0.0, AI_STEP_UP);
-                // The surface under the wheel itself counts only within a few centimetres of
-                // that: taken up to 0.8 m off, a wheel beside the lane climbed the kerb and
-                // the gutter, and the texel steps of the road raster kept every bus rocking
-                // like a boat (faded out between 3 and 5 cm off, so that a sample near the
-                // limit does not flick between the two).
-                let h = match drawn {
-                    Some(h) => {
-                        let off = (h - base).abs();
-                        let t = ((0.05 - off) / 0.02).clamp(0.0, 1.0);
-                        base + (h - base) * t
-                    }
-                    None => base,
-                };
-                (lat, long, h)
-            })
-            .collect();
-        let mut contacts = contacts;
-        // each contact followed with a short lag (a tyre rolls over a texel step, it does
-        // not jump onto it); a car put somewhere else starts from where it stands
-        if self.contact_z.len() != contacts.len() {
-            self.contact_z = vec![f64::NAN; contacts.len()];
-        }
-        let follow = if dt > 0.0 { (dt / 0.07).min(1.0) as f64 } else { 1.0 };
-        for (c, z) in contacts.iter_mut().zip(self.contact_z.iter_mut()) {
-            if z.is_nan() || (c.2 - *z).abs() > 0.3 {
-                *z = c.2;
-            } else {
-                *z += (c.2 - *z) * follow;
-            }
-            c.2 = *z;
+            let h = drawn.unwrap_or(path_z);
+            self.contact_z[k] = h;
+            contacts.push((w.lat, w.long, h));
         }
         // least-squares plane h = a + b·long + c·lat (the wheels sit symmetrically, so the
         // two slopes separate)
@@ -821,6 +784,38 @@ mod tests {
         let rolling = pull_out_ramps(30.0, 2.0, true);
         assert_eq!(rolling[0], 20.0);
         assert!(rolling.iter().all(|&x| (4.0..=20.0).contains(&x)), "{rolling:?}");
+    }
+
+    /// Every wheel stands on the face drawn under it, as Omsi.exe's ground query stands an
+    /// AI car's (the highest face under a ray from 3 m over the wheel): a road drawn 8 cm
+    /// over the lane and cambered across it carries each wheel at its own height, and a lane
+    /// laid 0.9 m under its road has the car on the road, not inside it.
+    #[test]
+    fn each_wheel_stands_on_the_face_under_it() {
+        let def = golf();
+        for (lift, camber) in [(0.08f64, 0.03f64), (0.9, 0.0), (0.08, -0.05)] {
+            let road = move |x: f64, _y: f64| 10.0 + lift + camber * x;
+            let ground = move |x: f64, y: f64, top: f64| {
+                let z = road(x, y);
+                if z <= top { crate::rigid::GroundProbe { below: Some(z), above: None } } else { crate::rigid::GroundProbe { below: Some(9.0), above: Some(z) } }
+            };
+            let way = |d: f32| DVec3::new(0.0, d as f64, 10.0);
+            let mut body = AiBody::new(&def, MotionKind::Road);
+            body.place(&way, None, Some(&ground), 0.0);
+            let mut x = 0.0f32;
+            for _ in 0..90 {
+                x += 0.2;
+                let at = x;
+                body.step(1.0 / 30.0, 6.0, &|d| way(at + d), None, Some(&ground));
+            }
+            for (w, z) in body.wheels.iter().zip(&body.contact_z) {
+                let p = body.position.truncate() + DVec2::new(w.lat as f64, w.long as f64);
+                assert!((z - road(p.x, p.y)).abs() < 0.01, "lift {lift} camber {camber}: wheel at {z:.3}, road {:.3}", road(p.x, p.y));
+            }
+            assert!((body.position.z - (10.0 + lift)).abs() < 0.02, "lift {lift} camber {camber}: body at {:.3}", body.position.z);
+            let lean = (-camber).atan().to_degrees() as f32;
+            assert!((body.bank_deg - lean).abs() < 0.3, "camber {camber}: bank {} against {lean}", body.bank_deg);
+        }
     }
 
     #[test]

@@ -4493,7 +4493,20 @@ impl PlayerDuty {
         {
             let given_up = day_time > self.trip().end + 1800.0;
             let unbegun = self.left_late.is_none() && !self.picked;
-            if !(self.done || unbegun || given_up) {
+            // on the trip's last leg and standing at the next trip's first stop: this trip is
+            // over even when its last stop was never reached within AT_STOP (a terminus
+            // whose stop object lies away from where the buses stand, or that has no place
+            // on the map). Before, the duty stayed on the old trip until half an hour after
+            // its end: the IBIS kept the old terminus, the people at the new trip's stops
+            // waited for another bus, and they boarded only once that half hour was up -
+            // somewhere along the route.
+            let last = self.trip().stops.len().saturating_sub(1);
+            // (at the last stop itself it is reached the usual way, its arrival counted)
+            let at_last = self.trip().stops.get(last).and_then(|s| s.position).is_some_and(|p| (p - pos).length() < AT_STOP);
+            let at_next_start = self.next_stop >= last
+                && !at_last
+                && self.trips[self.trip_index + 1].stops.first().and_then(|s| s.position).is_some_and(|p| (p - pos).length() < AT_STOP);
+            if !(self.done || unbegun || given_up || at_next_start) {
                 break;
             }
             self.set_trip(self.trip_index + 1);
@@ -4862,6 +4875,33 @@ mod tests {
         assert_eq!(tt_terminus_index(Some(&hof), "B"), 1);
         assert_eq!(tt_terminus_index(Some(&hof), "b"), -1);
         assert_eq!(tt_terminus_index(None, "B"), -1);
+    }
+
+    #[test]
+    fn the_next_trip_starts_at_its_first_stop_though_the_last_one_was_missed() {
+        // trip 1 ends at x = 1000 (a stop object the bus never comes within 25 m of: it
+        // stands at x = 1040, where trip 2 leaves from)
+        let t1 = planned(0.0, &[(0.0, 0.0, 0.0), (500.0, 100.0, 100.0), (1000.0, 200.0, 200.0)]);
+        let t2 = planned(400.0, &[(1040.0, 400.0, 400.0), (1500.0, 500.0, 500.0)]);
+        let mut d = PlayerDuty { line: "5".into(), tour: "1".into(), trips: vec![t1, t2], trip_index: 0, first_trip: 0, next_stop: 0, at_stop: false, arrived_late: None, done: false, left_late: None, held_back: false, placed: true, trip_changed: false, picked: true, first_update: None, heading: 90.0 };
+        d.advance(glam::DVec3::new(0.0, 0.0, 0.0), 0.0);
+        d.advance(glam::DVec3::new(100.0, 0.0, 0.0), 10.0);
+        d.advance(glam::DVec3::new(500.0, 0.0, 0.0), 100.0);
+        d.advance(glam::DVec3::new(700.0, 0.0, 0.0), 130.0);
+        assert_eq!(d.next_stop, 2);
+        d.take_trip_change();
+        // at trip 2's first stop a minute before it leaves: trip 2, and the IBIS is told
+        d.advance(glam::DVec3::new(1040.0, 0.0, 0.0), 300.0);
+        assert_eq!(d.trip_index, 0, "not before a minute ahead of the departure");
+        d.advance(glam::DVec3::new(1040.0, 0.0, 0.0), 345.0);
+        assert_eq!(d.trip_index, 1);
+        assert!(d.take_trip_change());
+        // a bus still on its way (not at trip 2's first stop) stays on trip 1
+        let t1 = planned(0.0, &[(0.0, 0.0, 0.0), (500.0, 100.0, 100.0), (1000.0, 200.0, 200.0)]);
+        let t2 = planned(400.0, &[(1040.0, 400.0, 400.0), (1500.0, 500.0, 500.0)]);
+        let mut d = PlayerDuty { line: "5".into(), tour: "1".into(), trips: vec![t1, t2], trip_index: 0, first_trip: 0, next_stop: 2, at_stop: false, arrived_late: None, done: false, left_late: Some(0.0), held_back: false, placed: true, trip_changed: false, picked: true, first_update: None, heading: 90.0 };
+        d.advance(glam::DVec3::new(800.0, 0.0, 0.0), 345.0);
+        assert_eq!(d.trip_index, 0);
     }
 
     #[test]
