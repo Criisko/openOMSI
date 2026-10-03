@@ -163,11 +163,14 @@ jobs:
 
           The project's own release notes for this commit are on
           https://github.com/openOMSI-Project/openOMSI/releases."
-          git tag -f "$tag" "$GITHUB_SHA"
-          git push -f origin "$tag"
+          # gh makes the tag itself, through the releases API. Pushing it with git instead
+          # fails whenever this commit's workflow file differs from the one on main: GitHub
+          # refuses to let a workflow token create or update a workflow file without the
+          # "workflows" permission, which a GITHUB_TOKEN cannot have. Two commits built at
+          # the same time are enough for that to happen.
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" out/*.zip --clobber
             gh release edit "$tag" --title "openOMSI $version" --notes "$notes"
           else
-            gh release create "$tag" out/*.zip --verify-tag --title "openOMSI $version" --notes "$notes"
+            gh release create "$tag" out/*.zip --title "openOMSI $version" --notes "$notes" --target "$GITHUB_SHA"
           fi
