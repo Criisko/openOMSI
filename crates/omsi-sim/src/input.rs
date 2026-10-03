@@ -142,7 +142,9 @@ impl KeyboardAxes {
         // middle, harder the faster the bus rolls) is a little brisker standing still, and the
         // key turns the wheel at that same pace, only a tenth faster - never a swerve, because
         // a correction can only be as fast as the wheel would come back on its own anyway.
-        let v = self.speed_kmh.abs();
+        // (a speed that is no number made the return's step NaN, and its clamp stopped the
+        // game, #1045)
+        let v = if self.speed_kmh.is_finite() { self.speed_kmh.abs() } else { 0.0 };
         let (rate, back) = if self.linear {
             // OMSI: 0.05 of curvature a second, from the middle to the lock in
             // `[inv_min_turnradius]` / 0.05 seconds (2 s for a bus with a 10 m radius); it
@@ -223,6 +225,17 @@ mod tests {
             a.update(0.01);
         }
         assert!((a.steering - 0.25).abs() < 0.02, "it comes back at the same pace: {}", a.steering);
+    }
+
+    /// A speed that is no number (a bus whose physics went NaN) leaves the wheel coming
+    /// back as standing still; its clamp stopped the game (#1045).
+    #[test]
+    fn a_speed_that_is_no_number_does_not_stop_the_game() {
+        let mut a = KeyboardAxes { lock_curvature: 0.1, speed_kmh: f32::NAN, steering: 0.5, ..Default::default() };
+        for _ in 0..10 {
+            a.update(0.01);
+        }
+        assert!(a.steering.is_finite() && a.steering < 0.5, "{}", a.steering);
     }
 
     /// `[redSteerSpd]` with the steady pace: Omsi.exe's keys at speed (0x7e614c).

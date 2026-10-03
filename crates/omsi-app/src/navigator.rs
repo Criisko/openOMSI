@@ -40,11 +40,42 @@ const PANEL: Color = Color::rgba(10, 10, 10, 0.70);
 // (the bars under the texts darken whatever the opacity setting leaves of the panel: at a
 // third the cab showed through behind the next stop)
 const BAR: Color = Color::rgba(0, 0, 0, 0.55);
-const ROAD_CASING: Color = Color::rgba(30, 30, 30, 0.9);
-const ROAD: Color = Color::rgba(92, 92, 92, 1.0);
-const ROAD_MAIN: Color = Color::rgba(112, 112, 112, 1.0);
-const ROUTE: Color = Color::rgba(214, 48, 40, 1.0);
+// (the launcher's map picture draws with these too, so the two maps cannot look apart)
+pub(crate) const ROAD_CASING: Color = Color::rgba(30, 30, 30, 0.9);
+pub(crate) const ROAD: Color = Color::rgba(92, 92, 92, 1.0);
+pub(crate) const ROAD_MAIN: Color = Color::rgba(112, 112, 112, 1.0);
+pub(crate) const ROUTE: Color = Color::rgba(214, 48, 40, 1.0);
 const DOT: Color = Color::rgba(70, 140, 255, 1.0);
+/// The public transport's dots: trolleybuses, buses, trams, and the text on their line tags.
+const TROLLEY: Color = Color::rgba(46, 184, 92, 1.0);
+const BUS: Color = Color::rgba(226, 58, 52, 1.0);
+const TRAM: Color = Color::rgba(240, 190, 30, 1.0);
+const LINE_TEXT: Color = Color::rgba(15, 15, 15, 1.0);
+
+/// What a traffic vehicle is on the map: a trolleybus (its model has trolley poles to
+/// raise, `cp_SHTANGALEV` or `shtanga_lev_rot`), a tram, a bus (one on a timetable or
+/// showing a line), or any other car; and the line it shows, if it is public transport.
+fn traffic_kind(c: &crate::traffic::AiCar) -> (Color, Option<String>) {
+    let v = &c.vehicle;
+    let line = v
+        .ty
+        .program
+        .str_var("SetLineTo")
+        .and_then(|i| v.state.str_vars.get(i as usize))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "0");
+    let trolley = v.var("cp_SHTANGALEV").is_some() || v.var("shtanga_lev_rot").is_some();
+    let color = if c.is_rail() {
+        TRAM
+    } else if trolley {
+        TROLLEY
+    } else if c.bus.is_some() || line.is_some() {
+        BUS
+    } else {
+        return (DOT, None);
+    };
+    (color, line)
+}
 /// The route by how busy its roads are: empty, light, busy, heavy, jammed.
 const LEVEL: [Color; 5] = [
     Color::rgba(46, 116, 240, 1.0),
@@ -237,6 +268,7 @@ pub struct Navigator {
     /// screen.
     pub city: CityMap,
     panel_rect: [f32; 4],
+    origin_x: f32,
     gpu: Option<Gpu>,
     fonts: Fonts,
     atlas: Atlas,
@@ -361,6 +393,7 @@ impl Navigator {
             panel_room: [0.0; 2],
             city: CityMap::default(),
             panel_rect: [0.0; 4],
+            origin_x: 0.0,
             gpu: None,
             fonts: Fonts::new(),
             atlas: Atlas::new(1024),
@@ -783,6 +816,31 @@ impl Navigator {
     }
 
     /// Advance, draw into the texture and put it on the screen.
+    pub fn frame_at(
+        &mut self,
+        renderer: &Renderer,
+        scene: &mut Scene,
+        f: &NavFrame,
+        origin_x: f32,
+    ) {
+        for rect in [&mut self.panel_rect, &mut self.city.rect] {
+            rect[0] -= self.origin_x;
+            rect[2] -= self.origin_x;
+        }
+        if self.origin_x != origin_x {
+            self.panel_drag = None;
+            self.city.drag = None;
+        }
+        let start = scene.overlays.len();
+        self.frame(renderer, scene, f);
+        crate::ui::shift_overlays(scene, start, origin_x);
+        for rect in [&mut self.panel_rect, &mut self.city.rect] {
+            rect[0] += origin_x;
+            rect[2] += origin_x;
+        }
+        self.origin_x = origin_x;
+    }
+
     pub fn frame(&mut self, renderer: &Renderer, scene: &mut Scene, f: &NavFrame) {
         self.panel_overlay = None;
         // (with the navigator off the route is still followed for OMSI 2's arrows)
@@ -1017,14 +1075,21 @@ impl Navigator {
             }
         }
         let n_traffic = dy.len();
-        // the other vehicles: blue dots, as the other drivers in ETS2
+        // the other vehicles: blue dots, as the other drivers in ETS2; the public transport in
+        // its own colours (trolleybus, bus, tram), a little bigger, its line beside it
+        let mut lines: Vec<(DVec3, Color, String)> = Vec::new();
         if let Some(t) = f.traffic.filter(|_| self.show_ai) {
             for c in &t.cars {
                 if c.gone || (c.vehicle.position - f.bus).truncate().length() > self.zoom * 3.5 + 150.0 {
                     continue;
                 }
-                dy.world_disc(rel(c.vehicle.position), 1.7, 3.6, Color::rgba(8, 8, 8, 0.9));
-                dy.world_disc(rel(c.vehicle.position), 1.2, 2.6, DOT);
+                let (color, line) = traffic_kind(c);
+                let k = if color == DOT { 1.0 } else { 1.35 };
+                dy.world_disc(rel(c.vehicle.position), 1.7 * k, 3.6 * k, Color::rgba(8, 8, 8, 0.9));
+                dy.world_disc(rel(c.vehicle.position), 1.2 * k, 2.6 * k, color);
+                if let Some(l) = line {
+                    lines.push((c.vehicle.position, color, l));
+                }
             }
         }
         let n_world = dy.len();
@@ -1076,6 +1141,24 @@ impl Navigator {
             let fill = if next { Color::rgba(45, 116, 205, 1.0) } else if k + 1 == n_stops { ROUTE } else { Color::rgba(76, 91, 112, 0.98) };
             ui.circle(sp, badge, fill);
             ui.icon(&mut self.atlas, "directions_bus", sp, if next { 12.5 } else { 10.5 } * s, TEXT);
+        }
+        // the public transport's lines: a tag in its colour above its dot (the nearest first,
+        // none on top of another)
+        lines.sort_by(|a, b| (a.0 - f.bus).length().total_cmp(&(b.0 - f.bus).length()));
+        let mut taken: Vec<Rect> = Vec::new();
+        for (pos, color, l) in &lines {
+            let Some(p) = project(vpm, vp, rel(*pos)).filter(|p| map.contains(*p)) else { continue };
+            let px = 9.5 * s;
+            let l = self.fonts.fit(l, px, Weight::Bold, 40.0 * s);
+            let w = self.fonts.width(&l, px, Weight::Bold) + 8.0 * s;
+            let r = Rect::new(p.x - w * 0.5, p.y - 19.0 * s, w, 13.0 * s);
+            if taken.iter().any(|o| o.x < r.right() && r.x < o.right() && o.y < r.bottom() && r.y < o.bottom()) {
+                continue;
+            }
+            taken.push(r);
+            ui.rounded(Rect::new(r.x - 1.0 * s, r.y - 1.0 * s, r.w + 2.0 * s, r.h + 2.0 * s), 4.0 * s, Color::rgba(10, 10, 10, 0.9));
+            ui.rounded(r, 3.5 * s, *color);
+            ui.text_in(&mut self.atlas, &self.fonts, &l, px, Weight::Bold, r, Align::Center, LINE_TEXT);
         }
         // the bus: a plain white arrow
         if let Some(bp) = project(vpm, vp, rel(f.bus)) {
@@ -1307,10 +1390,25 @@ fn visible_road_lanes(net: &Network) -> Vec<(usize, &omsi_sim::traffic::Lane)> {
         .collect()
 }
 
-struct MapRoad {
-    points: Vec<DVec3>,
-    width: f32,
-    main: bool,
+/// The roads a city map draws, from a whole map's lanes as they were read off the tiles:
+/// every path linked to its neighbours, the editor-only ones confirmed by the map's own
+/// asphalt, then grouped into carriageways with their real widths. The navigator's city map
+/// and the launcher's map picture draw the same roads this way, so the two cannot drift
+/// apart; the second value is the linked network the caller may walk (a trip's own lanes).
+pub(crate) fn city_roads(lanes: Vec<omsi_sim::traffic::Lane>, surfaces: &[(Vec<DVec3>, f32)]) -> (Vec<MapRoad>, Network) {
+    let mut net = Network { lanes, ..Default::default() };
+    net.link(1.5);
+    confirm_road_surfaces(&mut net, surfaces);
+    let roads = road_geometry(&net);
+    (roads, net)
+}
+
+/// A road of the city map: the centre line of a carriageway, as wide as the map makes it.
+pub(crate) struct MapRoad {
+    pub points: Vec<DVec3>,
+    pub width: f32,
+    /// A road cars drive far along (the map's own speed limits say so): drawn brighter.
+    pub main: bool,
 }
 
 /// Some maps separate the asphalt mesh from their editor-only traffic splines. Use the
@@ -1484,8 +1582,8 @@ fn build_roads(p: &mut Painter, net: &Network, anchor: DVec2) {
 
 /// `pts` with the points dropped that lie within `tol` metres of the line through their
 /// neighbours kept (Douglas-Peucker): a lane is sampled every metre or two, a ribbon needs
-/// only its bends.
-fn simplify(pts: &[Vec3], tol: f32) -> Vec<Vec3> {
+/// only its bends. The launcher's map picture draws its roads with this too.
+pub(crate) fn simplify(pts: &[Vec3], tol: f32) -> Vec<Vec3> {
     if pts.len() < 3 {
         return pts.to_vec();
     }
@@ -2075,6 +2173,12 @@ impl Navigator {
         self.city.open
     }
 
+    /// Where the small navigator is on the screen, when it is shown.
+    pub fn screen_rect(&self) -> Option<[f32; 4]> {
+        let r = self.panel_rect;
+        (self.enabled && !self.city.open && r[2] > r[0]).then_some(r)
+    }
+
     /// The point (physical pixels) is on the small navigator.
     pub fn over_panel(&self, x: f32, y: f32) -> bool {
         let r = self.panel_rect;
@@ -2084,7 +2188,11 @@ impl Navigator {
     /// The mouse button went down on the small navigator: a click opens the city map, a
     /// drag moves the navigator (see [`Navigator::panel_move`]).
     pub fn panel_press(&mut self, x: f32, y: f32) {
-        self.panel_drag = Some(([x, y], [self.panel_rect[0], self.panel_rect[1]], false));
+        self.panel_drag = Some((
+            [x, y],
+            [self.panel_rect[0] - self.origin_x, self.panel_rect[1]],
+            false,
+        ));
     }
 
     /// The cursor moved with the button held on the navigator: past a few pixels it follows
@@ -2288,12 +2396,19 @@ impl Navigator {
         // (the opacity setting the map's ground too; the roads, names and header stay solid)
         bg.rounded(win, 10.0 * s, Color::rgba(15, 15, 15, crate::ui::backdrop(self.opacity).min(1.0)));
         let n_bg = bg.len();
-        // traffic: blue dots
+        // traffic: blue dots, the public transport in its colours with its line (as on the
+        // small map)
         let mut dots = Painter::new();
+        let mut lines: Vec<(DVec3, Color, String)> = Vec::new();
         if let Some(t) = f.traffic.filter(|_| self.show_ai) {
             for car in t.cars.iter().filter(|c| !c.gone) {
-                dots.world_disc(rel(car.vehicle.position), 2.2, 3.4, Color::rgba(8, 8, 8, 0.9));
-                dots.world_disc(rel(car.vehicle.position), 1.5, 2.3, DOT);
+                let (color, line) = traffic_kind(car);
+                let k = if color == DOT { 1.0 } else { 1.4 };
+                dots.world_disc(rel(car.vehicle.position), 2.2 * k, 3.4 * k, Color::rgba(8, 8, 8, 0.9));
+                dots.world_disc(rel(car.vehicle.position), 1.5 * k, 2.3 * k, color);
+                if let Some(l) = line {
+                    lines.push((car.vehicle.position, color, l));
+                }
             }
         }
         let n_dots = dots.len();
@@ -2316,6 +2431,24 @@ impl Navigator {
                 taken.push(r);
                 stop_labels.push((k, name, r));
             }
+        }
+        // the public transport's line tags, above their dots, where there is room
+        for (pos, color, l) in &lines {
+            let p = to_screen(*pos);
+            if !win.contains(p) {
+                continue;
+            }
+            let px = 11.0 * s;
+            let l = self.fonts.fit(l, px, Weight::Bold, 50.0 * s);
+            let tw = self.fonts.width(&l, px, Weight::Bold) + 9.0 * s;
+            let r = Rect::new(p.x - tw * 0.5, p.y - 22.0 * s, tw, 15.0 * s);
+            if taken.iter().any(|o| o.x < r.right() && r.x < o.right() && o.y < r.bottom() && r.y < o.bottom()) {
+                continue;
+            }
+            taken.push(r);
+            ui.rounded(Rect::new(r.x - 1.0 * s, r.y - 1.0 * s, r.w + 2.0 * s, r.h + 2.0 * s), 4.5 * s, Color::rgba(10, 10, 10, 0.9));
+            ui.rounded(r, 4.0 * s, *color);
+            ui.text_in(&mut self.atlas, &self.fonts, &l, px, Weight::Bold, r, Align::Center, LINE_TEXT);
         }
         if let (Some(st), true) = (self.streets.clone(), self.city.mpp < 3.2 && self.global.is_some()) {
             let px = 12.0 * s;
@@ -2453,6 +2586,24 @@ impl Navigator {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn centre_panel_map_click_and_drag_use_window_coordinates() {
+        let mut n = Navigator::new(true, 0.85, "bottom-left");
+        n.origin_x = 1920.0;
+        n.panel_rect = [1930.0, 600.0, 2290.0, 890.0];
+        n.panel_room = [1240.0, 610.0];
+        assert!(!n.over_panel(100.0, 700.0));
+        assert!(n.over_panel(2020.0, 700.0));
+        n.panel_press(2020.0, 700.0);
+        n.panel_move(2630.0, 405.0);
+        assert_eq!(n.at, Some([0.5, 0.5]));
+        n.city.open = true;
+        n.city.rect = [2100.0, 100.0, 3700.0, 900.0];
+        n.city.center = DVec2::new(100.0, 200.0);
+        n.city.mpp = 2.0;
+        assert_eq!(n.map_point(2900.0, 500.0), Some(n.city.center));
+        assert_eq!(n.map_point(1000.0, 500.0), None);
+    }
     /// A press and a small wobble is a click (the city map), a longer move drags the
     /// navigator, and the place reads back from the setting it is saved as (#940).
     #[test]

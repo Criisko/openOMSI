@@ -682,6 +682,9 @@ pub struct WsClient {
     pub local: SocketAddr,
     stop: Arc<AtomicBool>,
     pub alive: Arc<AtomicBool>,
+    /// How often the bridge opened a new WebSocket after a break (the game says hello again
+    /// at once instead of waiting for the host to be missed).
+    reconnects: Arc<AtomicUsize>,
 }
 
 impl Drop for WsClient {
@@ -720,7 +723,8 @@ impl WsClient {
         let local = udp.local_addr().map_err(|e| e.to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
-        let (st, al) = (stop.clone(), alive.clone());
+        let reconnects = Arc::new(AtomicUsize::new(0));
+        let (st, al, rc) = (stop.clone(), alive.clone(), reconnects.clone());
         let url = url.to_string();
         std::thread::Builder::new()
             .name("ws client".into())
@@ -806,6 +810,7 @@ impl WsClient {
                                 last_in = Instant::now();
                                 last_ping = Instant::now();
                                 log::info!("ws client {url}: connected again");
+                                rc.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
                             Err(e) => {
@@ -819,7 +824,12 @@ impl WsClient {
             })
             .map_err(|e| e.to_string())?;
         log::info!("ws client: the session is reached through {local}");
-        Ok(WsClient { local, stop, alive })
+        Ok(WsClient { local, stop, alive, reconnects })
+    }
+
+    /// How many times the connection was made again after a break.
+    pub fn reconnects(&self) -> usize {
+        self.reconnects.load(Ordering::Relaxed)
     }
 }
 
@@ -960,6 +970,7 @@ mod tests {
         }
         assert!(again, "the datagram came back through the second connection");
         assert!(client.alive.load(Ordering::Relaxed));
+        assert_eq!(client.reconnects(), 1);
     }
 
     #[test]

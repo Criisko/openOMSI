@@ -493,11 +493,15 @@ impl State {
             self.set_status("The server has not answered yet (is its address right? is it running?)", true);
             return;
         };
+        // A map not installed here comes with the server's mods when the game joins
+        // (`lan_mods`), so this is a notice, not a refusal. The Drive page needs a map of
+        // this installation chosen, so the choice stays as it is then: `duty()` starts the
+        // game on the server's map anyway.
         if !self.maps.is_empty() && !self.maps.iter().any(|m| m.file.eq_ignore_ascii_case(&info.map)) {
-            self.set_status(format!("The server plays {}, which is not installed here: install that map first.", info.map), true);
-            return;
+            self.set_status(format!("The server plays {}, which is not installed here: it is fetched from the server on joining.", info.map), false);
+        } else {
+            self.choice.map = info.map.clone();
         }
-        self.choice.map = info.map.clone();
         self.choice.lan_mode = "join".into();
         // (a server added by its bare address is joined where it answered: its web gateway)
         let bare = omsi_net::ws::ws_url(address).is_none() && !omsi_net::official::is_alias(address);

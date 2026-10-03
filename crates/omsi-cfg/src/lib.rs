@@ -946,6 +946,33 @@ pub fn content_folder_of(dir: &Path) -> PathBuf {
     }
 }
 
+/// A folder of programs - macOS's `/Applications` or `~/Applications`, where an
+/// openOMSI.app is usually copied to - is no place for the content folder: the game laid
+/// OMSI's folders (Vehicles, maps, Mods ...) out among the user's applications (#1043). The
+/// content folder then lives in the user's data folder instead - unless content was already
+/// installed there by an older version, which then stays where the player put it.
+pub fn is_programs_folder(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("Applications")) && !holds_content(dir)
+}
+
+/// Whether `dir` holds installed OMSI content: a vehicle or scenery folder with something in
+/// it, a map (a folder with its global.cfg - the game itself leaves only a `laststn.osn`
+/// there), or a mod beside the `Mods` folder's own README.
+fn holds_content(dir: &Path) -> bool {
+    let map = resolve_existing(dir, &["maps"]).and_then(|d| std::fs::read_dir(d).ok()).is_some_and(|mut it| {
+        it.any(|e| e.is_ok_and(|e| resolve_existing(&e.path(), &["global.cfg"]).is_some()))
+    });
+    let filled = |name: &str, skip: &[&str]| {
+        resolve_existing(dir, &[name]).and_then(|d| std::fs::read_dir(d).ok()).is_some_and(|mut it| {
+            it.any(|e| e.is_ok_and(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                !n.starts_with('.') && !skip.iter().any(|s| n.eq_ignore_ascii_case(s))
+            }))
+        })
+    };
+    map || ["Vehicles", "Sceneryobjects", "Splines"].iter().any(|n| filled(n, &[])) || filled("Mods", &["README.txt"])
+}
+
 /// Check if a directory is writable by attempting to create and remove a probe file.
 pub fn is_writable(dir: &Path) -> bool {
     let probe = dir.join(".openomsi-write-test");
@@ -982,6 +1009,23 @@ mod tests {
         assert!(is_writable(&tmp));
         let nonexistent = tmp.join("nonexistent_subfolder_xyz_123");
         assert!(!is_writable(&nonexistent));
+    }
+
+    #[test]
+    fn applications_folder_is_no_content_folder() {
+        assert!(is_programs_folder(Path::new("/Users/x/Applications")));
+        assert!(!is_programs_folder(Path::new("/Users/x/Games/openOMSI")));
+        // content an older version installed there stays in use
+        let dir = std::env::temp_dir().join(format!("omsi-apps-{}", std::process::id())).join("Applications");
+        std::fs::create_dir_all(dir.join("Mods")).unwrap();
+        std::fs::create_dir_all(dir.join("Vehicles")).unwrap();
+        std::fs::create_dir_all(dir.join("maps").join("Grundorf")).unwrap();
+        std::fs::write(dir.join("Mods").join("README.txt"), b"x").unwrap();
+        std::fs::write(dir.join("maps").join("Grundorf").join("laststn.osn"), b"x").unwrap();
+        assert!(is_programs_folder(&dir));
+        std::fs::create_dir_all(dir.join("Vehicles").join("MAN_SD200")).unwrap();
+        assert!(!is_programs_folder(&dir));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]

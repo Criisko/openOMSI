@@ -1,0 +1,16 @@
+{
+  "id": "openomsi-voice",
+  "name": "openOMSI Voice",
+  "version": "1.0.0",
+  "description": "Positional voice for openOMSI multiplayer: players are heard where they stand, quieter through a bus's bodywork (like SaltyChat for FiveM).",
+  "entry": "dist/index.js",
+  "permissions": [
+    "connection.read",
+    "connection.move",
+    "connection.nickname",
+    "voice.spatial",
+    "events.talk",
+    "events.mute",
+    "events.connection"
+  ]
+}

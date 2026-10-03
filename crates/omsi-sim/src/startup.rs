@@ -432,7 +432,7 @@ fn display_switches(v: &VehicleInstance) -> Vec<(String, String, f32)> {
         .model
         .text_textures
         .iter()
-        .filter_map(|t| p.str_var(&t.variable))
+        .filter_map(|t| p.text_texture_var(&t.variable))
         .map(|id| id as u32)
         .collect();
     let mut read_by_displays: Vec<omsi_script::VarId> = Vec::new();
@@ -512,11 +512,12 @@ fn display_switches(v: &VehicleInstance) -> Vec<(String, String, f32)> {
 fn blank_displays(v: &VehicleInstance) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for t in &v.ty.model.text_textures {
-        if v.ty.program.str_var(&t.variable).is_some()
-            && v.str_var(&t.variable).trim().is_empty()
-            && !out.contains(&t.variable)
-        {
-            out.push(t.variable.clone());
+        // the field may be a built-in string's number (see `Program::text_texture_var`); the
+        // variable it names is what a caller has to look at, not the number in the file
+        let Some(id) = v.ty.program.text_texture_var(&t.variable) else { continue };
+        let Some(name) = v.ty.program.str_var_names.get(id as usize).cloned() else { continue };
+        if v.str_var(&name).trim().is_empty() && !out.contains(&name) {
+            out.push(name);
         }
     }
     out

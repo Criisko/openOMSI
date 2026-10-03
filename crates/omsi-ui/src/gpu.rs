@@ -352,7 +352,9 @@ impl Gpu {
         pass.set_pipeline(&self.pipeline);
         for d in draws {
             let (Some((Some(buf), _)), Some(l)) = (self.buffers.get(d.buffer), layers.get(d.layer)) else { continue };
-            let Some(Some(tex)) = self.textures.get(d.texture).or(self.textures.first()) else { continue };
+            // (a texture that is not there - one freed, or a number kept from another device -
+            // draws nothing: taken for the atlas, a picture came out as the interface's words)
+            let Some(Some(tex)) = self.textures.get(d.texture) else { continue };
             if d.range.is_empty() || d.layer as u64 >= MAX_LAYERS {
                 continue;
             }

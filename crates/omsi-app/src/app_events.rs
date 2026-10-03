@@ -60,10 +60,7 @@ impl ApplicationHandler for App {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         self.surface = None;
         self.touch.drop_gpu();
-        self.keys.clear();
-        if let Some(p) = self.player.as_mut() {
-            p.axes.release_all();
-        }
+        self.input_lost();
         self.save_last_situation();
     }
 
@@ -78,12 +75,22 @@ impl ApplicationHandler for App {
                 if let (Some(s), Some(r)) = (self.surface.as_mut(), self.renderer.as_ref()) {
                     s.resize(r, size.width, size.height);
                 }
+                // (minimised, Windows makes the window 0 x 0)
+                let hidden = size.width == 0 || size.height == 0;
+                if hidden && !self.window_hidden {
+                    self.input_lost();
+                }
+                self.window_hidden = hidden;
             }
+            // (minimised or covered entirely, macOS and Wayland: the focus goes with it, and a
+            // window merely covered by another may still be the one the player drives with)
+            WindowEvent::Occluded(hidden) => self.window_hidden = hidden,
             WindowEvent::Focused(true) => {
                 self.window_focused = true;
                 if let Some(ctl) = self.controllers.as_mut() {
                     ctl.set_focus(true);
                 }
+                self.input_back();
             }
             WindowEvent::Focused(false) => {
                 self.finish_vr_nav_edit();
@@ -101,12 +108,17 @@ impl ApplicationHandler for App {
                 // modifier got "stuck" and made the next plain key press look like it was
                 // held with that modifier - Shift got stuck this way once, and a plain `W`
                 // (throttle in the wasd preset) was then read as Shift+W, OMSI's own wiper
-                // key, toggling the wipers on every press instead of driving.
-                self.keys.clear();
-                if let Some(p) = self.player.as_mut() {
-                    p.axes.release_all();
-                }
+                // key, toggling the wipers on every press instead of driving. The vehicle's
+                // own keys, a door button, a switch held with the mouse and the mouse
+                // steering's throttle went on as well, with the window minimised.
+                self.input_lost();
             }
+            // nothing the keyboard or the mouse does reaches the game while the window is
+            // in the background (a wheel turned over a window behind another one zoomed;
+            // the keys a system sends again for what is still held when the focus comes
+            // back count only when pressed anew)
+            WindowEvent::KeyboardInput { is_synthetic, ref event, .. } if self.input_away || (is_synthetic && event.state == ElementState::Pressed) => {}
+            WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } if self.input_away => {}
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed && self.menu_edit_icao {
                     if let Some(text)=event.text.as_deref(){ self.icao_edit_text(text); }
@@ -508,6 +520,9 @@ impl ApplicationHandler for App {
                 self.drive_streaming();
                 *self.profile.entry("streaming").or_default() += __t.elapsed().as_secs_f64();
                 let __t = Instant::now();
+                // (with a triple screen, all of its three panels are in sight)
+                let sight = self.camera.as_ref().zip(self.surface.as_ref())
+                    .and_then(|(c, s)| self.sight_extent(c, (s.config.width, s.config.height)));
                 if let (Some(t), Some(w), Some(r), Some(scene)) = (
                     self.traffic.as_mut(),
                     self.world.as_ref(),
@@ -534,6 +549,7 @@ impl ApplicationHandler for App {
                         t,
                         self.camera.as_ref(),
                         aspect,
+                        sight,
                         fog,
                         &self.clock,
                         self.humans.as_ref(),
@@ -599,6 +615,7 @@ impl ApplicationHandler for App {
                     t.others.extend(own_outlines(self.player.as_ref(), &self.placed));
                     if !self.paused {
                         t.player_priority = self.player.as_ref().and_then(|p| p.vehicle.var("TrafficPriority")).is_some_and(|v| v > 0.5);
+                        t.player_blinker = self.player.as_ref().map(|p| lan::indicator(&p.vehicle)).unwrap_or(0);
                         t.tick(dt, self.player.as_ref().map(|p| player_outline(p)));
                         if let Some(w) = self.world.as_ref() {
                             w.set_switches(&t.switch_requests());
@@ -739,7 +756,7 @@ impl ApplicationHandler for App {
                 // mouse steering asks only for a player's vehicle, 0x6f4257; not on foot,
                 // #516)
                 let bus_view = self.mouse_steers_in_view();
-                if let (true, Some(s)) = (self.mouse_drive && bus_view && !self.mouse_look
+                if let (true, Some(s)) = (self.mouse_drive && bus_view && !self.mouse_look && !self.input_away
                                               && self.game_menu.is_none(), self.surface.as_ref()) {
                     let (w, h) = (s.config.width as f32, s.config.height as f32);
                     if std::mem::take(&mut self.center_cursor) {
@@ -800,11 +817,13 @@ impl ApplicationHandler for App {
                     }
                     analog.throttle = Some(self.mouse_pedals.0);
                     analog.brake = Some(self.mouse_pedals.1);
-                } else if self.mouse_drive && bus_view && self.mouse_look
+                } else if self.mouse_drive && bus_view && (self.mouse_look || self.input_away)
                     && self.game_menu.is_none() {
                     // looking round with the right button: the wheel and the pedals stay where
                     // the mouse left them, as in OMSI (they went slack until the button was let
-                    // go - no quick look round while driving)
+                    // go - no quick look round while driving). With the window in the
+                    // background the same, its throttle let go (`App::input_lost`): the
+                    // cursor wandering over other windows steered and drove the bus.
                     analog.steering = Some(self.mouse_steer.0);
                     analog.throttle = Some(self.mouse_pedals.0);
                     analog.brake = Some(self.mouse_pedals.1);
@@ -1211,6 +1230,8 @@ impl ApplicationHandler for App {
                 self.tick_on_foot(if self.paused { 0.0 } else { dt });
                 self.sync_remote_walkers();
                 let __t = Instant::now();
+                let sight = self.camera.as_ref().zip(self.surface.as_ref())
+                    .and_then(|(c, s)| self.sight_extent(c, (s.config.width, s.config.height)));
                 if let (Some(h), Some(w), Some(r), Some(scene)) = (
                     self.humans.as_mut(),
                     self.world.as_ref(),
@@ -1251,7 +1272,7 @@ impl ApplicationHandler for App {
                         h.eye = Some(humans::Eye::of(
                             cam,
                             s.config.width as f32 / s.config.height.max(1) as f32,
-                        ));
+                        ).widened(sight));
                     }
                     // (the other LAN players' buses, for their riders to sit in)
                     h.set_remote_buses(self.remotes.remotes.iter().map(|(id, r)| (*id, r.vehicle())));
@@ -1331,6 +1352,7 @@ impl ApplicationHandler for App {
                             p.ibis_to_stop(trip, k);
                         }
                     }
+                    d.learn_loaded(&w.object_positions.lock());
                     if let Some((arrival, departure)) = d.update(&mut p.vehicle, self.clock.time) {
                         self.career.stop_served(arrival, departure);
                     }
@@ -1418,6 +1440,12 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+
+                // Steam's callbacks (rich presence)
+                #[cfg(steam)]
+                if let Some(steam) = self.steam.as_ref() {
+                    steam.client.run_callbacks();
+                }
                 // the plugins' frame, with the bus's scripts done
                 let plugins = self.plugins.get_or_insert_with(crate::plugins::load);
                 if !plugins.is_empty() && !self.paused {
@@ -1488,8 +1516,13 @@ impl ApplicationHandler for App {
                     // turns (kept per bus in mirrors.cfg when the keys are let go)
                     // the mirror editor: an arrow held over a panel aims that panel's mirror
                     // (kept per bus like Ctrl+Alt+arrows below)
-                    if let (Some(size), Some(a)) = (self.mirror_hud_size(), self.mirror_hud.turning()) {
-                        if let (Some(i), Some(p)) = (self.mirror_hud.cam_under(self.cursor, size), self.player.as_mut()) {
+                    if let (Some(size), Some(a)) =
+                        (self.mirror_hud_size(), self.mirror_hud.turning())
+                    {
+                        if let (Some(i), Some(p)) = (
+                            self.mirror_hud.cam_under(self.hud_cursor(), size),
+                            self.player.as_mut(),
+                        ) {
                             let n = p.vehicle.ty.def.cameras_reflexion.len();
                             if p.mirror_offsets.len() < n {
                                 p.mirror_offsets.resize(n, [0.0; 2]);
@@ -1909,7 +1942,7 @@ impl ApplicationHandler for App {
                 ) {
                     let traffic = self.traffic.as_ref();
                     let phase = |c: usize, li: usize| {
-                        traffic.map(|t| t.light_vars(c, li)).unwrap_or((-1.0, 0.0))
+                        traffic.map(|t| t.light_vars(c, li)).unwrap_or((omsi_sim::traffic::UNLINKED_PHASE as f32, 0.0))
                     };
                     let __tb = Instant::now();
                     if let Some(p) = self.player.as_mut() {
@@ -1960,9 +1993,6 @@ impl ApplicationHandler for App {
                     // the trip, the launcher the keys): only what the driver has to act on,
                     // in the interface font, top left.
                     let mut lines: Vec<String> = Vec::new();
-                    if self.paused {
-                        lines.push(ui::PAUSE_NOTICE.into());
-                    }
                     // why the bus is not moving, whenever the throttle is pressed and nothing
                     // happens: the things a driver checks first
                     if let Some(p) = self.player.as_ref() {
@@ -1996,8 +2026,13 @@ impl ApplicationHandler for App {
                         }
                     }
                     self.service_msg = self.service_msg.take().filter(|(_, l)| *l > 0.0);
+                    for n in self.notices.iter_mut() {
+                        n.left -= dt;
+                    }
+                    self.notices.retain(|n| n.left > 0.0);
                     if let Some(lan) = self.lan.as_ref() {
                         lines.extend(lan::hud_lines(lan, &self.remotes, self.player.as_ref()));
+                        lines.extend(self.voice.as_ref().and_then(|v| v.hud_line()));
                     }
                     if let Some(h) = self.humans.as_ref() {
                         if let Some(hint) = h.hint() {
@@ -2021,7 +2056,19 @@ impl ApplicationHandler for App {
                     // pictures' only)
                     scene.overlays.clear();
                     let notes = lines;
-                    if let (Some(nav), Some(p), Some(s)) = (self.navigator.as_mut(), self.player.as_ref(), self.surface.as_ref()) {
+                    let hud = self
+                        .surface
+                        .as_ref()
+                        .map(|s| {
+                            self.settings
+                                .hud_viewport((s.config.width, s.config.height))
+                        })
+                        .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+                    if let (Some(nav), Some(p), Some(_)) = (
+                        self.navigator.as_mut(),
+                        self.player.as_ref(),
+                        self.surface.as_ref(),
+                    ) {
                         let old_enabled = nav.enabled;
                         let old_opacity = nav.opacity;
                         nav.cockpit_display = vr_active;
@@ -2078,13 +2125,25 @@ impl ApplicationHandler for App {
                             time: self.clock.time,
                             weekday: self.clock.weekday(),
                             language: &self.settings.language,
-                            screen: if vr_active { (1440.0, 1440.0) } else { (s.config.width as f32, s.config.height as f32) },
-                            ui_scale: if vr_active { 1.0 } else { self.settings.ui_scale },
-                            follow_window: if vr_active { true } else { self.settings.ui_scale_window },
+                            screen: if vr_active {
+                                (1440.0, 1440.0)
+                            } else {
+                                (hud[2], hud[3])
+                            },
+                            ui_scale: if vr_active {
+                                1.0
+                            } else {
+                                self.settings.ui_scale
+                            },
+                            follow_window: if vr_active {
+                                true
+                            } else {
+                                self.settings.ui_scale_window
+                            },
                             dt,
                         };
                         let __tn = Instant::now();
-                        nav.frame(r, scene, &frame);
+                        nav.frame_at(r, scene, &frame, hud[0]);
                         nav.enabled = old_enabled;
                         nav.opacity = old_opacity;
                         *self.profile.entry("hud.navigator").or_default() += __tn.elapsed().as_secs_f64();
@@ -2098,7 +2157,7 @@ impl ApplicationHandler for App {
                     }
                     if let (Some(ui), Some(s)) = (self.ui.as_mut(), self.surface.as_ref()) {
                         let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
-                        let (w, h) = (s.config.width as f32, s.config.height as f32);
+                        let (w, h) = (hud[2], hud[3]);
                         self.remotes.chat.disabled = !self.settings.chat;
                         let chat = (self.lan.is_some() && self.settings.chat).then(|| ui::ChatView {
                             lines: &self.remotes.chat.lines,
@@ -2106,11 +2165,37 @@ impl ApplicationHandler for App {
                             error: self.remotes.chat.error(),
                         });
                         ui.chat.hidden = self.remotes.chat.hidden;
-                        let tags = if self.settings.name_tags {
-                            self.camera.as_ref().map(|c| lan::name_tags(&self.remotes, c, w, h)).unwrap_or_default()
+                        let mut tags = if self.settings.name_tags {
+                            let voice = self.voice.as_ref();
+                            let speaks = |name: &str, id: u32| voice.is_some_and(|v| v.speaks(name, id));
+                            let rig = (self.settings.triple.enabled
+                                && !self.settings.vr_requested())
+                            .then(|| {
+                                self.settings.triple.zoomed(
+                                    s.config.width,
+                                    s.config.height,
+                                    self.view_zoom.get(&self.view).copied().unwrap_or(1.0),
+                                )
+                            });
+                            self.camera
+                                .as_ref()
+                                .map(|c| {
+                                    lan::name_tags(
+                                        &self.remotes,
+                                        c,
+                                        s.config.width as f32,
+                                        h,
+                                        rig.as_ref(),
+                                        &speaks,
+                                    )
+                                })
+                                .unwrap_or_default()
                         } else {
                             Vec::new()
                         };
+                        for (pos, _, _, _) in &mut tags {
+                            pos.0 -= hud[0];
+                        }
                         // the vehicle chooser shows its vehicles in the menu's place (the menu
                         // scrolls a long list)
                         // the name of the cab's switch under the cursor, unless the interface
@@ -2147,7 +2232,7 @@ impl ApplicationHandler for App {
                             opacity: ui::backdrop(self.settings.ui_opacity),
                             width: w,
                             height: h,
-                            cursor: self.cursor,
+                            cursor: (self.cursor.0 - hud[0], self.cursor.1),
                             vr: {
                                 #[cfg(windows)] { self.vr.is_some() }
                                 #[cfg(not(windows))] { false }
@@ -2178,8 +2263,10 @@ impl ApplicationHandler for App {
                             tutorial: self.tutorial.as_ref().filter(|t| !t.hidden && self.game_menu.is_none()).and_then(|t| t.page().map(|p| (p.title.as_str(), p.text.as_str(), p.image.as_deref(), t.at, t.pages.len()))),
                             chat,
                             tags,
+                            notices: &self.notices,
+                            notice_anchor: self.navigator.as_ref().and_then(|n| n.screen_rect()),
                         };
-                        ui.draw(r, scene, &frame, dt);
+                        ui.draw_at(r, scene, &frame, dt, hud[0]);
                     }
                     *self.profile.entry("hud").or_default() += __t.elapsed().as_secs_f64();
                 }
@@ -2349,6 +2436,7 @@ impl ApplicationHandler for App {
                     if frame.is_none() {
                         self.hidden_frames += 1;
                     }
+                    let shown_nothing = frame.is_none() && stand_in.is_none();
                     let view = frame
                         .as_ref()
                         .map(|f| f.texture.create_view(&Default::default()))
@@ -2408,7 +2496,10 @@ impl ApplicationHandler for App {
                             // its frustum can leave a mirror visible in VR uninitialised
                             // (black). Refresh all bus mirrors in VR, still taking turns
                             // within the configured budget; keep desktop visibility culling.
-                            let mirror_view = if vr_active || (self.mirror_hud.active() && self.in_cab) {
+                            let mirror_view = if vr_active
+                                || self.settings.triple.enabled
+                                || (self.mirror_hud.active() && self.in_cab)
+                            {
                                 None
                             } else {
                                 Some((*cam, s.config.width as f32 / s.config.height.max(1) as f32))
@@ -2496,14 +2587,43 @@ impl ApplicationHandler for App {
                         if self.in_cab {
                             if let Some(w) = self.world.as_ref() {
                                 self.mirror_hud.ensure_frame(r, scene);
-                                self.mirror_hud.push(scene, w, s.config.width as f32, s.config.height as f32, self.cursor);
+                                let hud = self
+                                    .settings
+                                    .hud_viewport((s.config.width, s.config.height));
+                                let start = scene.overlays.len();
+                                self.mirror_hud.push(
+                                    scene,
+                                    w,
+                                    hud[2],
+                                    hud[3],
+                                    (self.cursor.0 - hud[0], self.cursor.1),
+                                );
+                                crate::ui::shift_overlays(scene, start, hud[0]);
                             }
                             // (the editor's keys, on screen as long as it is on)
                             if self.mirror_hud.editing() && self.service_msg.is_none() {
                                 self.service_msg = Some((crate::mirror_hud::HINT.into(), 2.0));
                             }
                         }
-                        if !mirrored {
+                        if !mirrored
+                            && self.settings.triple.enabled
+                            && !self.settings.vr_requested()
+                        {
+                            let rig = self.settings.triple.zoomed(
+                                s.config.width,
+                                s.config.height,
+                                self.view_zoom.get(&self.view).copied().unwrap_or(1.0),
+                            );
+                            r.render_triple(
+                                scene,
+                                &view,
+                                s.config.width,
+                                s.config.height,
+                                cam,
+                                &lighting,
+                                &rig,
+                            );
+                        } else if !mirrored {
                             r.render(
                                 scene,
                                 &view,
@@ -2570,6 +2690,10 @@ impl ApplicationHandler for App {
                     } else {
                         max_fps
                     };
+                    // a frame not shown (the window minimised or out of sight): 30 frames a
+                    // second keep the simulation and the sound going; more is only heat
+                    // (OMSI_RENDER_OCCLUDED, which draws them anyway, keeps its pace)
+                    let max_fps = if shown_nothing { if max_fps == 0 { 30 } else { max_fps.min(30) } } else { max_fps };
                     #[cfg(windows)]
                     let vr_active = self.vr.is_some();
                     #[cfg(not(windows))]
@@ -2775,7 +2899,7 @@ impl App {
         if !self.in_cab || self.game_menu.is_some() || !self.mirror_hud.editing() {
             return None;
         }
-        self.surface.as_ref().map(|s| (s.config.width as f32, s.config.height as f32))
+        Some(self.hud_size())
     }
 
     /// The mouse wheel (or a pinch of two fingers): `amount` notches, up positive.
@@ -2783,8 +2907,12 @@ impl App {
         if self.vr_nav_edit.is_some() { self.vr_nav_scroll(amount); return; }
         // over a mirror panel the wheel resizes it (Shift: wider or narrower)
         if let Some(size) = self.mirror_hud_size() {
-            let shift = self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight);
-            if self.mirror_hud.wheel(amount, shift, self.cursor, size) {
+            let shift =
+                self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight);
+            if self
+                .mirror_hud
+                .wheel(amount, shift, self.hud_cursor(), size)
+            {
                 return;
             }
         }
@@ -2859,8 +2987,11 @@ impl App {
     pub(crate) fn left_button(&mut self, event_loop: &ActiveEventLoop, pressed: bool) {
         if let Some(edit) = self.vr_nav_edit.as_mut() { edit.moving = pressed; return; }
         // a mirror panel is dragged with the left button (a release always ends a drag)
-        if let Some(size) = self.mirror_hud_size().or_else(|| (!pressed).then(|| self.surface.as_ref().map(|s| (s.config.width as f32, s.config.height as f32))).flatten()) {
-            if self.mirror_hud.press(pressed, self.cursor, size) {
+        if let Some(size) = self
+            .mirror_hud_size()
+            .or_else(|| (!pressed).then(|| self.hud_size()))
+        {
+            if self.mirror_hud.press(pressed, self.hud_cursor(), size) {
                 return;
             }
         }
@@ -2881,6 +3012,8 @@ impl App {
             // Releasing the mouse button finishes scrollbar dragging.
             if state == ElementState::Released {
                 self.menu_drag = None;
+                self.dd_scroll_drag = None;
+                self.pane_scroll_drag = None;
                 if self.menu_scroll_drag {
                     self.menu_scroll_drag = false;
                     self.menu_top = self.menu_top.map(f32::round);
@@ -2892,6 +3025,17 @@ impl App {
             if self.dropdown.is_some() {
                 let inside = |r: &[f32; 4]| self.cursor.0 >= r[0] && self.cursor.0 <= r[2] && self.cursor.1 >= r[1] && self.cursor.1 <= r[3];
                 let hit = self.ui.as_ref().and_then(|u| u.dd_rects.iter().position(|r| inside(r)).map(|i| i + u.dd_top));
+                // its scroll bar is dragged (a press on the track beside the thumb takes the
+                // thumb there by its middle); before, the press closed the list (#794)
+                if let Some((track, thumb)) = self.ui.as_ref().and_then(|u| u.dd_scroll).filter(|_| hit.is_none()) {
+                    let bar = [thumb[0], track[1], thumb[2], track[3]];
+                    if inside(&bar) {
+                        let grab = if inside(&thumb) { self.cursor.1 - thumb[1] } else { (thumb[3] - thumb[1]) * 0.5 };
+                        self.dd_scroll_drag = Some(grab);
+                        self.drag_dropdown(self.cursor.1);
+                        return;
+                    }
+                }
                 match hit {
                     Some(i) => self.dropdown_pick(i),
                     None => self.dropdown = None,
@@ -2934,6 +3078,17 @@ impl App {
 
                 // The timetable beside a line's tours: a stop to start from, or the button.
                 if self.chooser.is_some() {
+                    // its scroll bar is dragged (a press on the track beside the thumb takes
+                    // the thumb there by its middle)
+                    if let Some((track, thumb, _, _)) = self.ui.as_ref().and_then(|u| u.menu_pane_scroll) {
+                        let inside = |r: &[f32; 4]| self.cursor.0 >= r[0] && self.cursor.0 <= r[2] && self.cursor.1 >= r[1] && self.cursor.1 <= r[3];
+                        if inside(&[thumb[0], track[1], thumb[2], track[3]]) {
+                            let grab = if inside(&thumb) { self.cursor.1 - thumb[1] } else { (thumb[3] - thumb[1]) * 0.5 };
+                            self.pane_scroll_drag = Some(grab);
+                            self.drag_pane(self.cursor.1);
+                            return;
+                        }
+                    }
                     let pane = self.ui.as_ref().and_then(|u| {
                         let inside = |r: &[f32; 4]| self.cursor.0 >= r[0] && self.cursor.0 <= r[2] && self.cursor.1 >= r[1] && self.cursor.1 <= r[3];
                         if u.menu_pane_go.as_ref().is_some_and(inside) {

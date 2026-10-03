@@ -73,6 +73,9 @@ pub(crate) struct DeviceCfg {
     pub(crate) ff_scale: Option<(f32, f32)>,
     /// Motor polarity for this device; None uses the existing global setting.
     pub(crate) ff_invert: Option<bool>,
+    /// `[openOMSI.Latching]`: the buttons (from 0) that are latching switches - a turn signal
+    /// lever, a lit hazard button - and switch back when they come out.
+    pub(crate) latching: Vec<usize>,
 }
 
 /// The `gamectrler.cfg` in use: the content folder's (written by the launcher) before
@@ -138,6 +141,13 @@ pub(crate) fn parse_cfg(text: &str) -> Vec<DeviceCfg> {
                 }
                 i += 3;
             }
+            "[openOMSI.Latching]" => {
+                if let Some(d) = out.last_mut() {
+                    // (button numbers as the launcher shows them, from 1)
+                    d.latching = lines.get(i + 1).unwrap_or(&"").split_whitespace().filter_map(|v| v.parse::<usize>().ok()?.checked_sub(1)).collect();
+                }
+                i += 2;
+            }
             "[openOMSI.FFInvert]" => {
                 if let Some(d) = out.last_mut() {
                     d.ff_invert = lines.get(i + 1).and_then(|v| match *v { "0" => Some(false), "1" => Some(true), _ => None });
@@ -170,6 +180,10 @@ pub(crate) fn cfg_text(devices: &[DeviceCfg]) -> String {
         t.push_str(&format!("\r\n[FFScale]\r\n{a:.3}\r\n{b:.3}\r\n\r\n"));
         if let Some(invert) = d.ff_invert {
             t.push_str(&format!("[openOMSI.FFInvert]\r\n{}\r\n\r\n", invert as u8));
+        }
+        if !d.latching.is_empty() {
+            let numbers: Vec<String> = d.latching.iter().map(|b| (b + 1).to_string()).collect();
+            t.push_str(&format!("[openOMSI.Latching]\r\n{}\r\n\r\n", numbers.join(" ")));
         }
     }
     t
@@ -262,7 +276,15 @@ impl Devices {
         // without gilrs's default filters: its dead zone took 10 % of every axis - on a
         // wheel of 1800 degrees, 90 degrees either side of the middle did nothing - and its
         // jitter filter held back small movements; the settings' dead zone is the only one
-        let gilrs = gilrs::GilrsBuilder::new().with_default_filters(false).build().map_err(|e| log::info!("game controllers: {e}")).ok();
+        // Linux: gilrs takes a wheel with periodic effects for a rumbling gamepad and starts
+        // a rumble effect on it every 50 ms, even at strength 0 - a HID PID wheel's motor
+        // kicks on every start and the wheel buzzes. A wheel's forces go through evdev_ff,
+        // so gilrs's force feedback stays off while one is connected.
+        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+        let gilrs_ff = !crate::evdev_ff::wheel_connected();
+        #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+        let gilrs_ff = true;
+        let gilrs = gilrs::GilrsBuilder::new().with_default_filters(false).with_force_feedback(gilrs_ff).build().map_err(|e| log::info!("game controllers: {e}")).ok();
         #[cfg(windows)]
         let di = hwnd.and_then(|h| crate::dinput::DirectInput::new(h, ff));
         #[cfg(not(windows))]
@@ -491,6 +513,16 @@ impl Devices {
     }
 }
 
+/// What a latching switch fires when it comes out: a turn signal set goes off, the parking
+/// brake set is released, anything else (a toggle) fires once more and so switches back.
+fn latch_release(action: &str) -> String {
+    match action.to_ascii_lowercase().as_str() {
+        "blinker_left_set" | "blinker_right_set" => "blinker_off".to_string(),
+        "parking_brake_set" => "parking_brake_release".to_string(),
+        _ => action.to_string(),
+    }
+}
+
 fn use_gilrs_buttons(direct_input: bool, system_gamepad: bool) -> bool {
     !direct_input || system_gamepad
 }
@@ -629,8 +661,17 @@ impl Controllers {
             if self.off(&name) {
                 continue;
             }
-            if let Some(action) = find_device_cfg(&self.cfg, &name).and_then(|d| d.buttons.get(n)).filter(|a| !a.0.is_empty()) {
+            let Some(d) = find_device_cfg(&self.cfg, &name) else { continue };
+            if let Some(action) = d.buttons.get(n).filter(|a| !a.0.is_empty()) {
                 self.actions.push((action.0.clone(), down));
+                // a latching switch coming out switches back: pressed in again it would
+                // only have toggled the hazard lights on the next press, and the lever's
+                // turn signal stayed on in the middle
+                if !down && d.latching.contains(&n) {
+                    let back = latch_release(&action.0);
+                    self.actions.push((back.clone(), true));
+                    self.actions.push((back, false));
+                }
             }
         }
         if !self.enabled {
@@ -1236,6 +1277,21 @@ mod axis_shape_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn latching_switches_switch_back_and_stay_in_the_file() {
+        assert_eq!(super::latch_release("blinker_left_set"), "blinker_off");
+        assert_eq!(super::latch_release("Blinker_Right_Set"), "blinker_off");
+        assert_eq!(super::latch_release("parking_brake_set"), "parking_brake_release");
+        assert_eq!(super::latch_release("blinker_warn_toggle"), "blinker_warn_toggle");
+        let text = "[ctrl]\r\nAER0 Truck Simulator Gear\r\n0\r\n\r\n[buttons]\r\n2\r\nblinker_warn_toggle\r\n0\r\n\r\n0\r\n\r\n[openOMSI.Latching]\r\n1\r\n";
+        let devices = super::parse_cfg(text);
+        assert_eq!(devices[0].latching, vec![0]);
+        let again = super::parse_cfg(&super::cfg_text(&devices));
+        assert_eq!(again[0].latching, vec![0]);
+        assert_eq!(again[0].buttons, devices[0].buttons);
+        assert!(super::cfg_text(&devices).contains("[openOMSI.Latching]\r\n1\r\n"));
+    }
 
     #[test]
     fn look_axes_are_kept_in_the_file_and_rest_at_the_centre() {

@@ -476,31 +476,15 @@ pub(crate) fn spawn_player(
     if let Some(d) = args.dirt {
         p.vehicle.dirt = d.clamp(0.0, 1.0);
     }
-    if !args.situation_vars.is_empty() {
-        let mut n = 0;
-        for (name, v) in &args.situation_vars {
-            if p.vehicle.set_var(name, *v) {
-                n += 1;
-            }
-        }
-        for (name, v) in &args.situation_strvars {
-            if let Some(i) = p.vehicle.ty.program.str_var(name) {
-                p.vehicle.state.str_vars[i as usize] = v.clone();
-            }
-        }
+    if args.is_resuming() {
+        let (numeric, textual) = p
+            .vehicle
+            .restore_script_state(&args.situation_vars, &args.situation_strvars);
         log::info!(
-            "situation: {n} of {} vehicle variables restored",
-            args.situation_vars.len()
+            "situation: {numeric} of {} variables and {textual} of {} strings restored",
+            args.situation_vars.len(),
+            args.situation_strvars.len()
         );
-        // the saved Dirt_Norm is the engine's own dirt counter, not a script variable
-        if let Some((_, d)) = args
-            .situation_vars
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case("Dirt_Norm"))
-        {
-            p.vehicle.dirt = d.clamp(0.0, 1.0);
-        }
-        p.vehicle.update(1.0 / 30.0);
     }
     if let Some(sv) = &args.setstr {
         for kv in sv.split(',') {

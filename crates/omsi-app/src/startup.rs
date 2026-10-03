@@ -112,7 +112,7 @@ pub(crate) fn content_dir() -> Option<PathBuf> {
         dir
     };
     let cand = omsi_cfg::content_folder_of(&dir);
-    if (cand.exists() || std::fs::create_dir_all(&cand).is_ok()) && omsi_cfg::is_writable(&cand) {
+    if !omsi_cfg::is_programs_folder(&cand) && (cand.exists() || std::fs::create_dir_all(&cand).is_ok()) && omsi_cfg::is_writable(&cand) {
         Some(cand)
     } else {
         let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
@@ -159,18 +159,25 @@ pub(crate) fn graphics_instance() -> wgpu::Instance {
         descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
         return wgpu::Instance::new(descriptor);
     }
-    let mut last = None;
+    // (an interface whose only adapter is a software renderer - DirectX 12's "Microsoft
+    // Basic Render Driver" on a chip without a DirectX 12 driver - comes after the others)
+    let (mut software, mut last) = (None, None);
     for b in backend_order() {
         let instance = backend_instance(b);
         let adapters = pollster::block_on(instance.enumerate_adapters(b));
-        if !adapters.is_empty() {
+        if adapters.iter().any(|a| !is_software(&a.get_info())) {
             log::info!("graphics: {:?} ({})", b, adapters.iter().map(|a| a.get_info().name).collect::<Vec<_>>().join(", "));
             return instance;
         }
-        log::info!("graphics: no {b:?} adapter here");
-        last = Some(instance);
+        if adapters.is_empty() {
+            log::info!("graphics: no {b:?} adapter here");
+            last = Some(instance);
+        } else {
+            log::info!("graphics: {b:?} has only a software renderer ({})", adapters.iter().map(|a| a.get_info().name).collect::<Vec<_>>().join(", "));
+            software.get_or_insert(instance);
+        }
     }
-    last.unwrap_or_else(|| wgpu::Instance::new(descriptor))
+    software.or(last).unwrap_or_else(|| wgpu::Instance::new(descriptor))
 }
 
 /// The graphics interfaces in the order they are tried: Metal on a Mac; on Windows DirectX
@@ -205,6 +212,16 @@ pub(crate) fn backend_order() -> Vec<wgpu::Backends> {
     first.into_iter().chain(all.into_iter().filter(|b| Some(*b) != first)).collect()
 }
 
+/// A renderer in software on the processor (wgpu calls it a CPU adapter: WARP, llvmpipe,
+/// SwiftShader).
+fn is_software(info: &wgpu::AdapterInfo) -> bool {
+    software_adapter(&info.name, info.device_type)
+}
+
+fn software_adapter(name: &str, device_type: wgpu::DeviceType) -> bool {
+    device_type == wgpu::DeviceType::Cpu || name.contains("Microsoft Basic Render Driver") || name.contains("llvmpipe")
+}
+
 fn backend_instance(b: wgpu::Backends) -> wgpu::Instance {
     let mut d = wgpu::InstanceDescriptor::new_without_display_handle();
     d.backends = b;
@@ -224,41 +241,69 @@ pub(crate) fn window_renderer(
     options: omsi_render::RenderOptions,
 ) -> Result<Renderer> {
     let mut failures: Vec<String> = Vec::new();
-    // the instance made for the settings' interface first, then every interface in turn
-    let mut candidates: Vec<(Option<wgpu::Backends>, wgpu::Instance)> = vec![(None, instance.clone())];
-    for b in backend_order() {
-        candidates.push((Some(b), backend_instance(b)));
-    }
-    for (b, inst) in candidates {
-        let surface = match inst.create_surface(window.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                failures.push(format!("{}: no surface ({e})", b.map(|b| format!("{b:?}")).unwrap_or_else(|| "first choice".into())));
+    // The instance made for the settings' interface first, then every interface in turn -
+    // each made only when the ones before it could not draw. Made all at once, a Windows
+    // machine drawing on DirectX 12 loaded the Vulkan loader and its layers (Optimus,
+    // overlays) and made an OpenGL context for nothing, and when those were dropped right
+    // after the renderer was made, the game and the launcher went down ("[Vulkan Loader]
+    // vkDestroyFramebuffer: Invalid device", #1058, #1044) or hung (#746).
+    // A software renderer (DirectX 12's "Microsoft Basic Render Driver", llvmpipe) only
+    // when no graphics chip opens on any interface: an Intel HD 2500 has no DirectX 12
+    // driver, DirectX 12 listed that renderer alone, and the game "started" on it at a
+    // frame every few seconds instead of on the chip's OpenGL (#770).
+    let mut made: Vec<(Option<wgpu::Backends>, wgpu::Instance)> = vec![(None, instance.clone())];
+    let mut order = backend_order().into_iter();
+    let mut no_surface: Vec<usize> = Vec::new();
+    for software_round in [false, true] {
+        let mut k = 0;
+        loop {
+            if k == made.len() {
+                let Some(b) = order.next() else { break };
+                log::info!("graphics: trying {b:?}");
+                made.push((Some(b), backend_instance(b)));
+            }
+            let (b, inst) = made[k].clone();
+            k += 1;
+            if no_surface.contains(&(k - 1)) {
                 continue;
             }
-        };
-        for adapter in Renderer::adapters_for(&inst, &surface) {
-            let info = adapter.get_info();
-            let what = format!("{} ({:?})", info.name, info.backend);
-            if failures.iter().any(|f| f.starts_with(&what)) {
-                continue;
-            }
-            match omsi_render::catch(|| pollster::block_on(Renderer::new_on(adapter, Some(&surface), None, options))) {
-                Some(Ok(r)) => {
-                    if !failures.is_empty() {
-                        log::warn!("graphics: drawing on {what}; before it {}", failures.join("; "));
+            let surface = match inst.create_surface(window.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    failures.push(format!("{}: no surface ({e})", b.map(|b| format!("{b:?}")).unwrap_or_else(|| "first choice".into())));
+                    no_surface.push(k - 1);
+                    continue;
+                }
+            };
+            for adapter in Renderer::adapters_for(&inst, &surface) {
+                let info = adapter.get_info();
+                if is_software(&info) != software_round {
+                    continue;
+                }
+                let what = format!("{} ({:?})", info.name, info.backend);
+                if failures.iter().any(|f| f.starts_with(&what)) {
+                    continue;
+                }
+                if software_round {
+                    log::warn!("graphics: no graphics chip could be opened; trying the software renderer {what} (a few frames a second at best)");
+                }
+                match omsi_render::catch(|| pollster::block_on(Renderer::new_on(adapter, Some(&surface), None, options))) {
+                    Some(Ok(r)) => {
+                        if !failures.is_empty() {
+                            log::warn!("graphics: drawing on {what}; before it {}", failures.join("; "));
+                        }
+                        drop(surface);
+                        *instance = inst;
+                        return Ok(r);
                     }
-                    drop(surface);
-                    *instance = inst;
-                    return Ok(r);
-                }
-                Some(Err(e)) => {
-                    log::warn!("graphics: {what} could not be opened: {e:#}");
-                    failures.push(format!("{what}: {e:#}"));
-                }
-                None => {
-                    log::warn!("graphics: {what} failed while being opened");
-                    failures.push(format!("{what}: failed while being opened"));
+                    Some(Err(e)) => {
+                        log::warn!("graphics: {what} could not be opened: {e:#}");
+                        failures.push(format!("{what}: {e:#}"));
+                    }
+                    None => {
+                        log::warn!("graphics: {what} failed while being opened");
+                        failures.push(format!("{what}: failed while being opened"));
+                    }
                 }
             }
         }
@@ -406,6 +451,19 @@ mod own_key_tests {
 
 #[cfg(test)]
 mod window_tests {
+    use super::software_adapter;
+
+    /// The software renderers come after every graphics chip (#770).
+    #[test]
+    fn software_renderers_are_told_from_chips() {
+        use wgpu::DeviceType::*;
+        assert!(software_adapter("Microsoft Basic Render Driver", Cpu));
+        assert!(software_adapter("Microsoft Basic Render Driver", Other));
+        assert!(software_adapter("llvmpipe (LLVM 15.0.7, 256 bits)", Cpu));
+        assert!(!software_adapter("Intel(R) HD Graphics 2500", IntegratedGpu));
+        assert!(!software_adapter("NVIDIA GeForce RTX 3050 Laptop GPU", DiscreteGpu));
+    }
+
     #[test]
     fn the_window_fits_a_small_screen_and_sits_in_its_middle() {
         // 1920 x 1200 at 125 %: 1600 x 900 points would be 2000 px wide

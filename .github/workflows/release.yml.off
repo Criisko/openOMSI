@@ -26,8 +26,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # a pull request's test build says which pull request it is: 0.1.1313-pr1192 (the
+      # launcher shows it, and the updater leaves such a build alone)
       - id: v
-        run: echo "version=$(sh scripts/version.sh)" >> "$GITHUB_OUTPUT"
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: echo "version=$(sh scripts/version.sh)${PR:+-pr$PR}" >> "$GITHUB_OUTPUT"
       - run: echo "### openOMSI ${{ steps.v.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
 
   windows:
@@ -101,11 +105,15 @@ jobs:
           # started with --server, and start.cmd
           New-Item -ItemType Directory -Force dist/server | Out-Null
           Copy-Item dist/windows/openomsi.exe, dist/windows/vcruntime140.dll, dist/windows/vcruntime140_1.dll, dist/windows/msvcp140.dll, scripts/server/start.cmd, LICENSE dist/server/
+          # (Steam's library: the x64 program does not start without it beside it)
+          if (Test-Path dist/windows/steam_api64.dll) { Copy-Item dist/windows/steam_api64.dll dist/server/ }
           Copy-Item docs/SERVER.md dist/server/README.md
           New-Item -ItemType File -Force dist/server/.openomsi-content | Out-Null
           Compress-Archive -Path dist/server/* -DestinationPath "out/openOMSI-$env:OPENOMSI_VERSION-server-windows-${{ matrix.arch }}.zip"
       - uses: actions/upload-artifact@v4
         with:
+          # (a release keeps its files; a pull request's test builds are fetched within days)
+          retention-days: 14
           name: windows-${{ matrix.arch }}
           path: out/*.zip
 
@@ -142,6 +150,8 @@ jobs:
           cd dist/macos && ditto -c -k --sequesterRsrc . "../../out/openOMSI-$OPENOMSI_VERSION-macos-${{ matrix.arch }}.zip"
       - uses: actions/upload-artifact@v4
         with:
+          # (a release keeps its files; a pull request's test builds are fetched within days)
+          retention-days: 14
           name: macos-${{ matrix.arch }}
           path: out/*.zip
 
@@ -191,6 +201,8 @@ jobs:
           (cd dist/server && zip -qr "../../out/openOMSI-$OPENOMSI_VERSION-server-linux-${{ matrix.arch }}.zip" .)
       - uses: actions/upload-artifact@v4
         with:
+          # (a release keeps its files; a pull request's test builds are fetched within days)
+          retention-days: 14
           name: linux-${{ matrix.arch }}
           path: out/*.zip
 
@@ -202,6 +214,8 @@ jobs:
       # the signing key (base64 of a keystore, alias openomsi, password android); without
       # it every build is signed with a new key and does not install over the last one
       ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+      # a pull request's APK is an app of its own beside the release (scripts/build-android.sh)
+      OPENOMSI_PR: ${{ github.event.pull_request.number }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -228,6 +242,8 @@ jobs:
           cp "dist/android/openOMSI-$OPENOMSI_VERSION.apk" "out/openOMSI-$OPENOMSI_VERSION-android-arm64.apk"
       - uses: actions/upload-artifact@v4
         with:
+          # (a release keeps its files; a pull request's test builds are fetched within days)
+          retention-days: 14
           name: android
           path: out/*.apk
 

@@ -53,7 +53,7 @@ fn substitute(c: char) -> char {
 /// Letters written as a base and a combining mark (Unicode's decomposed form, which is how
 /// macOS stores file names: "Eiseska\u{308}lte.owt") as the one letter Roboto draws - the
 /// mark alone was a box after a plain "a" in the launcher's weather list.
-fn composed(text: &str) -> std::borrow::Cow<'_, str> {
+pub fn composed(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.chars().any(|c| ('\u{300}'..='\u{36f}').contains(&c)) {
         return std::borrow::Cow::Borrowed(text);
     }

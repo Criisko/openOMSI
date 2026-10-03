@@ -1456,6 +1456,13 @@ pub struct LightStop {
 /// `[approachdist]` (m): about four seconds at town speed.
 pub const DEFAULT_APPROACH: f32 = 50.0;
 
+/// The `TrafficLightPhase` of an object no crossing light drives: a signal without a
+/// `[varparent]`, one whose crossing has no program, any other scripted object. Omsi.exe
+/// binds every placed object's `TrafficLightPhase` and `TrafficLightApproach` to a light
+/// of its parent crossing ("RefreshAmpelParenting", 0x77d460) and, failing that, to a
+/// shared dummy variable in .bss (0x8619a4), which reads 0: red, not "no light".
+pub const UNLINKED_PHASE: i32 = 0;
+
 /// Traffic light program of a crossing object instance (`TAmpelGroup`): its lights'
 /// phases and one cycle clock that runs on game time. The clock is state, not a function
 /// of the time of day, because the program may wait at a stop point or jump.
@@ -2499,8 +2506,22 @@ impl AiState {
                 c.t += ds / c.length;
             }
             let from_len = net.lanes[self.lane].length();
-            let to_len = net.lanes.get(c.to).map(|l| l.length()).unwrap_or(0.0);
-            if c.t >= 1.0 || self.s >= from_len || c.s_to >= to_len {
+            let mut to_len = net.lanes.get(c.to).map(|l| l.length()).unwrap_or(0.0);
+            // A move that is not over where a lane ends carries on across the joint: the
+            // lane beside goes on into the way chosen on it, and this lane into its plan
+            // (below). Finished at the joint instead, the car jumped sideways by what was
+            // left of the move - so a lane change was only started 20 m and more before a
+            // lane's end, and on a road of short spline pieces a car stopped behind a parked
+            // car just past a joint never got round it. (A timetable vehicle's route moves
+            // over well before the end, as before.)
+            let carry_on = self.route.is_empty();
+            while carry_on && c.t < 1.0 && c.s_to >= to_len && !self.change_plan.is_empty() {
+                c.s_to -= to_len;
+                c.to = self.change_plan.remove(0);
+                to_len = net.lanes.get(c.to).map(|l| l.length()).unwrap_or(0.0);
+            }
+            let from_ends = self.s >= from_len && (self.planned_next.is_none() || !carry_on);
+            if c.t >= 1.0 || from_ends || c.s_to >= to_len {
                 // arrived on the new lane: it has no joint behind the car, and the way on
                 // is planned afresh from there
                 if self.route.get(self.route_index + 1) == Some(&c.to) {
@@ -2529,7 +2550,7 @@ impl AiState {
         if self.planned_next.is_none() {
             self.plan_next(net);
         }
-        while self.change.is_none() && self.s >= net.lanes[self.lane].length() {
+        while (self.change.is_none() || self.route.is_empty()) && self.s >= net.lanes[self.lane].length() {
             let l = &net.lanes[self.lane];
             let Some(next) = self.planned_next else {
                 // the end of a flight path: the aircraft flies on straight (the way runs on
@@ -2631,6 +2652,38 @@ mod tests {
         }
         let v = entered.expect("reached the bend");
         assert!(v < 7.5, "entered the bend at {v} m/s");
+    }
+
+    /// A pull-out started a few metres before the car's lane ends (a road of short spline
+    /// pieces) carries on across the joint and ends on the lane beside's next piece, without
+    /// a jump: it used to be finished at the joint, the car moved sideways in one frame.
+    #[test]
+    fn a_lane_change_carries_on_across_a_joint() {
+        let lane = |x: f64, y0: f64, y1: f64| LaneBuilder::polyline(vec![DVec3::new(x, y0, 0.0), DVec3::new(x, y1, 0.0)], LaneKind::Street, 3.0);
+        let mut net = Network { lanes: vec![lane(0.0, 0.0, 20.0), lane(-3.5, 0.0, 20.0), lane(0.0, 20.0, 70.0), lane(-3.5, 20.0, 70.0)], ..Default::default() };
+        net.link(1.5);
+        net.lanes[0].left = Some(1);
+        net.lanes[2].left = Some(3);
+        let mut car = AiState::new(0, 16.0, 7);
+        car.speed = 3.0;
+        car.plan_next(&net);
+        assert_eq!(car.planned_next, Some(2));
+        car.start_bypass(&net, 1, 1);
+        let dt = 1.0 / 30.0;
+        let mut at = car.way_point(&net, 0.0);
+        for _ in 0..300 {
+            assert!(car.drive(&net, dt, None, None));
+            let p = car.way_point(&net, 0.0);
+            let step = (p - at).length();
+            assert!(step < car.speed as f64 * dt as f64 + 0.05, "a jump of {step:.2} m on lane {} s {:.1} change {:?}", car.lane, car.s, car.change);
+            at = p;
+            if car.change.is_none() {
+                break;
+            }
+        }
+        assert!(car.change.is_none(), "the move is over");
+        assert_eq!(car.lane, 3, "on the lane beside's next piece");
+        assert!((at.x + 3.5).abs() < 0.05, "over in the lane beside: {at:?}");
     }
 
     #[test]

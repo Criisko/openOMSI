@@ -42,7 +42,7 @@ pub(crate) fn args_rail(args: &crate::Args) -> bool {
 
 /// Whether the vehicle `def` is bound to rails.
 pub(crate) fn is_rail(def: &omsi_vehicle::Vehicle) -> bool {
-    def.rail_body_osc.is_some() || !def.contact_shoes.is_empty() || def.boogies.is_some()
+    def.is_rail()
 }
 
 /// Put the vehicle on the rail lane nearest it (within `reach` m), facing the way that

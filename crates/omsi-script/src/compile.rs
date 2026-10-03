@@ -66,6 +66,21 @@ impl Program {
     pub fn str_var(&self, name: &str) -> Option<StrVarId> {
         self.str_var_index.get(&name.to_ascii_lowercase()).copied()
     }
+
+    /// The string variable a `[texttexture]`'s first field names: either a script variable's
+    /// name, or - as many vehicles write it, `[texttexture] 0 CN_REG ...` - the *number* of a
+    /// built-in string (`program/stringvarlist_roadvehicle.txt`: 0 `ident`, 1 `number`, ...).
+    /// Omsi.exe reads a number as that index; taking `"0"` for a name finds nothing and leaves
+    /// the text empty, so a plate written this way stays blank. The scenery objects' own
+    /// `[texttexture]` are read the same way (`resolve_scenery_freetex_name`).
+    pub fn text_texture_var(&self, field: &str) -> Option<StrVarId> {
+        let field = field.trim();
+        match field.parse::<usize>() {
+            Ok(idx) => self.str_var_names.get(idx).and_then(|n| self.str_var(n)),
+            Err(_) => self.str_var(field),
+        }
+    }
+
     pub fn name(&self, id: NameId) -> &str {
         &self.names[id as usize]
     }

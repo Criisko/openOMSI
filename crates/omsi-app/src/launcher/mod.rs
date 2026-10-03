@@ -9,6 +9,7 @@
 //! functions `omsi-launcher --cli` offers a terminal.
 
 pub(crate) mod drive;
+pub(crate) mod mapview;
 pub mod mobile;
 pub mod phone;
 mod multiplayer;
@@ -129,6 +130,11 @@ pub struct Launcher {
     preview_rect: Option<Rect>,
     preview_tex: Option<usize>,
     preview_gen: u64,
+    /// The chosen map's picture (see `mapview`): where it is this frame and its texture.
+    pub mapview: mapview::MapView,
+    map_rect: Option<Rect>,
+    map_tex: Option<usize>,
+    map_gen: u64,
     /// The window has the keyboard / is hidden: without focus it is drawn ten times a
     /// second, hidden not at all (a game started from it is being played).
     focused: bool,
@@ -208,6 +214,10 @@ impl Launcher {
         preview_rect: None,
         preview_tex: None,
         preview_gen: 0,
+        mapview: mapview::MapView::new(),
+        map_rect: None,
+        map_tex: None,
+        map_gen: 0,
         focused: true,
         occluded: false,
         awake_in_game: false,
@@ -261,8 +271,9 @@ impl Launcher {
             "sheet-livery" => app.phone.sheet = Some(phone::Sheet::Livery),
             _ => {}
         }
-        if let Some(step) = p.split(':').nth(1).and_then(|s| s.parse().ok()) {
-            app.drive.step = step;
+        if let Some(step) = p.split(':').nth(1).and_then(|s| s.parse::<usize>().ok()) {
+            // (the Drive page's second part is which of its three steps: drive:2 the map)
+            app.drive.tab = step.min(2);
             // (the Controls and Settings pages' second part is their tab: controls:1 the game
             // controllers, settings:3 Sound)
             app.pages.controls_tab = step;
@@ -272,16 +283,30 @@ impl Launcher {
     app
     }
 
-    /// The window, its surface and the renderer, given up for the game (a phone plays in the
-    /// launcher's window).
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    pub fn release_window(&mut self) -> Option<Arc<Window>> {
-        self.pages.pads.cancel_feedback_test();
-        self.surface = None;
+    /// Everything made on the graphics device goes with it: the interface's textures and every
+    /// number kept for one of them - the bus preview, the map picture (and the map's own
+    /// drawing), the servers' icons. A number kept over a device made anew pointed past the
+    /// new device's textures, and the map was drawn with the font atlas instead: the Drive
+    /// page's map full of the interface's words after a game (the launcher gives its device
+    /// up while one runs) or a lost device.
+    fn drop_gpu(&mut self) {
         self.gpu = None;
         self.preview_tex = None;
         self.showroom = showroom::Showroom::new();
         self.preview_gen = 0;
+        self.map_tex = None;
+        self.map_gen = 0;
+        self.mapview.drop_gpu();
+        self.icons.clear();
+    }
+
+    /// The window, its surface and the renderer, given up for the game (a phone plays in the
+    /// launcher's window).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn release_window(&mut self) -> Option<Arc<Window>> {
+        self.pages.pads.release_io();
+        self.surface = None;
+        self.drop_gpu();
         self.renderer = None;
         self.ime = false;
         self.window.take()
@@ -435,8 +460,9 @@ impl ApplicationHandler for Launcher {
                     MouseButton::Left => {
                         if down {
                             self.ui.input.pressed = true;
-                            // a drag on the preview turns the bus
-                            if self.preview_rect.map(|r| r.contains(self.ui.input.mouse)).unwrap_or(false) {
+                            // a drag on the preview turns the bus (the panels lie over it:
+                            // what the mouse is over is theirs, not the bus's)
+                            if !self.ui.over_ui && self.preview_rect.map(|r| r.contains(self.ui.input.mouse)).unwrap_or(false) {
                                 self.dragging = Some(self.ui.input.mouse);
                             }
                         } else {
@@ -613,10 +639,7 @@ impl Launcher {
             self.state.settings_dirty = 0.3;
         }
         self.surface = None;
-        self.gpu = None;
-        self.preview_tex = None;
-        self.showroom = showroom::Showroom::new();
-        self.preview_gen = 0;
+        self.drop_gpu();
         self.renderer = None;
         self.make_surface();
         true
@@ -741,17 +764,16 @@ impl Launcher {
         {
             log::info!("launcher: a game starts or runs, the graphics device is given up until it ends");
             self.surface = None;
-            self.gpu = None;
-            self.preview_tex = None;
-            self.showroom = showroom::Showroom::new();
-            self.preview_gen = 0;
+            self.drop_gpu();
             self.renderer = None;
         }
         if let Some(d) = presence_released.then(|| self.state.queued_launch.take()).flatten() {
             // Finish the Discord handoff in the background before starting the child.
             #[cfg(not(target_os = "android"))]
             drop(self.discord.take());
-            self.pages.pads.cancel_feedback_test();
+            // The Controls page may still own the same DirectInput wheel non-exclusively.
+            // Drop it before the child asks for exclusive foreground access for force feedback.
+            self.pages.pads.release_io();
             self.state.spawn_launch(d);
         }
     }
@@ -785,6 +807,7 @@ impl Launcher {
 
         // --- the interface
         self.preview_rect = None;
+        self.map_rect = None;
         self.ui.begin(size, scale, dt);
         self.draw_ui();
         if mobile::mobile() {
@@ -818,6 +841,22 @@ impl Launcher {
                     match self.preview_tex {
                         Some(id) => gpu.set_view(&renderer.device, id, &view, (w, h)),
                         None => self.preview_tex = Some(gpu.add_view(&renderer.device, &view, (w, h))),
+                    }
+                }
+            }
+        }
+        // the map picture, drawn again when what it shows, where it looks or the zoom's own
+        // thinness changed
+        if self.map_rect.is_some() {
+            if let Some(view) = self.mapview.picture(renderer) {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    if self.map_gen != self.mapview.generation {
+                        self.map_gen = self.mapview.generation;
+                        let size = self.mapview.pixels();
+                        match self.map_tex {
+                            Some(id) => gpu.set_view(&renderer.device, id, &view, size),
+                            None => self.map_tex = Some(gpu.add_view(&renderer.device, &view, size)),
+                        }
                     }
                 }
             }
@@ -905,6 +944,17 @@ impl Launcher {
                     self.release_next = true;
                 }
                 "wheel" => self.ui.input.wheel.y += arg.trim().parse::<f32>().unwrap_or(0.0),
+                // a drag: down at a place, `move` with the button still held, `up` at the end
+                "down" => {
+                    self.ui.input.mouse = xy();
+                    self.ui.input.pressed = true;
+                    self.ui.input.down = true;
+                    self.release_next = false;
+                }
+                "up" => {
+                    self.ui.input.released = true;
+                    self.ui.input.down = false;
+                }
                 "type" => self.ui.input.text.push_str(arg),
                 "key" => {
                     let k = match arg.trim() {
@@ -1082,6 +1132,77 @@ impl Launcher {
         if self.ui.hover(r) {
             self.ui.cursor = winit::window::CursorIcon::Grab;
         }
+    }
+
+    /// The chosen map across `r`, the whole page behind the panels: every road the map has,
+    /// its entry points and the chosen trip's route, read from the tile files (see
+    /// `mapview`), or a word while it is read. `map_interact` gives it the mouse afterwards.
+    pub fn map_background(&mut self, r: Rect) {
+        self.map_rect = Some(r);
+        let status = self.mapview.status();
+        match (self.map_tex, status.is_empty()) {
+            (Some(tex), true) => self.ui.image(r, tex, RADIUS),
+            _ => {
+                self.ui.solid(r);
+                self.ui.p().rounded(r, RADIUS, omsi_ui::Color::rgba(13, 13, 13, 1.0));
+                let t = if status.is_empty() { "Loading…" } else { status };
+                self.ui.text_in(t, Rect::new(r.x, r.y + r.h * 0.5 - 12.0, r.w, 24.0), 13.5, Weight::Regular, TEXT_FAINT, Align::Center);
+            }
+        }
+        if self.mapview.busy() {
+            // (out of the way of the panels: the map is being read, the page is not)
+            let c = Vec2::new(r.right() - 26.0, r.y + r.h - 26.0);
+            let a = self.ui.time * 5.0;
+            self.ui.p().arc(c, 6.0, 8.0, a, a + 4.2, TEXT_SOFT);
+        }
+    }
+
+    /// The mouse over the map: what it drags, where it zooms, and the entry point a click
+    /// takes. Called once the page's panels are drawn - they have the first claim on it.
+    pub fn map_interact(&mut self, r: Rect, window: Rect) {
+        let p = mapview::Pointer {
+            at: self.ui.input.mouse,
+            pressed: self.ui.input.pressed,
+            released: self.ui.input.released,
+            down: self.ui.input.down,
+            wheel: self.ui.input.wheel.y,
+            blocked: self.ui.over_ui || !r.contains(self.ui.input.mouse),
+        };
+        self.mapview.think(r, window, self.ui.scale, p);
+        if let Some(i) = self.mapview.take_clicked() {
+            if self.state.choice.entry != i as i32 {
+                log::info!("launcher map: entry point {} of the map's list taken from the map", i + 1);
+                self.state.choice.entry = i as i32;
+                self.state.touched();
+            }
+        }
+    }
+
+    /// The bus across `r`, the whole page behind the panels. `focus` is where the panels end,
+    /// as a share of the window: the showroom frames the bus in what is left of it.
+    pub fn preview_full(&mut self, r: Rect, focus: f32) {
+        self.preview_rect = Some(r);
+        self.showroom.focus_x = focus.clamp(0.2, 0.95);
+        match (self.preview_tex, self.showroom.has_picture()) {
+            (Some(tex), true) => self.ui.image(r, tex, RADIUS),
+            _ => {
+                self.ui.solid(r);
+                self.ui.p().rounded(r, RADIUS, FIELD);
+                let t = if self.showroom.error.is_some() { "No preview" } else { "Loading…" };
+                self.ui.text_in(t, Rect::new(r.x, r.y + r.h * 0.5 - 12.0, r.w, 24.0), 13.0, Weight::Regular, TEXT_FAINT, Align::Center);
+            }
+        }
+    }
+
+    /// The wheel and the cursor over the showroom, once the panels have had the mouse.
+    pub fn showroom_pointer(&mut self, r: Rect) {
+        if self.ui.over_ui || !r.contains(self.ui.input.mouse) {
+            return;
+        }
+        if self.ui.input.wheel.y.abs() > 0.0 {
+            self.showroom.zoom_by((1.0 - self.ui.input.wheel.y * 0.08).clamp(0.8, 1.25));
+        }
+        self.ui.cursor = winit::window::CursorIcon::Grab;
     }
 
     pub fn go(&mut self, p: Page) {

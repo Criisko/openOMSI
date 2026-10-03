@@ -48,6 +48,8 @@ pub(crate) struct ServerCfg {
     pub vehicles: Vec<String>,
     /// `GET /players` on the web port tells who drives what and where (for a web map).
     pub share_positions: bool,
+    /// The GreenTeaSpeak server and channel the players talk in (`voice`).
+    pub voice: Option<crate::voice::VoiceServer>,
 }
 
 pub(crate) const DEFAULT_CFG: &str = "\
@@ -107,6 +109,16 @@ vehicles =
 # tell anyone who asks the web port (GET /players) the players' names, buses, lines and
 # positions - for a live map of the server on a website; tell your players when it is on
 share_positions = 0
+
+# voice chat: the players hear each other where they stand, through GreenTeaSpeak and its
+# openOMSI plugin (as SaltyChat does for FiveM). voice_server_uid is the voice server's unique
+# id (its info panel; needed: without it there is no voice chat), voice_channel the in-game
+# channel's id or name (empty: no voice chat), voice_range how far a player is heard (m).
+# The channel and its password are sent to every player who joins
+voice_server_uid =
+voice_channel =
+voice_channel_password =
+voice_range = 20
 ";
 
 impl ServerCfg {
@@ -154,6 +166,7 @@ impl ServerCfg {
             metar_station: kv.get("metar_station").map(|v| v.chars().filter(|c| c.is_ascii_alphabetic()).take(4).collect::<String>().to_ascii_uppercase()).unwrap_or_default(),
             vehicles: kv.get("vehicles").map(|v| v.split(';').map(|x| x.trim().replace('\\', "/")).filter(|x| !x.is_empty()).collect()).unwrap_or_default(),
             share_positions: flag("share_positions", false),
+            voice: crate::voice::VoiceServer::from_kv(|k| kv.get(k).cloned()),
         })
     }
 }
@@ -188,6 +201,7 @@ pub(crate) fn prepare(args: &mut Args, path: &Path) -> Result<ServerCfg> {
     let _ = SERVER_ADMIN.set((cfg.admin_password.clone(), if cfg.real_time { 1.0 } else { cfg.time_speed }));
     crate::real_time::set_server_real(cfg.real_time);
     let _ = SERVER_VEHICLES.set(cfg.vehicles.clone());
+    let _ = SERVER_VOICE.set(cfg.voice.clone());
     args.map = cfg.map.clone();
     args.time = cfg.time.clone();
     if let Some(d) = &cfg.date {
@@ -228,6 +242,9 @@ pub(crate) static SERVER_METAR: std::sync::OnceLock<Option<String>> = std::sync:
 
 /// The buses a dedicated server allows (`vehicles`; empty: every bus it has).
 pub(crate) static SERVER_VEHICLES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// A dedicated server's voice server (`voice_*` of `server.cfg`).
+pub(crate) static SERVER_VOICE: std::sync::OnceLock<Option<crate::voice::VoiceServer>> = std::sync::OnceLock::new();
 
 /// A dedicated server's admin password and clock speed (for the host loop).
 pub(crate) static SERVER_ADMIN: std::sync::OnceLock<(String, f64)> = std::sync::OnceLock::new();

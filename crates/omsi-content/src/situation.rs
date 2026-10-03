@@ -164,7 +164,7 @@ impl Situation {
                     let mut vars = Vec::with_capacity(n);
                     for _ in 0..n {
                         let name = r.str().to_string();
-                        let v = r.str().to_string();
+                        let v = r.line().to_string();
                         vars.push((name, v));
                     }
                     if let Some(veh) = s.vehicles.last_mut() {
@@ -181,5 +181,36 @@ impl Situation {
             }
         }
         Ok(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn situation_round_trips_padded_device_strings_and_duty_identity() {
+        let path =
+            std::env::temp_dir().join(format!("omsi_situation_strings_{}.osn", std::process::id()));
+        let sit = Situation {
+            vehicles: vec![SituationVehicle {
+                file: "Vehicles/Test.bus".into(),
+                vars: vec![("power".into(), 1.0)],
+                string_vars: vec![
+                    ("line".into(), " 109  ".into()),
+                    ("blank".into(), "     ".into()),
+                    ("destination".into(), "  Central  ".into()),
+                ],
+                timetable: ["109", "65104", "16", "7", "0", "0"]
+                    .map(String::from)
+                    .to_vec(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        sit.save(&path).unwrap();
+        let loaded = Situation::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(loaded.vehicles, sit.vehicles);
     }
 }

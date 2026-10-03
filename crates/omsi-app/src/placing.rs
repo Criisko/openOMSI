@@ -77,7 +77,7 @@ impl App {
             return;
         };
         let (Some(w), Some(cam), Some(s)) = (self.world.clone(), self.camera.as_ref(), self.surface.as_ref()) else { return };
-        let (o, d) = crate::camera_util::cursor_ray(cam, self.cursor.0, self.cursor.1, s.config.width as f32, s.config.height as f32);
+        let (o, d) = self.world_cursor_ray(cam, (s.config.width, s.config.height));
         let hit = ground_hit(&w, o, d.as_dvec3(), 400.0);
         // in another vehicle (the own bus, the traffic, another placed one)?
         let blocked = hit

@@ -3,6 +3,8 @@ struct SsaoParams {
     inv_proj: mat4x4<f32>,
     // x radius (m), y strength, z width, w height
     params: vec4<f32>,
+    // xy: the projection's off-centre shift (m20, m21), zero for a symmetric frustum
+    shift: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> p: SsaoParams;
 @group(0) @binding(1) var t_depth: texture_depth_2d;
@@ -117,10 +119,11 @@ fn fs_ssao(in: VsOut) -> @location(0) vec4<f32> {
 // pixel position of a view-space point, through the same projection the depth was made with
 fn project(v: vec3<f32>) -> vec2<f32> {
     // inv_proj is the inverse of a perspective matrix: recover the projection's scale terms
-    // from it (m00 = 1/(f/aspect), m11 = 1/f)
+    // from it (m00 = 1/(f/aspect), m11 = 1/f); an off-centre frustum (a headset eye, a
+    // triple screen's side panel) adds its shift: x_ndc = (sx x + m20 z) / -z
     let sx = 1.0 / p.inv_proj[0][0];
     let sy = 1.0 / p.inv_proj[1][1];
-    let ndc = vec2<f32>(v.x * sx, v.y * sy) / (-v.z);
+    let ndc = vec2<f32>(v.x * sx, v.y * sy) / (-v.z) - p.shift.xy;
     return vec2<f32>((ndc.x + 1.0) * 0.5 * p.params.z, (1.0 - ndc.y) * 0.5 * p.params.w);
 }
 

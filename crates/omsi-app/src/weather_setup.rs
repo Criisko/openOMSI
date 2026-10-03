@@ -442,10 +442,16 @@ pub(crate) fn weather_lighting(
     if let Some(custom)=CustomWeather::parse(&w.path.to_string_lossy()){
         let k=custom.brightness;
         lighting.sun_intensity*=k;
-        lighting.secondary*=k;
-        lighting.ambient*=k;
-        lighting.sky_color*=k;
-        lighting.fog_color*=k;
+        // (Enhanced: the automatic exposure takes the picture back up to the eye's level
+        // whatever the weather's brightness, so there it only takes the sun away. The
+        // mirrors, drawn with the plain shading and graded by no exposure, went dark with
+        // the light instead - black at 0 % beside a window still in daylight, #1018.)
+        if !lighting.enhanced {
+            lighting.secondary*=k;
+            lighting.ambient*=k;
+            lighting.sky_color*=k;
+            lighting.fog_color*=k;
+        }
     }
     lighting.wetness = wetness;
     // Omsi.exe hides the sun under an 'ovc' cloud type (the Overcast ones in clouds.cfg) and

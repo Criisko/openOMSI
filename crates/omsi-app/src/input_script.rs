@@ -90,8 +90,8 @@ impl App {
             // R puts the mirror under the cursor back as the bus has it, Shift+R every mirror
             if self.mirror_hud.editing() && code == KeyCode::KeyR {
                 if pressed && !repeat {
-                    let size = self.surface.as_ref().map(|s| (s.config.width as f32, s.config.height as f32)).unwrap_or((1.0, 1.0));
-                    let which = self.mirror_hud.cam_under(self.cursor, size);
+                    let size = self.hud_size();
+                    let which = self.mirror_hud.cam_under(self.hud_cursor(), size);
                     let msg = match self.player.as_mut() {
                         Some(p) if shift => {
                             let n = p.vehicle.ty.def.cameras_reflexion.len();
@@ -123,9 +123,9 @@ impl App {
             }
             if self.mirror_hud.editing() && matches!(code, KeyCode::Insert | KeyCode::Delete | KeyCode::Backspace | KeyCode::KeyC | KeyCode::Escape) {
                 if pressed && !repeat {
-                    let size = self.surface.as_ref().map(|s| (s.config.width as f32, s.config.height as f32)).unwrap_or((1.0, 1.0));
+                    let size = self.hud_size();
                     if let Some(p) = self.player.as_ref() {
-                        if let Some(msg) = self.mirror_hud.key(code, p, self.cursor, size) {
+                        if let Some(msg) = self.mirror_hud.key(code, p, self.hud_cursor(), size) {
                             self.service_msg = Some((msg, 4.0));
                         }
                     }
@@ -205,7 +205,9 @@ impl App {
             }
             // Alt+Enter: full screen on and off
             if pressed && !repeat && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter) && (self.keys.contains(&KeyCode::AltLeft) || self.keys.contains(&KeyCode::AltRight)) {
-                if let Some(win) = self.window.as_ref() {
+                if self.spanned {
+                    log::info!("triple screen: the window spans three monitors, Alt+Enter is left alone");
+                } else if let Some(win) = self.window.as_ref() {
                     win.set_fullscreen(if win.fullscreen().is_some() { None } else { Some(winit::window::Fullscreen::Borderless(None)) });
                 }
                 return;
@@ -568,6 +570,13 @@ impl App {
                     if let Some(a) = fallback_action(code, wasd) {
                         p.axes.set(a, pressed);
                     }
+                } else if !pressed {
+                    // a driving key let go always lets go: released while Shift was held (or
+                    // in the free view) it stayed "pressed", and the wheel went on turning to
+                    // full lock until that key was pressed again (#1040, #1050, #1053)
+                    if let Some(a) = fallback_action(code, wasd) {
+                        p.axes.set(a, false);
+                    }
                 }
             }
             // A driving key held with shift is the vehicle key it covers: Shift+W is
@@ -604,7 +613,11 @@ impl App {
     /// vehicle for each of them.
     pub(crate) fn tick_lan(&mut self, dt: f32) {
         let walker = self.walker_pose();
-        let Some(lan) = self.lan.as_mut() else { return };
+        let Some(lan) = self.lan.as_mut() else {
+            // (the session is over: the plugin is told so)
+            self.voice = None;
+            return;
+        };
         let duty = self
             .duty
             .as_ref()
@@ -641,6 +654,7 @@ impl App {
         for (from, text) in cmds {
             self.lan_command(from, &text);
         }
+        self.tick_voice(dt);
     }
 
     /// A command another player's game sent ours (`LanSession::command`).
@@ -660,7 +674,63 @@ impl App {
             }
             return;
         }
+        // the voice server of the session (`voice`): asked of the host, told by it
+        if text == "voice?" {
+            if lan.role == omsi_net::Role::Host {
+                let answer = crate::voice::VoiceServer::command(crate::voice::hosted().as_ref());
+                if let Some(l) = self.lan.as_mut() {
+                    l.command(from, &answer);
+                }
+            }
+            return;
+        }
+        if text.starts_with("voice ") {
+            if from == 1 {
+                if let (Some(v), Some(server)) = (self.voice.as_mut(), crate::voice::VoiceServer::parse_command(text)) {
+                    v.set_server(server);
+                }
+            }
+            return;
+        }
         crate::admin::command(self, from, text);
+    }
+
+    /// The voice chat (`voice`), once a frame of a session: started with it when the
+    /// settings allow, the host's voice server asked for, the plugin told who is where.
+    fn tick_voice(&mut self, dt: f32) {
+        let Some(lan) = self.lan.as_mut() else {
+            self.voice = None;
+            return;
+        };
+        // (a dedicated server has nobody to talk at its place; a joining game that lost
+        // its host is in no session to talk in)
+        if !self.settings.voice_chat || self.args.server.is_some() || !lan.connected {
+            self.voice = None;
+            return;
+        }
+        let v = self.voice.get_or_insert_with(|| crate::voice::Voice::new(crate::voice::DEFAULT_PORT));
+        match lan.role {
+            omsi_net::Role::Host => {
+                // (once: hosted() reads voice.cfg)
+                if !v.known() {
+                    v.set_server(crate::voice::hosted());
+                }
+            }
+            omsi_net::Role::Client => {
+                if lan.connected && v.should_ask(dt) {
+                    lan.command(1, "voice?");
+                }
+            }
+        }
+        let lan = self.lan.as_ref().unwrap();
+        let my_bus = self.player.as_ref().map(|p| p.vehicle.position);
+        let others = crate::voice::speakers(lan, &self.remotes, my_bus);
+        let inside = if self.in_cab { Some(lan.my_id) } else { self.inside_remote };
+        let listener = self.camera.as_ref().map(|c| crate::voice::Listener { at: c.position, yaw: c.yaw, inside });
+        let me = (lan.my_name.clone(), lan.my_id);
+        if let Some(v) = self.voice.as_mut() {
+            v.tick(dt, (&me.0, me.1), listener, &others);
+        }
     }
 
     /// The host's world as LAN play asks for it: its clock (set or caught up with) and its
@@ -894,8 +964,9 @@ impl App {
         // a mirror panel being dragged follows the cursor (nothing else of the cursor's
         // work is done meanwhile, and outside a drag none of it is touched)
         if self.mirror_hud.dragging() {
-            if let Some(size) = self.surface.as_ref().map(|s| (s.config.width as f32, s.config.height as f32)) {
-                if self.mirror_hud.moved((x, y), size) {
+            if let Some(size) = self.surface.as_ref().map(|_| self.hud_size()) {
+                let origin_x = self.cursor.0 - self.hud_cursor().0;
+                if self.mirror_hud.moved((x - origin_x, y), size) {
                     self.cursor = (x, y);
                     return;
                 }
@@ -1051,6 +1122,22 @@ impl App {
             }
             return false;
         }
+        if self.pane_scroll_drag.is_some() {
+            if self.chooser.is_none() || self.game_menu.is_none() {
+                self.pane_scroll_drag = None;
+            } else {
+                self.drag_pane(y);
+                return false;
+            }
+        }
+        if self.dd_scroll_drag.is_some() {
+            if self.dropdown.is_none() || self.game_menu.is_none() {
+                self.dd_scroll_drag = None;
+            } else {
+                self.drag_dropdown(y);
+                return false;
+            }
+        }
         if self.menu_scroll_drag {
             let Some(ui) = self.ui.as_ref() else {
                 self.menu_scroll_drag = false;
@@ -1166,6 +1253,25 @@ impl App {
                     None => {}
                 }
             }
+        }
+        // the map camera (F4): Ctrl+click on the ground puts the bus on the street nearest
+        // that point, as Ctrl+click on the city map does - OMSI's map view moves the vehicle
+        // to a place clicked as well (#1039). A rail vehicle stays on its track.
+        let ctrl = self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight);
+        if pressed && ctrl && self.view == "free" && self.game_menu.is_none() && self.player.is_some() {
+            if self.player.as_ref().is_some_and(|p| crate::rail_drive::is_rail(&p.vehicle.ty.def)) {
+                self.service_msg = Some(("A rail vehicle cannot be moved off its track".into(), 3.0));
+                return;
+            }
+            let hit = self
+                .cursor_ray_now()
+                .zip(self.world.clone())
+                .and_then(|((o, d, _), w)| crate::placing::ground_hit(&w, o, d.as_dvec3(), 2000.0));
+            match hit {
+                Some(at) => self.place_bus_at(at.truncate()),
+                None => self.service_msg = Some(("Ctrl+click on the ground to move the bus there".into(), 3.0)),
+            }
+            return;
         }
         // a click on the chat opens its input box (and is the chat's, not the cockpit's)
         if pressed && self.lan.is_some() && self.settings.chat {
@@ -1427,17 +1533,27 @@ impl App {
                     }
                     log::info!("input script: wheel {n}: menu line {:?}, chooser {:?}, placing heading {:?}", self.game_menu, self.chooser, self.placing.as_ref().map(|p| p.heading));
                 }
-                // `click`: a left click where the cursor is, through the window's own path
+                // `click`: a left click where the cursor is, through the window's own path;
+                // `click down` / `click up` only press or let go (a drag in between)
                 "click" => {
+                    let (press, release) = (arg != "up", arg != "down");
                     if self.placing.is_some() && self.game_menu.is_none() {
                         self.placing_click();
                     } else if self.game_menu.is_some() {
                         // (on the menu as the window's button: its lines, its arrows)
-                        self.left_button(event_loop, true);
-                        self.left_button(event_loop, false);
+                        if press {
+                            self.left_button(event_loop, true);
+                        }
+                        if release {
+                            self.left_button(event_loop, false);
+                        }
                     } else {
-                        self.on_left(true);
-                        self.on_left(false);
+                        if press {
+                            self.on_left(true);
+                        }
+                        if release {
+                            self.on_left(false);
+                        }
                     }
                     log::info!("input script: click: placing {:?}, placed at {:?}", self.placing.as_ref().map(|p| (p.at, p.blocked)), self.placed.last().map(|q| (q.vehicle.position, q.vehicle.heading)));
                 }
@@ -1473,6 +1589,18 @@ impl App {
                 "turn" => {
                     let (dx, dy) = xy();
                     self.look_by(dx, dy);
+                }
+                // `focus 0|1`, `minimize`, `restore`: the window losing and getting back the
+                // keyboard and the mouse, as the window's own events do it
+                "focus" if arg == "0" => self.input_lost(),
+                "focus" => self.input_back(),
+                "minimize" => {
+                    self.window_hidden = true;
+                    self.input_lost();
+                }
+                "restore" => {
+                    self.window_hidden = false;
+                    self.input_back();
                 }
                 "key" | "keydown" | "keyup" => {
                     let Some(code) = Self::script_key(arg) else {
@@ -1584,6 +1712,10 @@ impl App {
     /// for the other players).
     pub(crate) fn open_game_menu(&mut self) {
         self.menu_prev_pause = self.paused;
+        // the menu takes the keys, their key-ups too: what is held now is let go here, or a
+        // steering key let go in the menu went on turning the wheel to full lock once the
+        // menu closed (a throttle key went on accelerating, a door button stayed pressed)
+        self.release_vehicle_keys();
         if self.lan.is_none() {
             self.paused = true;
         }
@@ -1591,6 +1723,56 @@ impl App {
         self.menu_top = None;
         self.menu_kbd = true;
         self.menu_drag = None;
+    }
+
+    /// Let go of every key the vehicle holds: the keyboard's driving keys and pedals, the
+    /// vehicle keys of `Inputs/keyboard.cfg` (their `<trigger>_off` fires) and the
+    /// Shift+number door buttons.
+    pub(crate) fn release_vehicle_keys(&mut self) {
+        if let Some(p) = self.player.as_mut() {
+            let held: Vec<_> = p.held_keys.keys().copied().collect();
+            for scan in held {
+                p.key(scan, 0, false);
+            }
+            p.axes.release_all();
+            for fired in self.door_key_triggers.drain().map(|(_, g)| g).collect::<Vec<_>>() {
+                p.door_key_off(&fired);
+            }
+        }
+        self.door_key_triggers.clear();
+    }
+
+    /// The window lost the keyboard and the mouse (focus gone to another window, minimised,
+    /// hidden, a phone sending the app to the background): no key-up or button-up comes for
+    /// what is held now, so all of it is let go here - the vehicle's keys, a switch held
+    /// with the mouse, looking round, the mouse's zoom - and the mouse steering holds the
+    /// wheel and the brake where they are with its throttle off. Until the window has the
+    /// focus again the mouse and the keyboard work nothing (see `input_away`). A game
+    /// controller's axes stay theirs.
+    pub(crate) fn input_lost(&mut self) {
+        self.input_away = true;
+        self.release_vehicle_keys();
+        self.keys.clear();
+        if let Some(p) = self.player.as_mut() {
+            p.release();
+        }
+        self.dragging = false;
+        self.buttons_held = (false, false);
+        self.both_drag = None;
+        self.mouse_look = false;
+        self.steer_cursor = None;
+        self.mouse_pedals.0 = 0.0;
+    }
+
+    /// The window has the focus again: the mouse steering eases from where the wheel stands
+    /// to the cursor (as when it is switched on) instead of jumping there. A key still held
+    /// from before counts only once it is pressed again.
+    pub(crate) fn input_back(&mut self) {
+        if !self.input_away {
+            return;
+        }
+        self.input_away = false;
+        self.mouse_steer = (self.player.as_ref().map(|p| p.vehicle.physics.controls.steering).unwrap_or(0.0), 1.0);
     }
 
     pub(crate) fn close_game_menu(&mut self) {
@@ -2436,7 +2618,7 @@ impl App {
             return true;
         }
         let (Some(cam), Some(s), Some(world)) = (self.camera.as_ref(), self.surface.as_ref(), self.world.clone()) else { return true };
-        let (o, d) = cursor_ray(cam, self.cursor.0, self.cursor.1, s.config.width as f32, s.config.height as f32);
+        let (o, d) = self.world_cursor_ray(cam, (s.config.width, s.config.height));
         let ed = self.editor.as_mut().unwrap();
         // (the copy being edited stays the one dragged while it is under the cursor)
         let on_added = ed.editing_added.and_then(|k| ed.added.get(k)).map(|a| {
@@ -2459,7 +2641,7 @@ impl App {
             return;
         }
         let (Some(cam), Some(s), Some(world)) = (self.camera.as_ref(), self.surface.as_ref(), self.world.clone()) else { return };
-        let (o, d) = cursor_ray(cam, self.cursor.0, self.cursor.1, s.config.width as f32, s.config.height as f32);
+        let (o, d) = self.world_cursor_ray(cam, (s.config.width, s.config.height));
         let Some(hit) = crate::placing::ground_hit(&world, o, d.as_dvec3(), 400.0) else { return };
         let (Some(r), Some(scene), Some(ed)) = (self.renderer.as_ref(), self.scene.as_mut(), self.editor.as_mut()) else { return };
         if let Some(m) = ed.drag_to(&world, r, scene, hit) {
@@ -2503,6 +2685,24 @@ impl App {
             KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => self.menu_choose(event_loop, sel),
             _ => {}
         }
+    }
+
+    /// The open drop-down's scroll bar held with the mouse at height `y`: the first entry
+    /// shown follows the thumb.
+    pub(crate) fn drag_dropdown(&mut self, y: f32) {
+        let (Some(grab), Some(ui)) = (self.dd_scroll_drag, self.ui.as_ref()) else { return };
+        let Some((track, thumb)) = ui.dd_scroll else { return };
+        let rows = ui.dd_rows.max(1);
+        let Some(d) = self.dropdown.as_mut() else { return };
+        d.top = dropdown_top_at(y - grab, track, thumb[3] - thumb[1], d.items.len(), rows);
+    }
+
+    /// The scroll bar of the timetable beside the tours held with the mouse at height `y`:
+    /// the first stop shown follows the thumb.
+    pub(crate) fn drag_pane(&mut self, y: f32) {
+        let (Some(grab), Some(k)) = (self.pane_scroll_drag, self.chooser) else { return };
+        let Some((track, thumb, n, fit)) = self.ui.as_ref().and_then(|u| u.menu_pane_scroll) else { return };
+        self.pane_scroll = Some((k, dropdown_top_at(y - grab, track, thumb[3] - thumb[1], n, fit)));
     }
 
     /// The mouse wheel over the game menu: the chosen line moves (the menu scrolls with it),
@@ -3088,6 +3288,10 @@ impl App {
         let Ok(exe) = std::env::current_exe() else { return false };
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("--root").arg(&self.args.root).arg("--no-menu").arg("--situation").arg(&file);
+        // (the duty typed by itself goes on being typed: `--autostart` with a situation)
+        if self.player.as_ref().is_some_and(|p| p.duty_typed) {
+            cmd.arg("--autostart");
+        }
         match cmd.spawn() {
             Ok(_) => {
                 log::info!("loading {} in a new game", file.display());
@@ -3499,6 +3703,10 @@ impl App {
         let Ok(exe) = std::env::current_exe() else { return false };
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("--root").arg(&self.args.root).arg("--no-menu").arg("--situation").arg(&file);
+        // (the duty typed by itself goes on being typed: `--autostart` with a situation)
+        if self.player.as_ref().is_some_and(|p| p.duty_typed) {
+            cmd.arg("--autostart");
+        }
         cmd.env("OMSI_SAFE_GPU", (n + 1).to_string());
         // (on Windows the other interface: DirectX 12 after Vulkan, Vulkan after DirectX 12 -
         // an AMD Radeon's DX12 driver lost the device where its Vulkan one did not, #274)
@@ -3610,13 +3818,70 @@ impl App {
         }
     }
 
+    pub(crate) fn hud_size(&self) -> (f32, f32) {
+        let v = self
+            .surface
+            .as_ref()
+            .map(|s| {
+                self.settings
+                    .hud_viewport((s.config.width, s.config.height))
+            })
+            .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+        (v[2], v[3])
+    }
+
+    pub(crate) fn hud_cursor(&self) -> (f32, f32) {
+        let x = self
+            .surface
+            .as_ref()
+            .map(|s| {
+                self.settings
+                    .hud_viewport((s.config.width, s.config.height))[0]
+            })
+            .unwrap_or(0.0);
+        (self.cursor.0 - x, self.cursor.1)
+    }
+
     pub(crate) fn cockpit_cursor_ray(&self, cam: &Camera, size: (u32, u32)) -> (glam::DVec3, glam::Vec3, f32) {
         #[cfg(windows)]
         if let Some(ray) = self.vr.as_ref().and_then(|vr| vr.cursor_ray(self.cursor.0, self.cursor.1, size)) {
             return (ray.0, ray.1, ray.2 * 6.0);
         }
+        if let Some(rig) = self.triple_rig(size) {
+            let (o, d, spread) = rig.cursor_ray(cam, self.cursor, size);
+            return (o, d, spread * 6.0);
+        }
         let (o, d) = cursor_ray(cam, self.cursor.0, self.cursor.1, size.0 as f32, size.1 as f32);
         (o, d, pixel_angle(cam, size.1 as f32) * 6.0)
+    }
+
+    /// The triple screen's rig as drawn this frame (the view's zoom applied), while it is on
+    /// and no headset is asked for.
+    pub(crate) fn triple_rig(&self, size: (u32, u32)) -> Option<omsi_render::TripleScreen> {
+        (self.settings.triple.enabled && !self.settings.vr_requested()).then(|| {
+            self.settings.triple.zoomed(size.0, size.1, self.view_zoom.get(&self.view).copied().unwrap_or(1.0))
+        })
+    }
+
+    /// The desktop ray under the cursor for placing and editing on the ground: the window's
+    /// own projection, or the triple screen panel's under the cursor.
+    pub(crate) fn world_cursor_ray(&self, cam: &Camera, size: (u32, u32)) -> (glam::DVec3, glam::Vec3) {
+        match self.triple_rig(size) {
+            Some(rig) => {
+                let (o, d, _) = rig.cursor_ray(cam, self.cursor, size);
+                (o, d)
+            }
+            None => cursor_ray(cam, self.cursor.0, self.cursor.1, size.0 as f32, size.1 as f32),
+        }
+    }
+
+    /// With a triple screen, the frustum around all three panels for "nothing appears or
+    /// vanishes in sight": tangents of its half-angles, horizontal and vertical (None: the
+    /// window's own view is the whole picture).
+    pub(crate) fn sight_extent(&self, cam: &Camera, size: (u32, u32)) -> Option<(f64, f64)> {
+        let rig = self.triple_rig(size)?;
+        let (tx, ty) = rig.view_extent(cam, size.0, size.1);
+        Some((tx as f64, ty as f64))
     }
 
     pub(crate) fn update_hover(&mut self) {
@@ -3720,7 +3985,7 @@ impl App {
     /// a page, a control, the scroll bar), the closed hand while a slider or the scroll bar
     /// is held.
     pub(crate) fn menu_cursor_kind(&self) -> u8 {
-        if self.menu_drag.is_some() || self.menu_scroll_drag {
+        if self.menu_drag.is_some() || self.menu_scroll_drag || self.dd_scroll_drag.is_some() || self.pane_scroll_drag.is_some() {
             return 4;
         }
         let Some(u) = self.ui.as_ref() else { return 0 };
@@ -4228,5 +4493,32 @@ mod cab_look_tests {
         assert!((cab_look_yaw("pax", 170.0 + 20.0) + 170.0).abs() < 1e-3);
         assert_eq!(cab_look_yaw("driver", 200.0), 140.0);
         assert_eq!(cab_look_yaw("driver", -200.0), -140.0);
+    }
+}
+
+/// The first entry a drop-down (or the tours' timetable) of `n` entries showing `rows`
+/// shows with its thumb (`len` high) at the top `thumb_top` in `track`.
+pub(crate) fn dropdown_top_at(thumb_top: f32, track: [f32; 4], len: f32, n: usize, rows: usize) -> usize {
+    let max = n.saturating_sub(rows);
+    let travel = (track[3] - track[1] - len).max(1.0);
+    let f = ((thumb_top - track[1]) / travel).clamp(0.0, 1.0);
+    ((f * max as f32).round() as usize).min(max)
+}
+
+#[cfg(test)]
+mod dropdown_tests {
+    /// A drop-down's thumb dragged down its track scrolls the list to its end (#794).
+    #[test]
+    fn a_dropdowns_thumb_dragged_scrolls_it() {
+        // 40 entries, 8 shown, a 300 px track with a 60 px thumb
+        let track = [0.0, 100.0, 4.0, 400.0];
+        assert_eq!(super::dropdown_top_at(100.0, track, 60.0, 40, 8), 0);
+        assert_eq!(super::dropdown_top_at(340.0, track, 60.0, 40, 8), 32);
+        assert_eq!(super::dropdown_top_at(220.0, track, 60.0, 40, 8), 16);
+        // past the ends it stays at them
+        assert_eq!(super::dropdown_top_at(-50.0, track, 60.0, 40, 8), 0);
+        assert_eq!(super::dropdown_top_at(900.0, track, 60.0, 40, 8), 32);
+        // a list that fits never scrolls
+        assert_eq!(super::dropdown_top_at(300.0, track, 60.0, 5, 8), 0);
     }
 }

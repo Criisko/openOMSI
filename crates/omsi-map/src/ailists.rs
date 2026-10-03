@@ -64,6 +64,12 @@ impl DepotEntry {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AiLists {
     pub groups: Vec<AiGroup>,
+    /// The default group (index into `groups`): the `[ailist]` header's second number, the
+    /// "NotInGroup" group it makes for -1, else the first group (Omsi.exe 0x78093c sets 0,
+    /// 0x780a58 reads the header). A map without `unsched_vehgroups.txt` takes its random
+    /// traffic from this group alone (0x785f98: the one group it makes then has no name,
+    /// and a nameless group is the default group).
+    pub default_group: usize,
 }
 
 impl AiLists {
@@ -155,8 +161,11 @@ impl AiLists {
                     .map(|file| AiVehicleEntry { file, weight: 1.0, number: None, registration: None })
                     .collect();
                 if !vehicles.is_empty() {
+                    a.default_group = a.groups.len();
                     a.groups.push(AiGroup { name: "NotInGroup".into(), vehicles, ..Default::default() });
                 }
+            } else {
+                a.default_group = default as usize;
             }
         }
         a
@@ -463,6 +472,17 @@ mod legacy_tests {
         assert_eq!(a.groups.len(), 1);
         assert_eq!(a.groups[0].name, "NotInGroup");
         assert_eq!(a.groups[0].vehicles.len(), 2);
+        assert_eq!(a.default_group, 0);
+    }
+
+    #[test]
+    fn the_default_group_is_the_first_unless_the_header_names_one() {
+        let groups = "[aigroup_2]\nNormalCars\n\nvehicles\\A\\a.bus\t7\n[end]\n[aigroup_2]\nAmbulance\n\nvehicles\\B\\b.ovh\n[end]\n";
+        let a = super::AiLists::parse(&omsi_cfg::CfgFile::from_str("ailists.cfg", groups));
+        assert_eq!(a.default_group, 0);
+        let named = format!("[ailist]\n0\n1\n0\n{groups}");
+        let a = super::AiLists::parse(&omsi_cfg::CfgFile::from_str("ailists.cfg", &named));
+        assert_eq!(a.groups[a.default_group].name, "Ambulance");
     }
 }
 

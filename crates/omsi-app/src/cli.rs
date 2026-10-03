@@ -45,7 +45,9 @@ pub(crate) struct Args {
     /// View: driver, pax, outside, or free; mirror<n> shows what mirror n's camera sees (a check).
     #[arg(long, default_value = "driver")]
     pub(crate) view: String,
-    /// Put the bus into service at the start of the run (the Shift+U auto-start).
+    /// Put the bus into service at the start of the run (the Shift+U auto-start). With
+    /// `--situation` the bus is not started up again (it keeps its saved state and IBIS);
+    /// the flag then only has the duty's next trips typed into the IBIS as they come.
     #[arg(long)]
     pub(crate) autostart: bool,
     /// Start as a pedestrian where the bus would stand (the bus left out): one is placed
@@ -180,6 +182,9 @@ pub(crate) struct Args {
     pub(crate) situation_vars: Vec<(String, f32)>,
     #[arg(skip)]
     pub(crate) situation_strvars: Vec<(String, String)>,
+    /// Saved ordinal in the current timetable trip; absent in older situations.
+    #[arg(skip)]
+    pub(crate) situation_next_stop: Option<usize>,
     /// The situation's further vehicles (besides the one driven): each stands where it was
     /// saved with its variables.
     #[arg(skip)]
@@ -276,6 +281,14 @@ pub(crate) fn parse_triggers(args: &Args) -> Vec<(String, f32)> {
             None => (s.trim().to_string(), 0.0),
         })
         .collect()
+}
+
+impl Args {
+    pub(crate) fn is_resuming(&self) -> bool {
+        self.situation.is_some()
+            || !self.situation_vars.is_empty()
+            || !self.situation_strvars.is_empty()
+    }
 }
 
 /// A vehicle of a situation that is not the one driven.

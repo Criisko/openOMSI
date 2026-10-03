@@ -223,8 +223,10 @@ impl Single {
 /// The spellings a file name may have picked up between its author's machine and this
 /// one: `name` turned back into bytes in a code page it may have been read in wrongly
 /// (the zip OEM pages 437 and 852, Windows 1252 and 1250) and read again in the one it
-/// may have been written in (CP866, the Russian OEM page zip tools use, and Windows 1251,
-/// 1250, 1252). ASCII names have no other spelling; `name` itself is not in the list.
+/// may have been written in (CP866, the Russian OEM page zip tools use, Windows 1251, 1250,
+/// 1252, and the double-byte pages of a Korean, Chinese or Japanese system, where Omsi.exe
+/// reads an .o3d's texture names in that page). ASCII names have no other spelling; `name`
+/// itself is not in the list.
 pub fn name_variants(name: &str) -> Vec<String> {
     if name.is_ascii() {
         return Vec::new();
@@ -242,13 +244,18 @@ pub fn name_variants(name: &str) -> Vec<String> {
         Single::Enc(encoding_rs::WINDOWS_1250),
         Single::Enc(encoding_rs::WINDOWS_1252),
         Single::Table(&CP437_HIGH),
+        Single::Enc(encoding_rs::EUC_KR),
+        Single::Enc(encoding_rs::GBK),
+        Single::Enc(encoding_rs::BIG5),
+        Single::Enc(encoding_rs::SHIFT_JIS),
     ];
     let mut out: Vec<String> = Vec::new();
     for wrong in read_as {
         let Some(bytes) = wrong.encode(name) else { continue };
         for right in written_in {
             let v = right.decode(&bytes);
-            if v != name && !out.contains(&v) {
+            // bytes that are no text in a double-byte page are no name written in it
+            if v != name && !v.contains('\u{fffd}') && !out.contains(&v) {
                 out.push(v);
             }
         }
@@ -336,6 +343,11 @@ mod tests {
         // a 1251 name that was read as 1252
         assert!(name_variants("âåðõ.png").contains(&"верх.png".to_string()));
         assert!(name_variants("plain.png").is_empty());
+        // a CP949 (Korean) name in an .o3d, read as 1252 (#990)
+        let kr = encoding_rs::EUC_KR.encode("중앙분리봉.bmp").0.into_owned();
+        let misread = encoding_rs::WINDOWS_1252.decode_without_bom_handling(&kr).0.into_owned();
+        assert_eq!(misread, "Áß¾ÓºÐ¸®ºÀ.bmp");
+        assert!(name_variants(&misread).contains(&"중앙분리봉.bmp".to_string()));
     }
 
     #[test]

@@ -2305,6 +2305,14 @@ impl LanSession {
         self.timed_out = true;
     }
 
+    /// Say hello once more at once (the way to the host was made again: a new connection
+    /// is a new address to it, which it only learns from a hello). Clients only.
+    pub fn rehello(&mut self) {
+        if self.role == Role::Client {
+            self.confirm = true;
+        }
+    }
+
     /// Try the host again at once (a client that was turned away, timed out or sent away):
     /// the game takes the host's world again when the welcome comes. False for a host.
     pub fn reconnect(&mut self) -> bool {

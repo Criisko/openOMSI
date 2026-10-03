@@ -237,17 +237,6 @@ fn ao_at(frag: vec2<f32>, world: vec3<f32>) -> f32 {
 @group(0) @binding(18) var t_lmap: texture_2d<f32>;
 @group(0) @binding(19) var<uniform> lmap: vec4<f32>;
 
-// The sRGB curve both ways (the textures are sampled through it, the target writes through
-// it): the classic picture multiplies on the encoded values, as Omsi.exe does.
-fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
-    let x = max(c, vec3<f32>(0.0));
-    return select(1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055, x * 12.92, x <= vec3<f32>(0.0031308));
-}
-fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
-    let x = max(c, vec3<f32>(0.0));
-    return select(pow((x + 0.055) / 1.055, vec3<f32>(2.4)), x / 12.92, x <= vec3<f32>(0.04045));
-}
-
 // The tile light map's light at a world point (black outside the loaded square).
 fn light_map_at(p: vec3<f32>) -> vec3<f32> {
     if (lmap.w < 0.5) {
@@ -639,6 +628,11 @@ fn fs_shadow(in: FsIn) {
 // AO still leave glass transparent. Reject absent/fully faded layers and texture holes.
 @fragment
 fn fs_puddle_glass_depth(in: FsIn) {
+    // From the cabin we see the street through our own pane. Treating that pane as
+    // an SSR hit terminates every ray at the window instead of the outside vehicle.
+    if (inside_vehicle(camera.cam_pos.xyz) * near_player_vehicle(in.world) > 0.5) {
+        discard;
+    }
     var a = diffuse_border(textureSample(t_diffuse, s_diffuse, tex_address(in.uv)), in.uv).a;
     if (material.params.z > 0.5) {
         let tm = sample_transmap(tex_address(in.uv - in.params.zw));
@@ -1368,11 +1362,11 @@ fn rain_through(g: RainGlass, v: vec3<f32>) -> vec3<f32> {
 }
 
 // What the eye sees along `through` (the way out of a drop, `rain_through`) from the drop
-// at `world`: the street behind the glass as the last frame drew it, looked up where that
+// at `world`: the clean current street behind the glass, looked up where that
 // way meets it a few metres on - through a drop's rim the way bends far round, so the
 // drop holds the whole street small and upside down, the sky at its bottom, as a real
 // one does. The rain film's reflection slot holds that picture (see `Renderer::glass_slot`);
-// without it (a mirror's view, the first frame of the rain) or off the picture's edge,
+// without it (a mirror's view) or off the picture's edge,
 // `fallback` (the sky's colours). `scale` takes the picture into the caller's units.
 fn rain_behind(world: vec3<f32>, through: vec3<f32>, fallback: vec3<f32>, scale: f32) -> vec3<f32> {
     if (camera.flags.z > -0.5 || dot(through, through) < 1e-4) {
@@ -1424,11 +1418,37 @@ fn rain_env_vanilla(d: vec3<f32>) -> vec3<f32> {
     let horizon = max(camera.fog.rgb, camera.ambient.rgb);
     let ground = camera.ambient.rgb * 0.4 + camera.sun_color.rgb * camera.sun_dir.w * 0.06;
     let sky = mix(horizon, zenith, smoothstep(0.0, 0.5, d.z));
-    return mix(ground, sky, smoothstep(-0.06, 0.04, d.z));
+    let c = mix(ground, sky, smoothstep(-0.06, 0.04, d.z));
+    return select(c, srgb_decode(c), camera.sky_color.w > 0.5);
 }
 
 @fragment
 fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
+    var unused = 0.0;
+    return shade_vanilla(in, &unused, camera.cam_pos.xyz);
+}
+
+// Shared with Enhanced and the wheel splash mask: pools spread as the road soaks.
+fn road_puddle_coverage(world: vec3<f32>, normal: vec3<f32>, wet: f32) -> f32 {
+    let xy = world_pattern_xy(world);
+    let pn = vnoise_f(xy, 0.22, vec2<f32>(17.3, -9.1)) * 0.65
+        + vnoise_f(xy, 0.9, vec2<f32>(-4.0, 8.0)) * 0.35;
+    // The pools spread from the lowest spots as the road soaks, but they stay pools: a road
+    // wet through has standing water on about a third of it (PUDDLE_SPREAD in enhanced.wgsl,
+    // the same in `omsi-app/src/puddles.rs`) and wet asphalt between.
+    let threshold = 1.0 - wet * PUDDLE_SPREAD;
+    return smoothstep(threshold - 0.06, threshold + 0.06, pn) * smoothstep(0.75, 0.95, normal.z);
+}
+
+@fragment
+fn fs_vanilla_reflections(in: FsIn) -> EnhancedOut {
+    var weight = 0.0;
+    let c = shade_vanilla(in, &weight, camera.cam_pos.xyz);
+    let coverage = select(c.a, 0.0, in.params2.w > 1.5);
+    return EnhancedOut(c, vec4<f32>(0.0, weight * 0.49, weight, coverage));
+}
+
+fn shade_vanilla(in: FsIn, puddle_weight: ptr<function, f32>, eye: vec3<f32>) -> vec4<f32> {
     if (material.emissive.w > 1.5) {
         // a pane's film of water: drops, not the sliding texture
         let v = normalize(camera.cam_pos.xyz - in.world);
@@ -1612,7 +1632,7 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
     }
     if (material.params2.y > 0.0) {
         // [matl_envmap]: sphere map reflection, masked by the diffuse alpha like the original
-        let vdir = normalize(in.world - camera.cam_pos.xyz);
+        let vdir = normalize(in.world - eye);
         let r = reflect(vdir, n);
         // (the headset: laid out by the bus's heading, level, not by each eye's view)
         let vr_env = camera.cam_up.w > 0.5;
@@ -1666,29 +1686,35 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
         } else {
             kk = omsi_texture_factor(material.params2.y, camera.ambient.rgb + vec3<f32>(g));
         }
-        // In the vanilla picture the lerp is made on the encoded values, as the stage makes
-        // it, like the texture x light product above: made on linear ones it showed the
-        // reflection about twice as bright over a dark surface - since the nights got dark
-        // (#300) the instrument glass of the MAN NL/NG (Fenster.tga, factor 0.5, the sky
-        // at the sphere map's bottom) lay milky white over the unlit gauges.
-        if (classic) {
-            lit = srgb_decode(mix(srgb_encode(lit), srgb_encode(env.rgb), kk));
-        } else {
-            lit = mix(lit, env.rgb, kk);
-        }
+        // The lerp is made on the encoded values, as the stage makes it, like the texture x
+        // light product above: made on linear ones it showed the reflection about twice as
+        // bright over a dark surface - since the nights got dark (#300) the instrument glass
+        // of the MAN NL/NG (Fenster.tga, factor 0.5, the sky at the sphere map's bottom) lay
+        // milky white over the unlit gauges. (Vanilla+ as well: its linear lerp laid the
+        // sphere map as a grey sheen over every dark window band and chassis, #780.)
+        lit = srgb_decode(mix(srgb_encode(lit), srgb_encode(env.rgb), kk));
     }
     // wet road: a surface whose texture carries [moisture] darkens under rain and starts
     // to mirror the sky, strongest where you look along it (the Fresnel sheen that makes a
     // wet street read as wet)
     let outside = weather_outside_n(in.world, n, material.extra.x > 0.5, in.params2.w);
-    let wet = camera.shadow.w * material.params2.z * outside;
+    let wet = camera.shadow.w * material.params2.z * outside * (1.0 - clamp(camera.ambient.w, 0.0, 1.0));
     if (wet > 0.0) {
-        let vdir = normalize(in.world - camera.cam_pos.xyz);
+        let vdir = normalize(in.world - eye);
         let facing = clamp(-dot(vdir, n), 0.0, 1.0);
         let fresnel = pow(1.0 - facing, 4.0);
-        lit = lit * mix(1.0, 0.55, wet);
+        let puddle = road_puddle_coverage(in.world, n, wet);
+        let water = 0.02 + 0.98 * pow(1.0 - facing, 5.0);
+        let weight = clamp(mix(fresnel * wet * 0.85, water * wet, puddle), 0.0, 0.9);
         let sheen = camera.sky_color.rgb * 0.5 + camera.sun_color.rgb * camera.sun_dir.w * 0.35;
-        lit = mix(lit, sheen, clamp(fresnel * wet * 0.85, 0.0, 0.8));
+        if (classic) {
+            // Vanilla blends encoded weather colours, but asphalt darkening
+            // must stay in linear light to avoid turning the road black.
+            lit = srgb_decode(mix(srgb_encode(lit * mix(1.0, 0.75, wet)), sheen, weight));
+        } else {
+            lit = mix(lit * mix(1.0, 0.55, wet), sheen, weight);
+        }
+        *puddle_weight = weight * puddle;
     }
     // snow: the ground, the roads and every upward-facing surface whiten under it
     // (not on a shadow blob: whitened, it lit the snow under the bus instead of shading it)
@@ -1709,7 +1735,13 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
     }
     let dist = distance(in.world, camera.cam_pos.xyz);
     let f = 1.0 - exp(-fog_distance(in.world) * camera.fog.w);
+    *puddle_weight *= 1.0 - clamp(f, 0.0, 1.0);
     var rgb = mix(lit, camera.fog.xyz, clamp(f, 0.0, 1.0));
+    if (classic) {
+        // D3D's fixed-function fog blends the encoded vertex fog colour too.
+        // Treating that colour as linear raised a mid-grey fog from 128 to 188.
+        rgb = srgb_decode(mix(srgb_encode(lit), camera.fog.xyz, clamp(f, 0.0, 1.0)));
+    }
     if (camera.flags.z > 0.0) {
         // Never taken: flags.z (the old enhanced look's aerial perspective) is always 0
         // now - the enhanced path has its own fragment shader (enhanced.wgsl). The branch

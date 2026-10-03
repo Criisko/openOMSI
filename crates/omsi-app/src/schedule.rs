@@ -463,6 +463,18 @@ pub struct Schedule {
 /// within this many seconds; for a longer break it goes (and a bus comes back for it).
 const TOUR_LAYOVER_MAX: f64 = 30.0 * 60.0;
 
+/// A tour's bus takes its next trip on only from one of the trip's first lanes (or a short
+/// way onto one of them): Omsi.exe starts every trip at its beginning.
+const TOUR_ENTRY_LANES: usize = 4;
+
+/// Where on the next trip's route `section` the tour's bus standing on `lane` takes it on:
+/// only on one of its first lanes. A tour repeating the same trip leaves its bus on the
+/// route's last lane, and taken on there the trip was over at once - the bus stood at the
+/// last stop for good, and every bus behind it queued (#976).
+fn tour_entry(section: &[usize], lane: usize) -> Option<usize> {
+    section.iter().take(TOUR_ENTRY_LANES).position(|&l| l == lane)
+}
+
 /// How early a bus waits at its first stop for its departure (s): a quarter of an hour at a
 /// stand of its own, a minute where other buses stop as well (a layover bus there made
 /// every bus of the other lines queue behind it until it left).
@@ -2228,11 +2240,11 @@ impl Schedule {
             // from its lane onto one of the section's first lanes (round a terminal loop)
             let (lane0, s0) = (traffic.cars[ci].state.lane, traffic.cars[ci].state.s);
             let net = &traffic.net;
-            let (prefix, from) = match section.iter().position(|&l| l == lane0) {
+            let (prefix, from) = match tour_entry(&section, lane0) {
                 Some(r) => (Vec::new(), r),
                 None => {
                     let mut best: Option<(f32, Vec<usize>, usize)> = None;
-                    for t in 0..section.len().min(4) {
+                    for t in 0..section.len().min(TOUR_ENTRY_LANES) {
                         if let Some(p) = net.shortest_path(lane0, section[t]) {
                             let len = p[..p.len() - 1].iter().map(|&l| net.lanes[l].length()).sum::<f32>() - s0;
                             if len < 400.0 && best.as_ref().map(|b| len < b.0).unwrap_or(true) {
@@ -4188,6 +4200,30 @@ impl PlayerDuty {
         }
     }
 
+    /// The places of the stops ahead as the map has them now (`World::object_positions`):
+    /// a stop whose tile was not loaded when the duty began - and that no index placed -
+    /// gets its place once the tile comes, and one placed roughly (an object hung on
+    /// another) its exact one. A stop without a place was never reached: the next stop
+    /// stayed on it for the rest of the trip (#975) and the map left it out (#1014).
+    pub fn learn_loaded(&mut self, positions: &HashMap<i64, (glam::DVec3, [f64; 3])>) {
+        // (the trip under way and the next: the later ones learn theirs when they come)
+        let from = self.trip_index;
+        for trip in self.trips[from..].iter_mut().take(2) {
+            let mut changed = false;
+            for s in &mut trip.stops {
+                if let Some((p, _)) = positions.get(&s.object_id) {
+                    if s.position != Some(*p) {
+                        s.position = Some(*p);
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                trip.set_dirs();
+            }
+        }
+    }
+
     /// Time to drive from `pos` to `to` (s), roughly: roads are longer than the straight
     /// line, a bus in town makes some 25 km/h, and it takes a minute or two to get going.
     fn approach_time(pos: glam::DVec3, to: glam::DVec3) -> f64 {
@@ -4330,6 +4366,35 @@ impl PlayerDuty {
         self.placed = true;
     }
 
+    /// Resume the saved trip at its saved ordinal, without choosing a fresh starting
+    /// point or asking the device to retype its already restored programming. Past the
+    /// first stop the bus is on its way, as if it had left the stop before on time (as
+    /// `place` has it): `catch_up` may then look as far as the last stop and `delay`
+    /// counts from there. Saved at the last stop, the trip is over.
+    pub fn restore_progress(&mut self, stop: usize, pos: glam::DVec3) {
+        let last = self.trip().stops.len().saturating_sub(1);
+        self.next_stop = stop.min(last);
+        self.left_late = (self.next_stop > 0).then_some(0.0);
+        self.done = self.next_stop == last
+            && self.trip().stops[last].position.is_some_and(|p| (p - pos).length() < AT_STOP);
+        self.placed = true;
+        self.picked = true;
+        self.trip_changed = false;
+    }
+
+    /// The duty of a resumed situation: at its saved stop (an older save without one is
+    /// placed by where the bus stands), with the timetable on the host before the first
+    /// script frame.
+    pub fn resume(&mut self, bus: &mut omsi_sim::VehicleInstance, day_time: f64, saved_stop: Option<usize>) {
+        match saved_stop {
+            Some(stop) => self.restore_progress(stop, bus.position),
+            None => {
+                self.update(bus, day_time);
+            }
+        }
+        self.restore_host(bus, day_time);
+    }
+
     /// A page sets the stop the duty goes on with (`omsi.setNextStop`), forwards or
     /// backwards: skipped stops count as not served, and going back makes the stops from
     /// `stop` on due again. Not once the trip's last stop is reached (`done`), unless the
@@ -4408,6 +4473,18 @@ impl PlayerDuty {
         let day_time = self.duty_time(day_time);
         self.heading = bus.heading;
         let served = self.advance(bus.position, day_time);
+        self.feed_host(bus, day_time);
+        served
+    }
+
+    /// Supply restored timetable data before the first resumed script frame.
+    pub fn restore_host(&self, bus: &mut omsi_sim::VehicleInstance, day_time: f64) {
+        self.feed_host(bus, day_time);
+        bus.host.schedule_active = 1.0;
+        bus.set_var("schedule_active", 1.0);
+    }
+
+    fn feed_host(&self, bus: &mut omsi_sim::VehicleInstance, day_time: f64) {
         let delay = self.delay(day_time);
         let trip = &self.trips[self.trip_index];
         let host = &mut bus.host;
@@ -4421,7 +4498,6 @@ impl PlayerDuty {
         host.tt_busstop_index = self.next_stop as i32;
         host.tt_terminus_index = tt_terminus_index(host.hof.as_deref(), &trip.terminus);
         host.tt_delay = delay as f32;
-        served
     }
 
     /// The bus came to a later stop of the trip than the one it is due at (it drove past
@@ -4562,6 +4638,16 @@ mod tests {
 
     /// The row OMSI's AI bus is given: the first whose ident is the destination, whatever
     /// the codes' order; of equally loose matches the first as well.
+    #[test]
+    fn a_tour_bus_takes_a_trip_on_only_at_its_start() {
+        let route = [10, 11, 12, 13, 14, 15, 16];
+        assert_eq!(tour_entry(&route, 10), Some(0));
+        assert_eq!(tour_entry(&route, 13), Some(3));
+        // the same trip again: the bus stands on its last lane
+        assert_eq!(tour_entry(&route, 16), None);
+        assert_eq!(tour_entry(&route, 99), None);
+    }
+
     #[test]
     fn a_stop_is_no_target_of_itself() {
         // a circular line: from A round to A; B has two platforms of one name
@@ -4866,6 +4952,146 @@ mod tests {
         }
     }
 
+    /// A vehicle whose script drops its duty and destination while it has no timetable,
+    /// and shows what the timetable callbacks tell it.
+    fn timetable_test_vehicle() -> omsi_sim::VehicleInstance {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "omsi_tt_restore_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("device.osc");
+        let vars = dir.join("vars.txt");
+        let strings = dir.join("strings.txt");
+        std::fs::write(&vars, "duty\nobserved_stop\nobserved_delay\n").unwrap();
+        std::fs::write(&strings, "destination\nobserved_line\n").unwrap();
+        std::fs::write(
+            &script,
+            r#"
+{frame}
+(L.L.schedule_active) ! (M.V.GetTTBusstopCount) 0 = ||
+{if}
+0 (S.L.duty)
+"" (S.$.destination)
+{endif}
+(M.V.GetTTLineString) (S.$.observed_line)
+(M.V.GetTTBusstopIndex) (S.L.observed_stop)
+(M.V.GetTTDelay) (S.L.observed_delay)
+{end}
+"#,
+        )
+        .unwrap();
+        let program = omsi_script::compile(&omsi_script::CompileInput {
+            scripts: vec![script],
+            varlists: vec![vars],
+            stringvarlists: vec![strings],
+            builtin_vars: vec!["schedule_active".into()],
+            ..Default::default()
+        });
+        assert!(program.errors.is_empty(), "{:?}", program.errors);
+        let ty = Arc::new(omsi_sim::VehicleType {
+            def: Default::default(),
+            model: Default::default(),
+            model_dir: dir.clone(),
+            program: Arc::new(program),
+            meshes: Vec::new(),
+            paint_schemes: Vec::new(),
+            texchanges: Vec::new(),
+            wheel_meshes: Vec::new(),
+            suspension_axles: Vec::new(),
+            missing_packs: Vec::new(),
+            mesh_bounds: Vec::new(),
+            mesh_boxes: Vec::new(),
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+        omsi_sim::VehicleInstance::new(ty, omsi_sim::VehicleHost::new(Default::default()))
+    }
+
+    #[test]
+    fn resumed_duty_keeps_its_trip_and_stop_before_the_first_script_frame() {
+        let trips = vec![
+            planned(100.0, &[(0.0, 100.0, 100.0), (500.0, 200.0, 220.0)]),
+            planned(
+                400.0,
+                &[
+                    (500.0, 400.0, 400.0),
+                    (1000.0, 500.0, 520.0),
+                    (1500.0, 600.0, 600.0),
+                ],
+            ),
+            planned(800.0, &[(1500.0, 800.0, 800.0)]),
+        ];
+        let mut d = PlayerDuty {
+            line: "5".into(),
+            tour: "65104".into(),
+            trips,
+            trip_index: 0,
+            first_trip: 0,
+            next_stop: 0,
+            at_stop: false,
+            arrived_late: None,
+            done: false,
+            left_late: None,
+            held_back: false,
+            placed: false,
+            trip_changed: false,
+            picked: false,
+            first_update: None,
+            heading: 90.0,
+        };
+        // The same name appears twice. Its saved ordinal, rather than its name or the
+        // bus's position far from any stop, selects the second occurrence.
+        d.trips[1].stops[0].name = "Central".into();
+        d.trips[1].stops[1].name = "Central".into();
+        d.start_at(1, 0);
+        d.restore_progress(1, glam::DVec3::new(-3500.0, 0.0, 0.0));
+        assert_eq!(d.left_late, Some(0.0), "past its first stop the bus is on its way");
+        assert!(
+            !d.take_trip_change(),
+            "resume must not request automatic reprogramming"
+        );
+        let mut v = timetable_test_vehicle();
+        // Demonstrate that this device really loses its programming without callbacks.
+        let vars = vec![("duty".into(), 65104.0)];
+        let strings = vec![("destination".into(), "  Manual destination  ".into())];
+        v.restore_script_state(&vars, &strings);
+        v.update(0.02);
+        assert_eq!(v.var("duty"), Some(0.0));
+        v.restore_script_state(&vars, &strings);
+        v.position = glam::DVec3::new(-3500.0, 0.0, 0.0);
+        d.restore_host(&mut v, 542.0);
+        v.update(0.02);
+        assert_eq!(v.var("duty"), Some(65104.0));
+        let dest = v.ty.program.str_var("destination").unwrap() as usize;
+        assert_eq!(v.state.str_vars[dest], "  Manual destination  ");
+        assert_eq!(v.var("observed_stop"), Some(1.0));
+        assert_eq!(v.var("observed_delay"), Some(42.0));
+        d.update(&mut v, 542.0);
+        assert_eq!((d.trip_index, d.next_stop), (1, 1));
+        assert_eq!(d.tour, "65104");
+        d.restore_progress(usize::MAX, glam::DVec3::new(-3500.0, 0.0, 0.0));
+        assert_eq!(d.next_stop, 2);
+        assert!(!d.done, "away from the last stop the trip is not over yet");
+        d.restore_progress(2, glam::DVec3::new(1500.0, 0.0, 0.0));
+        assert!(d.done, "saved at the last stop, the trip is over");
+        d.restore_progress(0, glam::DVec3::new(-3500.0, 0.0, 0.0));
+        assert_eq!(d.next_stop, 0);
+        assert_eq!(d.left_late, None);
+        assert!(!d.done);
+        // Ordinary duty updates retain their existing handling of schedule_active.
+        v.host.schedule_active = 0.0;
+        v.set_var("schedule_active", 0.0);
+        d.update(&mut v, 542.0);
+        assert_eq!(v.host.schedule_active, 0.0);
+        assert_eq!(v.var("schedule_active"), Some(0.0));
+    }
+
     #[test]
     fn terminus_index_is_the_depot_terminus_of_that_name() {
         let mut hof = omsi_vehicle::hof::Hof::default();
@@ -4875,6 +5101,25 @@ mod tests {
         assert_eq!(tt_terminus_index(Some(&hof), "B"), 1);
         assert_eq!(tt_terminus_index(Some(&hof), "b"), -1);
         assert_eq!(tt_terminus_index(None, "B"), -1);
+    }
+
+    #[test]
+    fn a_stop_placed_only_once_its_tile_loads_is_reached() {
+        // stop 1's object was in no tile loaded when the duty began
+        let mut t = planned(0.0, &[(0.0, 0.0, 0.0), (500.0, 100.0, 100.0), (1000.0, 200.0, 200.0)]);
+        t.stops[1].position = None;
+        let mut d = PlayerDuty { line: "5".into(), tour: "1".into(), trips: vec![t], trip_index: 0, first_trip: 0, next_stop: 0, at_stop: false, arrived_late: None, done: false, left_late: None, held_back: false, placed: true, trip_changed: false, picked: true, first_update: None, heading: 90.0 };
+        d.advance(glam::DVec3::new(0.0, 0.0, 0.0), 0.0);
+        d.advance(glam::DVec3::new(100.0, 0.0, 0.0), 10.0);
+        assert_eq!(d.next_stop, 1);
+        // its tile comes: the map has it now
+        let mut positions = HashMap::new();
+        positions.insert(1i64, (glam::DVec3::new(500.0, 0.0, 0.0), [0.0; 3]));
+        d.learn_loaded(&positions);
+        assert_eq!(d.trips[0].stops[1].position, Some(glam::DVec3::new(500.0, 0.0, 0.0)));
+        d.advance(glam::DVec3::new(500.0, 0.0, 0.0), 100.0);
+        d.advance(glam::DVec3::new(700.0, 0.0, 0.0), 130.0);
+        assert_eq!(d.next_stop, 2);
     }
 
     #[test]

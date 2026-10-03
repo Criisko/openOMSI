@@ -109,6 +109,16 @@ impl Eye {
                 .cos(),
         }
     }
+
+    /// A wider picture than the camera's own (a triple screen's side panels): the tangents
+    /// of its half-angles, horizontal and vertical.
+    pub fn widened(mut self, extent: Option<(f64, f64)>) -> Eye {
+        if let Some((tan_x, tan_y)) = extent {
+            let half_diag = tan_x.hypot(tan_y).atan();
+            self.cos_half = self.cos_half.min((half_diag + 10f64.to_radians()).min(89f64.to_radians()).cos());
+        }
+        self
+    }
 }
 
 /// A bus as the passengers know it.
@@ -1324,6 +1334,18 @@ impl Want {
 }
 
 /// Velocity towards `to`, easing into the stop over the last metre.
+/// Somebody off the pavement's path by more than this beyond its corridor (just off a bus,
+/// at its door) walks onto it at their own pace before the corridor holds them; within it
+/// (a nudge of the crowd) the corridor takes them back.
+const OFF_PATH: f64 = 0.1;
+
+/// The corridor a walker at `pos` keeps to: none while they are still well off it. Eased
+/// into it at up to 0.6 m/s (twice a step) on top of walking there, the people getting off
+/// a bus slid sideways from its door to the pavement at twice their pace (#1033, #1079).
+fn path_corridor(pos: DVec2, corridor: Option<(DVec2, DVec2, f64)>) -> Option<(DVec2, DVec2, f64)> {
+    corridor.filter(|&(a, b, dev)| (crowd::clamp_to_corridor(pos, a, b, dev) - pos).length() <= OFF_PATH)
+}
+
 fn arrive(from: DVec2, to: DVec2, pace: f64) -> DVec2 {
     let d = to - from;
     let dist = d.length();
@@ -1934,13 +1956,13 @@ impl Humans {
     /// for them.
     /// Everybody on foot on the ground, for the traffic to stop for: position, velocity
     /// and whether they wait at a stop (a bus pulls up right beside those).
-    pub fn on_foot(&self) -> Vec<(DVec2, DVec2, bool)> {
+    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool)> {
         self.people
             .iter()
             .filter(|p| p.place == Place::Ground)
             .map(|p| {
                 let waiting = matches!(&p.state, State::Pax(x) if x.inside.is_none());
-                (p.position.truncate(), p.vel, waiting)
+                (p.position, p.vel, waiting)
             })
             .collect()
     }
@@ -4047,6 +4069,7 @@ impl Humans {
                 (width * 0.5 - side).max(0.35) + bow,
             )
         });
+        let corridor = path_corridor(pos2, corridor);
         if self.people[i].why != "queueing behind somebody" {
             self.people[i].why = "";
         }
@@ -5343,6 +5366,39 @@ impl Humans {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Off a bus 3 m from the pavement's path (along y), walking onto it at 1.1 m/s: hardly
+    /// faster over any quarter of a second (pulled by the corridor all the way, over 1.5
+    /// m/s), and on the path in the end.
+    #[test]
+    fn off_a_bus_people_walk_onto_the_pavement_at_their_pace() {
+        let walk = |held: bool| {
+            let pace = 1.1;
+            let mut w = Walker::new(DVec2::new(3.0, 0.0), 0.25, 0);
+            let params = CrowdParams::default();
+            let dt = 1.0 / 60.0;
+            let mut track = vec![w.pos];
+            for _ in 0..360 {
+                let s = w.pos.y.max(0.0);
+                let (a, b) = (DVec2::new(0.0, s - 2.0), DVec2::new(0.0, s + 2.5));
+                w.want = (DVec2::new(0.0, s + 1.3) - w.pos).normalize_or_zero() * pace;
+                let c = Some((a, b, 0.5));
+                w.corridor = if held { c } else { path_corridor(w.pos, c) };
+                crowd::step(std::slice::from_mut(&mut w), &[], &params, dt);
+                track.push(w.pos);
+            }
+            let fastest = track.windows(16).map(|k| (k[15] - k[0]).length() / (15.0 * dt)).fold(0.0, f64::max);
+            (fastest, w.pos)
+        };
+        let (fastest, end) = walk(false);
+        assert!(fastest < 1.3, "{fastest:.2} m/s");
+        assert!(end.x.abs() < 0.55, "{end:?}");
+        let held = walk(true).0;
+        assert!(held > 1.5, "{held:.2} m/s");
+        // on the path the corridor holds again
+        assert!(path_corridor(DVec2::new(0.55, 0.0), Some((DVec2::ZERO, DVec2::Y, 0.5))).is_some());
+        assert!(path_corridor(DVec2::new(3.0, 0.0), Some((DVec2::ZERO, DVec2::Y, 0.5))).is_none());
+    }
 
     #[test]
     fn map_humans_load_nested_paths_and_preserve_weights() {

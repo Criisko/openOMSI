@@ -11,7 +11,6 @@ use omsi_render::{Renderer, Scene, TextureId};
 
 /// Roboto (Apache 2.0), the interface font.
 const ROBOTO: &[u8] = include_bytes!("../../../assets/fonts/Roboto-VariableFont_wdth,wght.ttf");
-pub(crate) const PAUSE_NOTICE: &str = "Paused  ·  P to go on";
 
 /// A rendered text: its texture and size in pixels.
 #[derive(Clone, Copy)]
@@ -54,8 +53,11 @@ impl TextCache {
     /// its size.
     fn label(&mut self, r: &Renderer, scene: &mut Scene, text: &str, px: u32, color: [u8; 4]) -> Label {
         let color = [color[0], color[1], color[2], outline_for(color, if self.flat { 1.0 } else { self.backdrop })];
-        // (in the interface's language: the menu, the notes, the windows)
-        let text = &*omsi_ui::tr(text);
+        // (in the interface's language: the menu, the notes, the windows; a letter and its
+        // combining mark as one, as macOS gives file names - the weather "Eiseska\u{308}lte"
+        // showed a box after its "a" in the menu's list)
+        let text = omsi_ui::tr(text);
+        let text = &*omsi_ui::text::composed(&text);
         let key = (text.to_string(), px, color);
         if let Some(l) = self.labels.get_mut(&key) {
             l.used = self.frame;
@@ -86,6 +88,7 @@ impl TextCache {
     }
 
     fn width_in(&self, base: &FontVec, text: &str, px: f32) -> f32 {
+        let text = omsi_ui::text::composed(text);
         let mut w = 0.0;
         let mut prev: Option<(ab_glyph::GlyphId, *const FontVec)> = None;
         for c in text.chars() {
@@ -249,6 +252,57 @@ fn render_text(font: &FontVec, text: &str, px: f32, color: [u8; 4]) -> omsi_text
 const CHAT_SHOWN: usize = 8;
 pub const CHAT_KEEP: usize = 200;
 
+/// A notification from the server (`notify`): a card over the navigator that goes by itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Notice {
+    pub kind: NoticeKind,
+    pub text: String,
+    /// Seconds it still shows, of `total`.
+    pub left: f32,
+    pub total: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NoticeKind {
+    Info,
+    Warn,
+    Alert,
+}
+
+/// How many notifications show at once (the newest; an older one makes room).
+pub const NOTICES_SHOWN: usize = 3;
+
+impl Notice {
+    /// `notify`'s argument: `<id> <seconds> <info|warn|alert> <text>` → the id and the notice
+    /// (seconds held to 2 .. 30; an unknown kind is information).
+    pub fn parse(arg: &str) -> Option<(String, Notice)> {
+        let mut it = arg.trim().splitn(4, ' ');
+        let id = it.next().filter(|s| !s.is_empty())?.to_string();
+        let secs: f32 = it.next()?.parse().ok().filter(|s: &f32| s.is_finite())?;
+        let kind = match it.next()? {
+            "warn" => NoticeKind::Warn,
+            "alert" => NoticeKind::Alert,
+            _ => NoticeKind::Info,
+        };
+        let text = it.next().map(str::trim).filter(|t| !t.is_empty())?.to_string();
+        let total = secs.clamp(2.0, 30.0);
+        Some((id, Notice { kind, text, left: total, total }))
+    }
+
+    /// How opaque it is: fading in for a quarter second, out for its last half second.
+    pub fn alpha(&self) -> f32 {
+        (self.left / 0.5).min((self.total - self.left) / 0.25).clamp(0.0, 1.0)
+    }
+}
+
+/// A new notice in the list, the oldest going when there are more than `NOTICES_SHOWN`.
+pub fn push_notice(list: &mut Vec<Notice>, n: Notice) {
+    list.push(n);
+    while list.len() > NOTICES_SHOWN {
+        list.remove(0);
+    }
+}
+
 /// What the chat widget needs from the session each frame.
 pub struct ChatView<'a> {
     /// Every line, oldest first ("Name: text" or "* notice").
@@ -389,6 +443,11 @@ pub struct Frame<'a> {
     pub tutorial: Option<(&'a str, &'a str, Option<&'a std::path::Path>, usize, usize)>,
     /// Name tags: a screen position (the point above a bus), the name and a second line.
     pub tags: Vec<((f32, f32), String, String, f32)>,
+    /// The server's notifications, oldest first.
+    pub notices: &'a [Notice],
+    /// Where the navigator is on the screen (the notifications stand over it, or under it
+    /// in a top corner); none: they go to the top middle.
+    pub notice_anchor: Option<[f32; 4]>,
     /// What kind of menu the lines belong to.
     pub menu_kind: MenuKind,
     /// The open list's title and the small line above it (the line a tour list is of).
@@ -408,6 +467,7 @@ pub struct Frame<'a> {
 }
 
 pub struct Ui {
+    origin_x: f32,
     pub text: TextCache,
     pub chat: ChatWidget,
     /// Where the game menu's lines were drawn this frame (physical pixels), for the mouse.
@@ -430,6 +490,9 @@ pub struct Ui {
     pub menu_pane_go: Option<[f32; 4]>,
     /// The whole timetable pane beside the tours: the wheel over it scrolls its stops.
     pub menu_pane_box: Option<[f32; 4]>,
+    /// Its scroll bar when it has more stops than it shows: the track, the thumb (widened
+    /// to be hit), how many stops there are and how many it shows - for the mouse to drag.
+    pub menu_pane_scroll: Option<([f32; 4], [f32; 4], usize, usize)>,
     /// The two arrows beside the time of a tour: the trip before, the next one.
     pub menu_time: Vec<[f32; 4]>,
     /// The colours and positions of the menu's parts that ease to their new state (a line's
@@ -453,13 +516,71 @@ pub struct Ui {
     pub dd_rects: Vec<[f32; 4]>,
     pub dd_top: usize,
     pub dd_rows: usize,
+    /// The drop-down's scroll bar when it has more entries than it shows: its track and
+    /// its thumb (widened to be hit), for the mouse to drag.
+    pub dd_scroll: Option<([f32; 4], [f32; 4])>,
     /// Pictures shown in the interface (a tutorial page's), by file.
     images: hashbrown::HashMap<std::path::PathBuf, Option<(TextureId, u32, u32)>>,
 }
 
+pub(crate) fn shift_overlays(scene: &mut Scene, start: usize, x: f32) {
+    for (_, rect) in &mut scene.overlays[start..] {
+        rect[0] += x;
+        rect[2] += x;
+    }
+}
+
 impl Ui {
+    /// Lay out at panel resolution, then move both pixels and mouse targets to
+    /// that panel's position in the spanning window.
+    pub fn draw_at(&mut self, r: &Renderer, scene: &mut Scene, f: &Frame, dt: f32, origin_x: f32) {
+        self.shift_hitboxes(-self.origin_x);
+        let start = scene.overlays.len();
+        self.draw(r, scene, f, dt);
+        shift_overlays(scene, start, origin_x);
+        self.shift_hitboxes(origin_x);
+        self.origin_x = origin_x;
+    }
+
+    fn shift_hitboxes(&mut self, x: f32) {
+        for rect in self
+            .menu_rects
+            .iter_mut()
+            .chain(self.menu_side.iter_mut())
+            .chain(self.menu_pane.iter_mut())
+            .chain(self.menu_time.iter_mut())
+            .chain(self.dd_rects.iter_mut())
+            .chain(self.menu_ctl.iter_mut().flatten())
+            .chain(self.menu_scroll_thumb.iter_mut())
+            .chain(self.menu_scroll_track.iter_mut())
+            .chain(self.menu_pane_go.iter_mut())
+            .chain(self.menu_pane_box.iter_mut())
+        {
+            rect[0] += x;
+            rect[2] += x;
+        }
+        for arrows in self.menu_arrows.iter_mut().flatten() {
+            for at in arrows {
+                *at += x;
+            }
+        }
+        if let Some((track, thumb)) = &mut self.dd_scroll {
+            for rect in [track, thumb] {
+                rect[0] += x;
+                rect[2] += x;
+            }
+        }
+        if let Some((track, thumb, _, _)) = &mut self.menu_pane_scroll {
+            for rect in [track, thumb] {
+                rect[0] += x;
+                rect[2] += x;
+            }
+        }
+        self.chat.rect[0] += x;
+        self.chat.rect[2] += x;
+    }
     pub fn new() -> Option<Ui> {
-        Some(Ui { text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_time: Vec::new(), anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default() })
+        Some(Ui { origin_x: 0.0, text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, dd_scroll: None, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_pane_scroll: None, menu_time: Vec::new(), anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default() })
     }
 
     /// Draw the frame's interface: its overlays go after the HUD's in `scene.overlays`.
@@ -576,6 +697,74 @@ impl Ui {
             self.chat.hovered = false;
             self.chat.rect = [0.0; 4];
         }
+        // --- the server's notifications: cards over the navigator (under it when it is in a
+        // top corner; at the top middle without it), the newest nearest to it
+        if !f.notices.is_empty() {
+            let pad = 10.0 * s;
+            let stripe = 4.0 * s;
+            let gap = 6.0 * s;
+            let (x0, w, mut y, up) = match f.notice_anchor {
+                Some(a) => {
+                    let w = (a[2] - a[0]).max(300.0 * s).min(f.width - 16.0 * s);
+                    let x0 = if a[0] + w > f.width { f.width - w - 8.0 * s } else { a[0] }.max(8.0 * s);
+                    if a[1] > f.height * 0.5 { (x0, w, a[1] - gap, true) } else { (x0, w, a[3] + gap, false) }
+                }
+                None => {
+                    let w = (420.0 * s).min(f.width - 32.0 * s);
+                    ((f.width - w) * 0.5, w, 70.0 * s, false)
+                }
+            };
+            let title_px = (13.0 * s) as u32;
+            let px = (16.0 * s) as u32;
+            let lh = px as f32 * 1.3;
+            for n in f.notices.iter().rev() {
+                // (the text steps in quarters as it fades: a label is made for each colour)
+                let a = (n.alpha() * 4.0).ceil() / 4.0;
+                if a <= 0.0 {
+                    continue;
+                }
+                let (accent, title) = match n.kind {
+                    NoticeKind::Info => ([90, 160, 255], "Server"),
+                    NoticeKind::Warn => ([240, 170, 50], "Warning"),
+                    NoticeKind::Alert => ([235, 80, 70], "Alert"),
+                };
+                let rows = {
+                    let tc = &self.text;
+                    wrap_rows(&n.text, w - stripe - pad * 2.0, 0.0, &|t: &str| tc.width_raw(t, px as f32))
+                };
+                // (five rows at the most; a longer text says it goes on)
+                let mut rows: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+                if rows.len() > 5 {
+                    rows.truncate(5);
+                    rows[4].push('…');
+                }
+                let th = title_px as f32 * 1.35;
+                let h = pad + th + lh * rows.len() as f32 + pad * 0.7;
+                let top = if up { y - h } else { y };
+                // (a stack that would leave the window ends there)
+                if top < 0.0 || top + h > f.height {
+                    break;
+                }
+                let bg = self.text.solid(r, scene, [14, 16, 20, (225.0 * a * self.text.backdrop) as u8]);
+                scene.overlays.push((bg, [x0, top, x0 + w, top + h]));
+                let bar = self.text.solid(r, scene, [accent[0], accent[1], accent[2], (255.0 * a) as u8]);
+                scene.overlays.push((bar, [x0, top, x0 + stripe, top + h]));
+                // what is left of its time: a thin line along the bottom
+                let left = (n.left / n.total).clamp(0.0, 1.0);
+                let line = self.text.solid(r, scene, [accent[0], accent[1], accent[2], (150.0 * a) as u8]);
+                scene.overlays.push((line, [x0 + stripe, top + h - 2.0 * s, x0 + stripe + (w - stripe) * left, top + h]));
+                let tx = x0 + stripe + pad;
+                let t = self.text.label(r, scene, title, title_px, [accent[0], accent[1], accent[2], (255.0 * a) as u8]);
+                scene.overlays.push((t.tex, [tx, top + pad * 0.6, tx + t.w as f32, top + pad * 0.6 + t.h as f32]));
+                let mut ry = top + pad * 0.6 + th;
+                for row in &rows {
+                    let l = self.text.label(r, scene, row, px, [255, 255, 255, (240.0 * a) as u8]);
+                    scene.overlays.push((l.tex, [tx, ry, tx + l.w as f32, ry + l.h as f32]));
+                    ry += lh;
+                }
+                y = if up { top - gap } else { top + h + gap };
+            }
+        }
         if let Some(fps) = f.fps {
             let l = self.text.label(r, scene, &format!("{fps:.0} fps"), (13.0 * s) as u32, [255, 255, 255, 200]);
             let x = f.width - l.w as f32 - 12.0 * s;
@@ -689,17 +878,6 @@ impl Ui {
             scene.overlays.push((plate, [x, top, x + w, y]));
             scene.overlays.extend(items);
         }
-        // --- paused
-        if f.paused && f.menu.is_none() {
-            let l = self.text.label(r, scene, "Paused  ·  P to go on", (18.0 * s) as u32, [255, 255, 255, 0]);
-            let pad = 14.0 * s;
-            let (w, h) = (l.w as f32 + pad * 2.0, l.h as f32 + pad);
-            let x = (f.width - w) * 0.5;
-            let y = f.height * 0.2;
-            let plate = self.text.plate(r, scene, 3);
-            scene.overlays.push((plate, [x, y, x + w, y + h]));
-            scene.overlays.push((l.tex, [x + pad, y + pad * 0.5, x + pad + l.w as f32, y + pad * 0.5 + l.h as f32]));
-        }
         // --- the game menu and its lists, in the middle over a dimmed picture
         self.anim_dt = dt.clamp(0.0, 0.1);
         self.text.flat = true;
@@ -709,10 +887,10 @@ impl Ui {
         self.vr_tooltip_overlay = None;
         if let Some(t) = f.tooltip.as_ref().filter(|t| !t.is_empty()) {
             let l = self.text.label(r, scene, t, (14.0 * s) as u32, [255, 255, 255, 235]);
-            let mut x = f.cursor.0 + 16.0 * s;
+            let mut x = f.cursor.0.clamp(0.0, f.width) + 16.0 * s;
             let mut y = f.cursor.1 + 2.0 * s;
             if x + l.w as f32 > f.width {
-                x = f.cursor.0 - 8.0 * s - l.w as f32;
+                x = (f.cursor.0.clamp(0.0, f.width) - 8.0 * s - l.w as f32).max(5.0 * s);
             }
             if y + l.h as f32 > f.height {
                 y = f.height - l.h as f32;
@@ -1228,10 +1406,12 @@ impl Ui {
         self.menu_pane_start = 0;
         self.menu_pane_go = None;
         self.menu_pane_box = None;
+        self.menu_pane_scroll = None;
         self.menu_time.clear();
         self.menu_scroll_thumb = None;
         self.menu_scroll_track = None;
         self.dd_rects.clear();
+        self.dd_scroll = None;
         let overlay_start = scene.overlays.len();
         let Some((sel, items)) = f.menu else {
             self.menu_overlay_range = overlay_start..overlay_start;
@@ -1572,7 +1752,9 @@ impl Ui {
                 // (a long list of stops: a thin scroll bar at the pane's edge)
                 if n > fit {
                     let hot = over([px0, py0, px1, py1]);
-                    self.thumb(r, scene, [px1 - 7.0 * s, top, px1 - 3.0 * s, go[1] - 10.0 * s], first, fit, n, hot, s);
+                    let track = [px1 - 7.0 * s, top, px1 - 3.0 * s, go[1] - 10.0 * s];
+                    let thumb = self.thumb(r, scene, track, first, fit, n, hot, s);
+                    self.menu_pane_scroll = Some((track, [thumb[0] - 6.0 * s, thumb[1], thumb[2] + 3.0 * s, thumb[3]], n, fit));
                 }
                 let time_w = p.rows.iter().skip(first).take(fit).map(|row| self.text.width(&row.1, rpx as f32)).fold(0.0f32, f32::max);
                 for (i, (what, when)) in p.rows.iter().enumerate().skip(first).take(fit) {
@@ -1915,7 +2097,8 @@ impl Ui {
             }
             if more {
                 let track = [px1 - 8.0 * s, py0 + inner, px1 - 4.0 * s, py0 + ph - inner];
-                self.thumb(r, scene, track, top, n_vis, dd.items.len(), over(panel), s);
+                let thumb = self.thumb(r, scene, track, top, n_vis, dd.items.len(), over(panel), s);
+                self.dd_scroll = Some((track, [thumb[0] - 6.0 * s, thumb[1], thumb[2] + 4.0 * s, thumb[3]]));
             }
         }
     }
@@ -2023,6 +2206,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_server_notice_is_read_and_fades() {
+        let (id, n) = Notice::parse("a1b2 5 warn Service 15/5: departure at 06:07 | depot").unwrap();
+        assert_eq!(id, "a1b2");
+        assert_eq!((n.kind, n.text.as_str(), n.total, n.left), (NoticeKind::Warn, "Service 15/5: departure at 06:07 | depot", 5.0, 5.0));
+        // seconds held to 2 .. 30, an unknown kind is information
+        assert_eq!(Notice::parse("x 0.5 info hi").unwrap().1.total, 2.0);
+        assert_eq!(Notice::parse("x 600 whatever hi").unwrap().1, Notice { kind: NoticeKind::Info, text: "hi".into(), left: 30.0, total: 30.0 });
+        // no text, no seconds, nothing: not a notice
+        for bad in ["", "x", "x 5", "x 5 info", "x 5 info   ", "x five info hi", "x NaN info hi"] {
+            assert!(Notice::parse(bad).is_none(), "{bad}");
+        }
+        // fades in, stays, fades out
+        let mut n = Notice::parse("x 5 alert hi").unwrap().1;
+        assert_eq!(n.alpha(), 0.0);
+        n.left = 4.0;
+        assert_eq!(n.alpha(), 1.0);
+        n.left = 0.25;
+        assert!((n.alpha() - 0.5).abs() < 1e-6);
+        // three at most: the oldest goes
+        let mut list = Vec::new();
+        for k in 0..5 {
+            push_notice(&mut list, Notice::parse(&format!("{k} 5 info n{k}")).unwrap().1);
+        }
+        assert_eq!(list.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), ["n2", "n3", "n4"]);
+    }
+
+    #[test]
+    fn centre_hud_moves_menu_controls_and_chat_hitboxes_together() {
+        let mut ui = Ui::new().unwrap();
+        ui.menu_rects.push([20.0, 100.0, 900.0, 140.0]);
+        ui.menu_ctl.push(Some([600.0, 110.0, 860.0, 130.0]));
+        ui.menu_side.push([30.0, 100.0, 200.0, 140.0]);
+        ui.dd_rects.push([650.0, 150.0, 850.0, 180.0]);
+        ui.menu_arrows.push(Some([600.0, 640.0, 820.0]));
+        ui.chat.rect = [10.0, 800.0, 400.0, 1000.0];
+        ui.dd_scroll = Some(([850.0, 150.0, 860.0, 300.0], [844.0, 160.0, 864.0, 200.0]));
+        ui.menu_pane_scroll = Some((
+            [880.0, 150.0, 890.0, 700.0],
+            [874.0, 160.0, 894.0, 220.0],
+            40,
+            10,
+        ));
+        ui.shift_hitboxes(1920.0);
+        let track = ui.menu_ctl[0].unwrap();
+        assert_eq!((2650.0 - track[0]) / (track[2] - track[0]), 0.5);
+        assert!(ui.chat.contains(2020.0, 900.0));
+        assert!(!ui.chat.contains(100.0, 900.0));
+        assert_eq!(ui.dd_rects[0], [2570.0, 150.0, 2770.0, 180.0]);
+        assert_eq!(ui.menu_arrows[0], Some([2520.0, 2560.0, 2740.0]));
+        assert_eq!(ui.dd_scroll.unwrap().0[0], 2770.0);
+        assert_eq!(ui.menu_pane_scroll.unwrap().1[0], 2794.0);
+        ui.shift_hitboxes(-1920.0);
+        assert_eq!(ui.menu_ctl[0], Some([600.0, 110.0, 860.0, 130.0]));
+    }
+
+    #[test]
     fn a_long_chat_line_goes_on_in_rows() {
         // (10 px a character)
         let m = |t: &str| t.chars().count() as f32 * 10.0;
@@ -2057,19 +2296,6 @@ mod tests {
             }
         }
         assert_eq!(vr_settings_sidebar_step(1000.0, 8, 1.0), 42.0);
-    }
-
-    #[test]
-    fn pause_notice_is_translated_in_every_supported_language() {
-        for &(_, _, language, _) in omsi_launcher_lib::LANGUAGES {
-            if language == "en" {
-                continue;
-            }
-            let translated = crate::_rust_i18n_try_translate(language, PAUSE_NOTICE)
-                .unwrap_or_else(|| panic!("missing pause notice for {language}"));
-            assert!(!translated.trim().is_empty());
-            assert_ne!(translated, PAUSE_NOTICE, "{language}");
-        }
     }
 
     #[test]

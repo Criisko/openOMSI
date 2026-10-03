@@ -932,6 +932,14 @@ impl Ui {
         self.push_clip(r, 6.0);
         let content = body(self, Rect::new(r.x, r.y - off, r.w, r.h));
         self.pop_clip();
+        self.scroll_keep(name, r, content);
+    }
+
+    /// The scrolling of such a view: the bar, the wheel, and its own easing towards where it
+    /// was sent. `content` is what the rows came to, all of them.
+    pub fn scroll_keep(&mut self, name: &str, r: Rect, content: f32) {
+        let id = id_of(name);
+        let off = self.scroll.get(&id).copied().unwrap_or(0.0);
         let max = (content - r.h).max(0.0);
         let mut target = self.scroll.get(&(id ^ 0xabc)).copied().unwrap_or(off);
         if self.hover(r) && self.input.wheel.y.abs() > 0.0 && !self.wheel_taken {

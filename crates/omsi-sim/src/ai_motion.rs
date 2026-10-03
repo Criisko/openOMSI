@@ -412,6 +412,9 @@ impl AiBody {
             self.contact_z = vec![f64::NAN; self.wheels.len()];
         }
         let mut contacts: Vec<(f32, f32, f64)> = Vec::with_capacity(self.wheels.len());
+        // per wheel: no face near its lane's height, and the face found deeper down
+        let mut hung: Vec<bool> = Vec::with_capacity(self.wheels.len());
+        let mut low: Vec<Option<f64>> = Vec::with_capacity(self.wheels.len());
         for (k, w) in self.wheels.iter().enumerate() {
             if axle_z[w.axle].is_nan() {
                 axle_z[w.axle] = way(w.long).z;
@@ -433,13 +436,31 @@ impl AiBody {
             // Without the world's faces, the plain height sampler.
             let last = self.contact_z[k];
             let from = if last.is_finite() && (last - path_z).abs() < AI_RAY_UP { last.max(path_z) } else { path_z };
-            let drawn = match contact {
-                Some(c) => c.probe(p.x, p.y, from + AI_RAY_UP).below.filter(|g| *g >= path_z - AI_DROP),
-                None => ground.and_then(|g| g(p.x, p.y)).filter(|g| (*g - path_z).abs() < AI_RAY_UP),
+            let (drawn, deeper) = match contact {
+                Some(c) => {
+                    let below = c.probe(p.x, p.y, from + AI_RAY_UP).below;
+                    (below.filter(|g| *g >= path_z - AI_DROP), below.filter(|g| *g < path_z - AI_DROP && *g > path_z - AI_RAY_UP))
+                }
+                None => (ground.and_then(|g| g(p.x, p.y)).filter(|g| (*g - path_z).abs() < AI_RAY_UP), None),
             };
-            let h = drawn.unwrap_or(path_z);
-            self.contact_z[k] = h;
-            contacts.push((w.lat, w.long, h));
+            low.push(deeper);
+            contacts.push((w.lat, w.long, drawn.unwrap_or(path_z)));
+            hung.push(drawn.is_none());
+        }
+        // A wheel hangs over a drop on its spring while the others carry the car; with no
+        // wheel near its lane's height the car has nothing to hang from and comes down onto
+        // what is drawn under it, as Omsi.exe's wheel physics drops it. (Kept at the lane's
+        // height, a car whose junction's paths ran half a metre over the drawn road drove
+        // through the junction in the air, #876.)
+        if hung.iter().all(|h| *h) && low.iter().any(|l| l.is_some()) {
+            for (c, l) in contacts.iter_mut().zip(&low) {
+                if let Some(z) = l {
+                    c.2 = *z;
+                }
+            }
+        }
+        for (k, c) in contacts.iter().enumerate() {
+            self.contact_z[k] = c.2;
         }
         // least-squares plane h = a + b·long + c·lat (the wheels sit symmetrically, so the
         // two slopes separate)
@@ -815,6 +836,30 @@ mod tests {
             assert!((body.position.z - (10.0 + lift)).abs() < 0.02, "lift {lift} camber {camber}: body at {:.3}", body.position.z);
             let lean = (-camber).atan().to_degrees() as f32;
             assert!((body.bank_deg - lean).abs() < 0.3, "camber {camber}: bank {} against {lean}", body.bank_deg);
+        }
+    }
+
+    /// A lane laid half a metre over its drawn road (a junction's paths): with no wheel
+    /// near the lane's height the car comes down onto the road instead of driving in the air;
+    /// a road far below (under a bridge the lane crosses) still does not pull it down.
+    #[test]
+    fn a_car_over_a_lower_road_comes_down_onto_it() {
+        let def = golf();
+        for (drop, expect) in [(0.5f64, 9.5f64), (6.0, 10.0)] {
+            let ground = move |_x: f64, _y: f64, top: f64| {
+                let z = 10.0 - drop;
+                crate::rigid::GroundProbe { below: (z <= top).then_some(z), above: None }
+            };
+            let way = |d: f32| DVec3::new(0.0, d as f64, 10.0);
+            let mut body = AiBody::new(&def, MotionKind::Road);
+            body.place(&way, None, Some(&ground), 0.0);
+            let mut x = 0.0f32;
+            for _ in 0..60 {
+                x += 0.2;
+                let at = x;
+                body.step(1.0 / 30.0, 6.0, &|d| way(at + d), None, Some(&ground));
+            }
+            assert!((body.position.z - expect).abs() < 0.02, "drop {drop}: body at {:.3}", body.position.z);
         }
     }
 

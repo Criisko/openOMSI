@@ -24,7 +24,9 @@ pub(crate) fn standing_reasons(v: &omsi_sim::VehicleInstance, key: &dyn Fn(&str)
     }
     if !omsi_sim::startup::engine_running(v) {
         let m = key("kw_m_enginestart").unwrap_or_else(|| "M".into());
-        lines.push(format!("The engine is off  (E electrics, {m} starter; mod buses with an ignition key turn it with E: press again and hold. Shift+U does it all)"));
+        // (the electrics' key named as the player set it too, not always E - #461)
+        let e = key("cp_batterietrennschalter_toggle").unwrap_or_else(|| "E".into());
+        lines.push(format!("The engine is off  ({e} electrics, {m} starter; mod buses with an ignition key turn it with {e}: press again and hold. Shift+U does it all)"));
     } else if v
         .var("antrieb_getr_gangwahl")
         .map(|g| (g - 1.0).abs() < 0.1)
@@ -193,5 +195,8 @@ mod tests {
         assert_eq!(rebound_key(&[bind("automatic_D", 32, 4)], "automatic_D").as_deref(), Some("Ctrl+D"));
         assert_eq!(rebound_key(&[bind("automatic_D", 0, 0)], "automatic_D"), None);
         assert_eq!(rebound_key(&[], "automatic_D"), None);
+        // the electrics' key: E is the stock one, a moved one is named
+        assert_eq!(rebound_key(&[bind("cp_batterietrennschalter_toggle", 18, 0)], "cp_batterietrennschalter_toggle"), None);
+        assert_eq!(rebound_key(&[bind("cp_batterietrennschalter_toggle", 18, 4)], "cp_batterietrennschalter_toggle").as_deref(), Some("Ctrl+E"));
     }
 }

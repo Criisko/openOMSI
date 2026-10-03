@@ -182,7 +182,11 @@ fn kill_stale() {
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .status();
     }
 }
 
@@ -192,11 +196,18 @@ impl Tunnel {
     pub fn start(port: u16) -> Option<Tunnel> {
         let bin = ensure_cloudflared()?;
         kill_stale();
-        let mut child = Command::new(&bin)
+        let mut command = Command::new(&bin);
+        command
             .args(["tunnel", "--no-autoupdate", "--url", &format!("http://127.0.0.1:{port}")])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| log::warn!("tunnel: {} could not be started: {e}", bin.display()))
             .ok()?;

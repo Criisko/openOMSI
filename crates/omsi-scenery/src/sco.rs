@@ -383,7 +383,15 @@ impl SceneryObject {
                 "mass" => o.mass = Some(r.f32()),
                 "momentofintertia" => o.moment_of_inertia = Some(r.f32s::<3>()),
                 "cog" => o.cog = Some(r.f32s::<3>()),
-                "boundingbox" => o.bounding_box = Some(r.f32s::<6>()),
+                "boundingbox" => {
+                    // (the sizes as magnitudes, as a vehicle's: a box given negative
+                    // crossed the bounds of the walkers' clamp about it, #986)
+                    let mut bb = r.f32s::<6>();
+                    for x in &mut bb[..3] {
+                        *x = x.abs();
+                    }
+                    o.bounding_box = Some(bb);
+                }
                 "crashmode_pole" => {
                     let a = r.f32();
                     let b = r.f32();

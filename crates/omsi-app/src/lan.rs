@@ -448,6 +448,9 @@ pub struct RemoteVehicle {
     /// Their bus type is not installed here: ours stands in for it.
     pub stand_in: bool,
     pub last: Pose,
+    /// The bus file and paint scheme it was made in (`last` is the state drawn, which may be
+    /// an interpolated older one).
+    made_as: (String, String),
     /// The driver at the wheel (their bus stood empty here), hidden while they walk about.
     driver: Option<crate::driver::DriverFigure>,
     driver_tried: bool,
@@ -678,6 +681,13 @@ struct WsPath {
 }
 
 static WS_PATH: std::sync::Mutex<Option<WsPath>> = std::sync::Mutex::new(None);
+
+/// Whether the joining game's WebSocket was made again since this was last asked.
+fn ws_came_back() -> bool {
+    static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = WS_PATH.lock().ok().and_then(|w| w.as_ref()?._client.as_ref().map(|c| c.reconnects())).unwrap_or(0);
+    n != SEEN.swap(n, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Shut the gateway and the tunnel (its cloudflared process) down: at the end of the game.
 pub fn close_public_gateway() {
@@ -1462,9 +1472,33 @@ fn relative_position(me: &omsi_sim::VehicleInstance, pose: &Pose) -> String {
 
 /// The other players' name tags, as ETS2 has them: the name over the bus's roof and a
 /// small line under it (line and destination, how far away), fading out beyond 300 m.
-/// Screen positions in physical pixels of a `width` x `height` picture.
-pub fn name_tags(game: &LanGame, cam: &omsi_render::Camera, width: f32, height: f32) -> Vec<((f32, f32), String, String, f32)> {
-    let vp = cam.view_proj(width / height.max(1.0), cam.position);
+/// Screen positions in physical pixels of a `width` x `height` picture (on a triple-screen
+/// rig, of the three panels side by side). `speaks` tells who talks in the voice chat now (by
+/// name and id): "speaking" under their name.
+pub fn name_tags(
+    game: &LanGame,
+    cam: &omsi_render::Camera,
+    width: f32,
+    height: f32,
+    rig: Option<&omsi_render::TripleScreen>,
+    speaks: &dyn Fn(&str, u32) -> bool,
+) -> Vec<((f32, f32), String, String, f32)> {
+    let views: Vec<_> = if let Some(rig) = rig {
+        rig.views(cam, width as u32, height as u32)
+            .iter()
+            .map(|v| {
+                let vp = v.projection
+                    * glam::Mat4::look_to_rh(glam::Vec3::ZERO, v.camera.forward(), v.camera.up());
+                (vp, v.viewport[0] as f32, v.viewport[2] as f32)
+            })
+            .collect()
+    } else {
+        vec![(
+            cam.view_proj(width / height.max(1.0), cam.position),
+            0.0,
+            width,
+        )]
+    };
     let mut tags = Vec::new();
     for r in game.remotes.values() {
         let v = &r.vehicle;
@@ -1479,15 +1513,23 @@ pub fn name_tags(game: &LanGame, cam: &omsi_render::Camera, width: f32, height: 
         if d > 450.0 {
             continue;
         }
-        let c = vp * (p - cam.position).as_vec3().extend(1.0);
-        if c.w <= 0.1 {
+        let Some((screen_x, y)) = views.iter().find_map(|(vp, offset, panel_width)| {
+            let c = *vp * (p - cam.position).as_vec3().extend(1.0);
+            if c.w <= 0.1 {
+                return None;
+            }
+            let (x, y) = (c.x / c.w, c.y / c.w);
+            let limit = if rig.is_some() { 1.0 } else { 1.2 };
+            (x.abs() <= limit && y.abs() <= 1.2)
+                .then_some((offset + (x + 1.0) * 0.5 * panel_width, y))
+        }) else {
             continue;
-        }
-        let (x, y) = (c.x / c.w, c.y / c.w);
-        if x.abs() > 1.2 || y.abs() > 1.2 {
-            continue;
-        }
-        let name = if r.name.trim().is_empty() { format!("player {}", r.last.id) } else { r.name.trim().to_string() };
+        };
+        let name = if r.name.trim().is_empty() {
+            format!("player {}", r.last.id)
+        } else {
+            r.name.trim().to_string()
+        };
         let pose = &r.last;
         let mut sub = match (pose.line.trim().is_empty(), pose.destination.trim().is_empty()) {
             (false, false) => format!("{} {}", pose.line.trim(), pose.destination.trim()),
@@ -1499,8 +1541,11 @@ pub fn name_tags(game: &LanGame, cam: &omsi_render::Camera, width: f32, height: 
             let dist = if d >= 1000.0 { format!("{:.1} km", d / 1000.0) } else { format!("{:.0} m", d) };
             sub = if sub.is_empty() { dist } else { format!("{sub} · {dist}") };
         }
+        if speaks(&r.name, r.last.id) {
+            sub = if sub.is_empty() { omsi_ui::tr("speaking").into_owned() } else { format!("{} · {sub}", omsi_ui::tr("speaking")) };
+        }
         let alpha = (1.0 - ((d as f32 - 300.0) / 150.0)).clamp(0.0, 1.0);
-        tags.push((((x + 1.0) * 0.5 * width, (1.0 - y) * 0.5 * height), name, sub, alpha));
+        tags.push(((screen_x, (1.0 - y) * 0.5 * height), name, sub, alpha));
     }
     tags
 }
@@ -1600,6 +1645,25 @@ fn line_and_destination(p: &Player, duty: Option<(&str, &str)>) -> (String, Stri
     (line, dest.trim().to_string())
 }
 
+/// What a vehicle's indicators show: 0 off, 1 left, 2 right, 3 hazard - the indicator
+/// switch where the script has one, else the lamps (as they are lit just now).
+pub(crate) fn indicator(v: &omsi_sim::VehicleInstance) -> u8 {
+    let on = |n: &str| v.var(n).unwrap_or(0.0) > 0.5;
+    if on("lights_sw_warnblinker") {
+        3
+    } else {
+        match v.var("lights_sw_blinker") {
+            Some(s) if (0.5..2.5).contains(&s) => s.round() as u8,
+            _ => match (on("lights_blinker_l"), on("lights_blinker_r")) {
+                (true, true) => 3,
+                (true, false) => 1,
+                (false, true) => 2,
+                _ => 0,
+            },
+        }
+    }
+}
+
 /// What we send about our own bus.
 pub fn my_pose(
     game: &mut LanGame,
@@ -1657,21 +1721,7 @@ pub fn my_pose(
     } else {
         0
     };
-    // the indicator switch where the script has one (0 off, 1 left, 2 right, 3 hazard),
-    // else the lamps, remembered across their dark phase
-    let blinker = if on("lights_sw_warnblinker") {
-        3
-    } else {
-        match v.var("lights_sw_blinker") {
-            Some(s) if (0.5..2.5).contains(&s) => s.round() as u8,
-            _ => match (on("lights_blinker_l"), on("lights_blinker_r")) {
-                (true, true) => 3,
-                (true, false) => 1,
-                (false, true) => 2,
-                _ => 0,
-            },
-        }
-    };
+    let blinker = indicator(v);
     let fp = footprint_of(v, BUS_BOX);
     let bb = v.ty.def.bounding_box.unwrap_or(BUS_BOX);
     let h = v.heading.to_radians();
@@ -1683,7 +1733,17 @@ pub fn my_pose(
         id: 0,
         name: String::new(),
         bus: content_relative(&v.ty.def.path, &args.root),
-        paint: paint_name(args, &v.ty),
+        // (the scheme the bus wears now: one picked in the game's menu after the start too)
+        paint: match v.host.paint_scheme {
+            Some(Some(i)) => {
+                v.ty.paint_schemes
+                    .get(i)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default()
+            }
+            Some(None) => String::new(),
+            None => paint_name(args, &v.ty),
+        },
         line,
         destination,
         tour: String::new(),
@@ -2360,6 +2420,7 @@ fn new_remote(
         shown: (String::new(), String::new()),
         stand_in,
         last: pose.clone(),
+        made_as: (pose.bus.clone(), pose.paint.clone()),
         driver: None,
         driver_tried: false,
         samples: std::collections::VecDeque::new(),
@@ -2820,6 +2881,9 @@ pub fn tick(
     frame: &Frame,
 ) -> Vec<WorldUpdate> {
     let mut updates = Vec::new();
+    if lan.role == Role::Client && ws_came_back() {
+        lan.rehello();
+    }
     let mut mine = my_pose(game, player.as_deref(), args, duty, frame.riders);
     mine.tour = frame.tour.clone().unwrap_or_default();
     mine.walker = frame.walker;
@@ -2976,11 +3040,12 @@ pub fn tick(
         .map(|p| p.pose.clone())
         .collect();
     for pose in poses {
-        // another vehicle than before (the player changed buses): made again
+        // another vehicle than before (the player changed buses), or another paint scheme on
+        // it: made again
         if game
             .remotes
             .get(&pose.id)
-            .map(|rv| rv.last.bus != pose.bus)
+            .map(|rv| rv.made_as.0 != pose.bus || rv.made_as.1 != pose.paint)
             .unwrap_or(false)
         {
             if let Some(rv) = game.remotes.remove(&pose.id) {

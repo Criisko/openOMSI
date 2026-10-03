@@ -27,7 +27,7 @@ pub(crate) fn take_preopened(map: &Path, date: i32) -> Option<World> {
 /// that stop by road (`args.entry`).
 pub(crate) fn place_on_duty(args: &mut Args) {
     let Some(line) = args.line.clone() else { return };
-    if !args.schedule || args.bus.is_none() || args.spawn.is_some() || !args.situation_vars.is_empty() {
+    if !args.schedule || args.bus.is_none() || args.spawn.is_some() || args.is_resuming() {
         return;
     }
     let t0 = Instant::now();

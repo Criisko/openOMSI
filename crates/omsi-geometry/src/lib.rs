@@ -971,7 +971,17 @@ pub fn turns_round(m: &omsi_o3d::Mesh) -> bool {
     // face up with their normals down, faced the ground and left holes in the streets.)
     let linear = glam::Mat3::from_mat4(m.transform);
     let identity = linear.abs_diff_eq(glam::Mat3::IDENTITY, 1e-4);
-    let mirrored = m.has_transform && !identity && m.transform.determinant() > 0.0;
+    // Some exporters keep authored winding with a positive non-uniform scale or a small
+    // rotation. Those transforms are not mirrors, even when the stored normals face the
+    // other way. Ignore scale when checking whether the basis still follows the object axes.
+    let axis_aligned = {
+        let x = linear.x_axis.normalize_or_zero();
+        let y = linear.y_axis.normalize_or_zero();
+        let z = linear.z_axis.normalize_or_zero();
+        x.dot(Vec3::X) > 0.9 && y.dot(Vec3::Y) > 0.9 && z.dot(Vec3::Z) > 0.9
+    };
+    let mirrored =
+        m.has_transform && !identity && !axis_aligned && m.transform.determinant() > 0.0;
     let explained = against_turned * 10 <= counted;
     mirrored && !explained && counted >= 2 && against * 10 >= counted * 9
 }
@@ -1136,6 +1146,46 @@ mod tests {
         assert!(normal.distance(Vec3::new(-0.1, 0.05, 1.0).normalize()) < 1e-5);
         assert!(grid.surface_below(4.0, 5.0, 11.0).is_none());
         assert!(grid.surface_below(290.0, 290.0, 30.0).is_none());
+    }
+
+    #[test]
+    fn surf_maps_lift_the_faces_drawn_with_their_texture() {
+        // red 0, 1, 0.5 and 1 along u: down 2 cm, up 2 cm, level, up 2 cm
+        let rgba: Vec<u8> = [0u8, 255, 128, 255].iter().flat_map(|&r| [r, 0, 0, 255]).collect();
+        let map = std::sync::Arc::new(HeightMap::from_rgba(4, 1, &rgba).unwrap());
+        assert!((map.lift(Vec2::new(0.0, 0.3)) + 0.02).abs() < 1e-6);
+        assert!((map.lift(Vec2::new(0.25, 0.0)) - 0.02).abs() < 1e-6);
+        assert!(map.lift(Vec2::new(0.5, 0.0)).abs() < 1e-3);
+        // tiled: 1.25 is 0.25; past the last texel's start the position stops there and
+        // the second last texel (0.5) is read, not the next tile's first one
+        assert!((map.lift(Vec2::new(1.25, 0.0)) - 0.02).abs() < 1e-6);
+        assert!(map.lift(Vec2::new(0.875, 0.0)).abs() < 1e-3);
+        // a spline's two faces: the one in the slot of a texture with a map is lifted, the
+        // other one not; u runs 0..1 over 10 m in x
+        let mesh = MeshData {
+            positions: vec![
+                Vec3::new(0.0, 0.0, 1.0), Vec3::new(10.0, 0.0, 1.0), Vec3::new(0.0, 10.0, 1.0),
+                Vec3::new(20.0, 0.0, 1.0), Vec3::new(30.0, 0.0, 1.0), Vec3::new(20.0, 10.0, 1.0),
+            ],
+            uvs: vec![
+                Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0),
+                Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0),
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5],
+            ranges: vec![(0, 3, 1), (3, 3, 0)],
+            ..Default::default()
+        };
+        let surf = SurfFaces::of(&mesh, &[None, Some(map)]).unwrap();
+        assert!(SurfFaces::of(&mesh, &[None, None]).is_none());
+        // (the drive mesh keeps only the shape, as the tile loader stages it)
+        let shape = MeshData { positions: mesh.positions.clone(), indices: mesh.indices.clone(), ..Default::default() };
+        let mut ts = TileSurface::new(64);
+        ts.add_spline_drive(&shape, Some(&surf), DVec3::ZERO, 0, 0);
+        ts.finish();
+        let at = |x: f32| ts.drive.probe(x, 1.0, 2.0).below.unwrap();
+        assert!((at(2.5) - 1.02).abs() < 1e-4);
+        assert!((at(0.1) - 0.98).abs() < 2e-3);
+        assert!((at(22.5) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1786,6 +1836,82 @@ fn plan_weights(a: Vec3, b: Vec3, c: Vec3, x: f32, y: f32, tol: f32) -> Option<(
     (out(l1, edge(b, c)) && out(l2, edge(c, a)) && out(l3, edge(a, b))).then_some((l1, l2, l3))
 }
 
+/// A `.surf` map: a picture beside a road texture (`str_kopfgr01.bmp.surf`) whose red
+/// channel lies over that texture's own coordinates. Where a wheel stands on a face drawn
+/// with the texture, OMSI 2 moves the ground by [`HeightMap::AMPLITUDE`] × (2·red − 1):
+/// cobbles, slabs and broken asphalt shake the bus over a face that is flat (#886).
+#[derive(Debug, Clone, Default)]
+pub struct HeightMap {
+    pub width: usize,
+    pub height: usize,
+    /// The red channel, row by row from the top (v = 0).
+    pub red: Vec<u8>,
+}
+
+impl HeightMap {
+    /// How far the ground moves at full red or black (m).
+    pub const AMPLITUDE: f32 = 0.02;
+
+    /// From an RGBA picture (row by row from the top).
+    pub fn from_rgba(width: usize, height: usize, rgba: &[u8]) -> Option<HeightMap> {
+        (width > 0 && height > 0 && rgba.len() >= width * height * 4)
+            .then(|| HeightMap { width, height, red: rgba.chunks_exact(4).take(width * height).map(|p| p[0]).collect() })
+    }
+
+    /// The ground's lift (m) at texture coordinates `uv`, tiled and filtered between four
+    /// texels as OMSI 2 reads it: no wrap at the picture's edge - the position stops at the
+    /// last texel, and there the second last is read (a strip one texel wide, level).
+    pub fn lift(&self, uv: Vec2) -> f32 {
+        let at = |t: f32, n: usize| {
+            let p = (t.rem_euclid(1.0) * n as f32).min(n as f32 - 1.0);
+            let f = p - p.floor();
+            let i = (p as usize).min(n.saturating_sub(2));
+            (i, (i + 1).min(n - 1), f)
+        };
+        let (x0, x1, fx) = at(uv.x, self.width);
+        let (y0, y1, fy) = at(uv.y, self.height);
+        let r = |x: usize, y: usize| self.red[y * self.width + x] as f32 / 255.0;
+        let top = r(x0, y0) * (1.0 - fx) + r(x1, y0) * fx;
+        let bottom = r(x0, y1) * (1.0 - fx) + r(x1, y1) * fx;
+        Self::AMPLITUDE * (2.0 * (top * (1.0 - fy) + bottom * fy) - 1.0)
+    }
+}
+
+/// The `.surf` maps a mesh's faces are drawn with: its texture coordinates and material
+/// ranges (as in its [`MeshData`]) and the map of each material slot's texture (none past
+/// the end). Kept beside a mesh whose own ranges mean something else (a spline's drive mesh).
+#[derive(Debug, Clone, Default)]
+pub struct SurfFaces {
+    pub uvs: Vec<Vec2>,
+    pub ranges: Vec<(u32, u32, u32)>,
+    pub maps: Vec<Option<std::sync::Arc<HeightMap>>>,
+}
+
+impl SurfFaces {
+    /// Only where a texture has a map, and the mesh texture coordinates to lay it on.
+    pub fn of(mesh: &MeshData, maps: &[Option<std::sync::Arc<HeightMap>>]) -> Option<SurfFaces> {
+        (maps.iter().any(Option::is_some) && mesh.uvs.len() == mesh.positions.len())
+            .then(|| SurfFaces { uvs: mesh.uvs.clone(), ranges: mesh.ranges.clone(), maps: maps.to_vec() })
+    }
+
+    /// The map and corner texture coordinates of face `j` (indices `tri`).
+    fn face(&self, j: usize, tri: &[u32]) -> Option<(&std::sync::Arc<HeightMap>, [Vec2; 3])> {
+        let first = (j * 3) as u32;
+        let r = self.ranges.iter().find(|r| first >= r.0 && first < r.0 + r.1)?;
+        let m = self.maps.get(r.2 as usize)?.as_ref()?;
+        let uv = [0, 1, 2].map(|k| self.uvs.get(tri[k] as usize).copied());
+        Some((m, [uv[0]?, uv[1]?, uv[2]?]))
+    }
+
+    /// Bytes held on the heap (the maps are shared).
+    pub fn heap_bytes(&self) -> usize {
+        self.uvs.capacity() * 8 + self.ranges.capacity() * 12 + self.maps.capacity() * 8
+    }
+}
+
+/// A triangle without a `.surf` map in [`DriveGrid`].
+const NO_BUMP: u32 = u32::MAX;
+
 /// Upward-facing triangles of one tile (tile-local x/y in metres, absolute z), bucketed on a
 /// coarse grid so that a wheel asks only the few faces around it.
 #[derive(Debug, Clone, Default)]
@@ -1794,6 +1920,11 @@ pub struct DriveGrid {
     /// Per triangle: a wall top ([`is_wall_top`]), never stood on - a wall where it stands
     /// over the ground (see [`DriveGrid::probe_walls`]).
     pub ridge: Vec<bool>,
+    /// Per triangle: its entry in `bumps`, or `NO_BUMP` where its texture has no `.surf`.
+    bump_of: Vec<u32>,
+    /// The `.surf` map (index into `maps`) and the texture coordinates of the corners.
+    bumps: Vec<(u32, [Vec2; 3])>,
+    maps: Vec<std::sync::Arc<HeightMap>>,
     cells: usize,
     cell: f32,
     /// Per cell, the range of `items` that lists its triangles (`cells² + 1` offsets).
@@ -1807,7 +1938,7 @@ impl DriveGrid {
 
     /// Bytes the grid holds on the heap.
     pub fn heap_bytes(&self) -> usize {
-        self.tris.capacity() * std::mem::size_of::<[Vec3; 3]>() + self.ridge.capacity() + self.start.capacity() * 4 + self.items.capacity() * 4
+        self.tris.capacity() * std::mem::size_of::<[Vec3; 3]>() + self.ridge.capacity() + self.bump_of.capacity() * 4 + self.bumps.capacity() * std::mem::size_of::<(u32, [Vec2; 3])>() + self.start.capacity() * 4 + self.items.capacity() * 4
     }
 
     /// Add a triangle; walls (faces steeper than about 70°) are left out, they are nothing
@@ -1817,14 +1948,35 @@ impl DriveGrid {
     }
 
     /// Add a triangle, a wall top or not.
-    pub fn push_kind(&mut self, p: [Vec3; 3], ridge: bool) {
+    pub fn push_kind(&mut self, p: [Vec3; 3], ridge: bool) -> bool {
         let nrm = (p[1] - p[0]).cross(p[2] - p[0]);
         let len = nrm.length();
         if len < 1e-6 || nrm.z.abs() / len < 0.3 {
-            return;
+            return false;
         }
         self.tris.push(p);
         self.ridge.push(ridge);
+        self.bump_of.push(NO_BUMP);
+        true
+    }
+
+    /// Add a triangle drawn with a texture that has a `.surf` map, with the texture
+    /// coordinates of its corners.
+    pub fn push_surf(&mut self, p: [Vec3; 3], uv: [Vec2; 3], map: &std::sync::Arc<HeightMap>) {
+        if !self.push_kind(p, false) {
+            return;
+        }
+        let m = match self.maps.iter().position(|m| std::sync::Arc::ptr_eq(m, map)) {
+            Some(m) => m,
+            None => {
+                self.maps.push(map.clone());
+                self.maps.len() - 1
+            }
+        };
+        if let Some(b) = self.bump_of.last_mut() {
+            *b = self.bumps.len() as u32;
+        }
+        self.bumps.push((m as u32, uv));
     }
 
     /// Bucket the triangles of a tile `tile` metres wide; those entirely outside are dropped.
@@ -1835,8 +1987,10 @@ impl DriveGrid {
         let mut ranges: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(self.tris.len());
         let mut keep = Vec::with_capacity(self.tris.len());
         let mut keep_ridge = Vec::with_capacity(self.tris.len());
+        let mut keep_bump = Vec::with_capacity(self.tris.len());
         self.ridge.resize(self.tris.len(), false);
-        for (t, r) in self.tris.iter().zip(self.ridge.iter()) {
+        self.bump_of.resize(self.tris.len(), NO_BUMP);
+        for ((t, r), b) in self.tris.iter().zip(self.ridge.iter()).zip(self.bump_of.iter()) {
             // (bucketed with the seam tolerance round it: a point that close is on it)
             let e = SEAM_TOLERANCE;
             let (lo_x, hi_x) = (t[0].x.min(t[1].x).min(t[2].x) - e, t[0].x.max(t[1].x).max(t[2].x) + e);
@@ -1848,9 +2002,11 @@ impl DriveGrid {
             ranges.push((c(lo_x), c(hi_x), c(lo_y), c(hi_y)));
             keep.push(*t);
             keep_ridge.push(*r);
+            keep_bump.push(*b);
         }
         self.tris = keep;
         self.ridge = keep_ridge;
+        self.bump_of = keep_bump;
         let mut count = vec![0u32; n * n + 1];
         for &(x0, x1, y0, y1) in &ranges {
             for y in y0..=y1 {
@@ -1926,7 +2082,11 @@ impl DriveGrid {
             }
             let [a, b, c] = self.tris[i as usize];
             let Some((l1, l2, l3)) = plan_weights(a, b, c, x, y, SEAM_TOLERANCE) else { continue };
-            out = out.merge(Probe::of(l1 * a.z + l2 * b.z + l3 * c.z, z_top));
+            let mut z = l1 * a.z + l2 * b.z + l3 * c.z;
+            if let Some(&(m, uv)) = self.bump_of.get(i as usize).and_then(|&b| self.bumps.get(b as usize)) {
+                z += self.maps[m as usize].lift(uv[0] * l1 + uv[1] * l2 + uv[2] * l3);
+            }
+            out = out.merge(Probe::of(z, z_top));
         }
         out
     }
@@ -2148,26 +2308,46 @@ impl TileSurface {
     /// object with a `[collision_mesh]` (a traffic island) that cuts no ground. The probe
     /// takes the highest face below the axle, so a bridge deck overhead is never picked.
     pub fn add_drive_mesh(&mut self, mesh: &MeshData, transform: &Mat4, origin: DVec3, tx: i32, ty: i32) {
+        self.add_drive_mesh_surf(mesh, transform, origin, tx, ty, None);
+    }
+
+    /// [`TileSurface::add_drive_mesh`] with the `.surf` maps of the mesh's textures: the
+    /// faces drawn with one carry it.
+    pub fn add_drive_mesh_surf(&mut self, mesh: &MeshData, transform: &Mat4, origin: DVec3, tx: i32, ty: i32, surf: Option<&SurfFaces>) {
         let ident = *transform == Mat4::IDENTITY;
         let off = (origin - DVec3::new(tx as f64 * tile_size(), ty as f64 * tile_size(), 0.0)).as_vec3();
-        for tri in mesh.indices.chunks_exact(3) {
+        for (j, tri) in mesh.indices.chunks_exact(3).enumerate() {
             let mut p = [Vec3::ZERO; 3];
             for k in 0..3 {
                 let v = mesh.positions[tri[k] as usize];
                 p[k] = (if ident { v } else { transform.transform_point3(v) }) + off;
             }
-            self.drive.push(p);
+            match surf.and_then(|s| s.face(j, tri)) {
+                Some((m, uv)) => self.drive.push_surf(p, uv, m),
+                None => self.drive.push(p),
+            }
         }
     }
 
     /// Add a spline's height profiles ([`build_height_profile_mesh`]): its wall tops (the
     /// range of material 1) go in as walls.
     pub fn add_height_profiles(&mut self, mesh: &MeshData, origin: DVec3, tx: i32, ty: i32) {
+        self.add_spline_drive(mesh, None, origin, tx, ty);
+    }
+
+    /// [`TileSurface::add_height_profiles`] for a spline's drawn mesh, with the `.surf` maps
+    /// of its textures where it has any.
+    pub fn add_spline_drive(&mut self, mesh: &MeshData, surf: Option<&SurfFaces>, origin: DVec3, tx: i32, ty: i32) {
         let off = (origin - DVec3::new(tx as f64 * tile_size(), ty as f64 * tile_size(), 0.0)).as_vec3();
         let ridge_from = mesh.ranges.iter().find(|r| r.2 == 1).map(|r| r.0 as usize).unwrap_or(usize::MAX);
         for (j, tri) in mesh.indices.chunks_exact(3).enumerate() {
             let p = [0, 1, 2].map(|k| mesh.positions[tri[k] as usize] + off);
-            self.drive.push_kind(p, j * 3 >= ridge_from);
+            match surf.and_then(|s| s.face(j, tri)) {
+                Some((m, uv)) => self.drive.push_surf(p, uv, m),
+                None => {
+                    self.drive.push_kind(p, j * 3 >= ridge_from);
+                }
+            }
         }
     }
 
@@ -2634,5 +2814,40 @@ mod ray_hit_tests {
         assert!((h.t - 3.0).abs() < 1e-4);
         assert!((h.uv - Vec2::new(0.75, 0.375)).length() < 1e-4, "{:?}", h.uv);
         assert_eq!(ray_mesh_hit(Vec3::new(11.0, -3.0, 0.5), Vec3::Y, &m, &xf).map(|h| h.t), ray_mesh(Vec3::new(11.0, -3.0, 0.5), Vec3::Y, &m, &xf));
+    }
+}
+
+
+#[cfg(test)]
+mod winding_transform_tests {
+    use super::*;
+
+    #[test]
+    fn positive_near_identity_scale_keeps_authored_winding() {
+        let v = |x: f32, y: f32| omsi_o3d::Vertex {
+            position: Vec3::new(x, y, 1.0),
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            uv: Vec2::ZERO,
+        };
+        let mesh = omsi_o3d::Mesh {
+            vertices: vec![v(0.0, 0.0), v(0.0, 1.0), v(1.0, 0.0), v(1.0, 1.0)],
+            triangles: vec![
+                omsi_o3d::Triangle {
+                    indices: [0, 1, 2],
+                    material: 0,
+                },
+                omsi_o3d::Triangle {
+                    indices: [2, 1, 3],
+                    material: 0,
+                },
+            ],
+            materials: vec![omsi_o3d::Material::default()],
+            transform: glam::Mat4::from_scale(Vec3::new(0.918_948, 0.951_776, 1.0)),
+            has_transform: true,
+            ..Default::default()
+        };
+        assert_eq!(positive_det_faces_forward(&mesh), Some(false));
+        assert!(!turns_round(&mesh));
+        assert_eq!(mesh_from_o3d(&mesh).indices[..3], [0, 1, 2]);
     }
 }

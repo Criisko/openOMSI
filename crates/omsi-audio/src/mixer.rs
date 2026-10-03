@@ -147,15 +147,22 @@ impl Shared {
         let frames = out.len() / ch;
         let rate = self.sample_rate.load(Ordering::Relaxed).max(1);
         let dev_rate = rate as f64;
-        // More voices than OMSI's `[sound_maxcount]` (200 by default): keep `[important]`
-        // sounds first, then the ordinary voices that reach the listener loudest. Voices
-        // left out still advance in time, so a loop comes back at the right phase.
+        // More voices than OMSI's `[sound_maxcount]` (200 by default): as Omsi.exe, the
+        // nearest sounds are kept and the far ones cut - by distance, which does not change
+        // from one block to the next, not by loudness, which follows every volume curve and
+        // cut voices in and out at the edge of the list (sounds breaking off in traffic).
+        // `[important]` ones and the non-spatial ones (the driven bus heard from inside, the
+        // interface) are never cut. Voices left out still advance in time, so a loop comes
+        // back at the right phase.
         let mixed: Option<Vec<bool>> = if voices.iter().filter(|v| !v.finished && v.stream.is_none()).count() > MAX_VOICES {
             let mut ranked: Vec<(bool, f32, usize)> = voices
                 .iter()
                 .enumerate()
                 .filter(|(_, v)| !v.finished && v.stream.is_none())
-                .map(|(i, v)| (v.params.important, heard_gain(v, &listener), i))
+                .map(|(i, v)| {
+                    let near = v.params.position.map_or(0.0, |p| (p - listener.position).length());
+                    (v.params.important || v.params.position.is_none(), -near, i)
+                })
                 .collect();
             ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
             let mut keep = vec![false; voices.len()];
@@ -335,10 +342,6 @@ fn apply_params(v: &mut Voice, params: VoiceParams, now: std::time::Instant, lis
 pub const MAX_VOICES: usize = 200;
 
 /// How loud voice `v` reaches the listener (its gain and distance), to rank voices by.
-fn heard_gain(v: &Voice, listener: &Listener) -> f32 {
-    let spatial = v.params.position.map(|p| distance_gain(v.params.range, (p - listener.position).length())).unwrap_or(1.0);
-    v.params.gain * spatial
-}
 
 /// Move a clip voice on by `frames` output frames without mixing it (looping or ending as
 /// it would have).
@@ -843,36 +846,47 @@ mod tests {
         assert!(!e.reopen.load(Ordering::Relaxed));
     }
 
+    /// A voice at `d` metres in front of the listener, heard at full gain whatever `d` is.
+    fn far_voice(clip: Arc<Clip>, d: f32) -> Voice {
+        let mut v = voice(clip, 1.0);
+        v.params.position = Some(Vec3::new(0.0, 0.0, -d));
+        v.params.range = 1.0e6;
+        v.params.doppler = false;
+        v
+    }
+
     #[test]
     fn important_voices_win_the_mixer_limit() {
         let clip = Arc::new(Clip { sample_rate: 48_000, channels: 1, samples: vec![64; 100] });
         let s = shared();
         for _ in 0..MAX_VOICES {
-            s.voices.lock().push(voice(clip.clone(), 1.0));
+            s.voices.lock().push(far_voice(clip.clone(), 10.0));
         }
-        let mut quiet_important = voice(clip, 0.001);
-        quiet_important.id = 9_999;
-        quiet_important.params.important = true;
-        s.voices.lock().push(quiet_important);
+        // the farthest of all, but [important]: it stays, one of the near ones goes
+        let mut far_important = far_voice(clip, 500.0);
+        far_important.id = 9_999;
+        far_important.params.important = true;
+        s.voices.lock().push(far_important);
         let mut out = vec![0.0f32; 16];
         s.render(&mut out);
-        let expect = ((MAX_VOICES - 1) as f32 + 0.001) * 64.0 / 32_768.0;
-        assert!((out[0] - expect).abs() < 1e-4, "{} vs {expect}", out[0]);
+        let expect = MAX_VOICES as f32 * 64.0 / 32_768.0;
+        assert!((out[0] - expect).abs() < 1e-3, "{} vs {expect}", out[0]);
     }
 
     #[test]
-    fn only_the_loudest_voices_are_mixed() {
+    fn the_nearest_voices_are_mixed_and_the_driven_bus_is_never_cut() {
         let clip = Arc::new(Clip { sample_rate: 48_000, channels: 1, samples: vec![64; 100] });
         let s = shared();
+        // 50 far voices, MAX_VOICES near ones, and the bus's own (non-spatial) at half gain
         for k in 0..MAX_VOICES + 50 {
-            s.voices.lock().push(voice(clip.clone(), if k < 50 { 0.001 } else { 1.0 }));
+            s.voices.lock().push(far_voice(clip.clone(), if k < 50 { 900.0 } else { 5.0 }));
         }
+        s.voices.lock().push(voice(clip, 0.5));
         let mut out = vec![0.0f32; 16];
         s.render(&mut out);
-        // the 50 quiet ones stayed out: exactly MAX_VOICES at full gain
-        let expect = MAX_VOICES as f32 * 64.0 / 32_768.0;
+        // the bus kept, then the nearest: MAX_VOICES - 1 near ones at full gain + 0.5
+        let expect = ((MAX_VOICES - 1) as f32 + 0.5) * 64.0 / 32_768.0;
         assert!((out[0] - expect).abs() < 1e-3, "{} vs {expect}", out[0]);
-        assert_eq!(s.voices.lock().len(), MAX_VOICES + 50);
     }
 }
 

@@ -109,7 +109,8 @@ The mouse wheel (and **=** / **-**, a pinch on a phone) zooms: outside the camer
 inside the bus the view narrows, as in OMSI; **Ctrl**+wheel outside narrows the view instead
 (a telephoto, the camera stays where it is). F1-F4 driver / passenger / outside / map (free) camera, F5-F8 the destination
 sign and roller blind keys as in OMSI, Ctrl+S quick save, F9 write the run into the personnel
-file, WASD+QE in the free camera, left click on cockpit elements, **V** the chat line in a
+file, WASD+QE in the free camera (**Ctrl**+click on the ground there moves the bus to the
+nearest street), left click on cockpit elements, **V** the chat line in a
 LAN session. Esc opens the game menu: drive the next placed vehicle, place any vehicle of
 the installation in front of the camera (or beside the bus), couple what stands close behind
 the bus and uncouple it again, save the situation or load the quicksave, the next weather, the clock an hour on or back, refuel and wash (only at a
@@ -154,6 +155,10 @@ again only when something changes; drag on it to turn the bus, scroll to zoom. I
   It is enabled by default and can be turned off under Settings → General; the switch
   affects the launcher immediately and the game on its next start. Discord must be running
   on the same computer.
+  **Voice chat through GreenTeaSpeak** (on by default): in multiplayer, the other players
+  are heard from where they are, when GreenTeaSpeak 2 runs with the openOMSI plugin and the
+  server names a voice channel (see [SERVER.md](SERVER.md) and
+  `tools/greenteaspeak-plugin/README.md`).
 * **Controls** - `Inputs/keyboard.cfg`: click a key, press the new one; clashes are red. The
   keys are the game's with *Driving keys: Custom controls* (Settings → Driving); with a ready-made
   layout (W A S D, arrows) those keys drive and win over the list - the page says so, and
@@ -283,14 +288,20 @@ lit cumulus) that also lights the scene, contact-hardening sun shadows, aerial p
 and height fog, automatic exposure, a glow only real highlights produce and the PBR
 Neutral tone curve with FXAA (`post_aa`); no light shafts, vignette or grading.
 
-The enhanced renderer also reflects buses, buildings and scenery in wet road puddles
-when `reflections=1`. Shallow rain ripples and depth-aware filtering soften the image.
+Vanilla, Vanilla+ and Enhanced reflect buses, buildings and scenery in wet road puddles
+when `reflections=1`, each using its own lighting. Depth-aware filtering softens the image;
+Enhanced also shades shallow rain ripples.
 The player's nearby bus and up to three coupled sections use one local geometry capture,
 mirrored around the actual road face's height and slope. Its windows are shaded from the
 reflected eye, and an open legacy chassis gets a dark underside in that same depth-tested
 view. This avoids mixing offset screen-space and geometry projections on the bus.
 Other objects use the current frame's colour and a private hit-depth texture that includes
-reflective windows. Rays run at half resolution, capped at 518400 pixels and 48 steps;
+reflective windows. From inside the bus, its own panes let the rays reach the street;
+glass tint and rain films attenuate the reflection along with the scene behind them.
+Vanilla blends wet-road reflections and fog in the original encoded colour space.
+Rain drops refract a separate, full-resolution copy of the current scene, including
+its puddle reflections, so wet glass and moving wipers do not feed back into later frames.
+Rays run at half resolution, capped at 518400 pixels and 48 steps;
 the local bus capture has the same pixel cap and a 60 m distance limit. Dry roads,
 snow-covered roads and mirror views skip these passes. Reflections beyond the local road
 plane use screen-space rays; objects unavailable to those rays keep the sky reflection.
@@ -379,6 +390,57 @@ only in winter, no cold presets in summer.
 Weather presets (`Weather/*.owt`) change the light: overcast takes the sun away, rain and
 fog thicken the air, a snow preset puts any map into its winter textures with snow cover.
 
+## Radio
+
+OMSI plays no music itself: a bus's radio only sets variables that radio plugins turn into
+sound. openOMSI plays internet radio for them, with no plugin needed.
+
+**Which buses.** Every bus whose radio sets `Snd_Radio` (the cassette player of the stock
+SD200/SD202/NL and of many mods: it plays the first station) or `SndExt_Radio` (the radios
+made for the Sound Extension plugin: station button *n* plays the *n*-th station, the volume
+knob `SndVol_Radio` sets how loud). Switch the radio on in the cockpit as in OMSI; the
+screen says which station plays and the song when the stream names it.
+
+**Your stations.** `~/.openomsi/radio.cfg` (on Windows `C:\Users\<you>\.openomsi\radio.cfg`)
+is written with a few stations the first time the game starts. One station a line, the
+first line on the first button:
+
+```
+volume = 0.7
+Radiozurnal = https://rozhlas.stream/radiozurnal.mp3
+Evropa 2 = https://ice.actve.net/fm-evropa2-128
+My playlist = https://example.org/station.m3u
+```
+
+A station is an MP3, AAC or Ogg stream, or an `.m3u` / `.pls` playlist that points to one.
+The address is the one a media player opens - on the station's website, or in a directory
+such as radio-browser.info. Streams in HE-AAC with a program config element (some `.aacp`
+stations) cannot be played. `volume` (0..1) is the radio's loudness on top of the knob.
+The file is read when the game starts.
+
+**Stations of a radio plugin.** Stations already set up for an OMSI radio plugin (SuperRadio
+and the like) are taken over: every line with an http(s) address in the text files under
+`plugins` is a station, after those of `radio.cfg`.
+
+**Shift+R** moves the whole list one station on, so that the buttons reach the stations
+behind the first ones.
+
+**A map's stations.** A map may bring a `radio.cfg` of its own beside its `global.cfg`: its
+stations come first on the buttons while you drive on that map, yours after them. It may
+also name the frequency each station is on at places of the map - see
+[Modding: Radio](MODDING.md#radio-a-maps-stations-and-a-buss-display).
+
+**The radio's display.** A radio with a text display shows the station and the song,
+running through its line where they do not fit (ten characters on Dmitrij's "Magnitola" of
+P3ta's SOR buses and its kin, whose first line then shows the map's frequency for the
+place, e.g. `94.6 MHz`). Without stations, or with the radio off, a display shows its own texts.
+
+**When nothing plays.** `~/.openomsi/game.log` says what happened:
+`radio: 23 stations` (the list), `radio: station 1 Radiozurnal (https://…)` (a button
+pressed), then `Radio 1: Radiozurnal - buffering …` and the song, or `no signal (…)` with
+the reason - mostly an address that is not a stream or a station that is down. No `radio:
+station` line at all means the bus's radio sets neither variable.
+
 ## Performance
 
 `OMSI_PROFILE=1 … --exit-after N` prints the frame split (render, mirrors, traffic, people,
@@ -451,6 +513,7 @@ Environment variables, all off unless set. The useful ones:
 | `OMSI_FLEET_IDLE=s`, `OMSI_FLEET_AHEAD=min` | how long an unused vehicle set is kept, how far ahead the fleet is read |
 | `OMSI_NO_BC=1`, `OMSI_NO_TEXCOMPRESS=1`, `OMSI_KEEP_ALLOCATOR=1` | textures as RGBA, no compression of loose pictures, no allocator restart |
 | `OMSI_NO_SHADOWS`, `OMSI_NO_CORONAS`, `OMSI_NO_ENVMAP`, `OMSI_NO_BUMP`, `OMSI_NO_CULL`, `OMSI_ENV_PHOTO=0` | leave one part of the picture out for an A/B |
+| `OMSI_NO_SURF=1` | roads without the bumps of their textures' `.surf` maps (A/B) |
 | `OMSI_NO_PUDDLE_REFLECTIONS=1` | leave wet-road scene reflections out for a screenshot or performance comparison |
 | `OMSI_DEBUG_ENHANCED`, `OMSI_DEBUG_SKY`, `OMSI_DEBUG_EXPOSURE`, `OMSI_METER=…` | the enhanced renderer's lamps, sky, adaptation and metering |
 | `OMSI_DEBUG_TRAFFIC`, `OMSI_DEBUG_PAX`, `OMSI_DEBUG_PHYSICS`, `OMSI_DEBUG_LAN`, `OMSI_DEBUG_IBIS`, `OMSI_DEBUG_VARS=a,b` | why a car, a passenger, a wheel, a peer, an IBIS or a script variable does what it does |
@@ -465,6 +528,7 @@ Environment variables, all off unless set. The useful ones:
 | `OMSI_STREAMLINE_DIR=dir`, `OMSI_DLSS_VERBOSE=1` | where Streamline's DLLs are (the game's folder by default), and all of Streamline's log |
 | `OMSI_DLSS_JITTER_SIGN=-1` | tell DLSS the sub-pixel offset the other way round (a picture that shimmers or smears on every edge with DLSS) |
 | `OMSI_GPU_LIMITS=default\|downlevel` | pretend the graphics card can only do this much (tests of old cards) |
+| `OMSI_GPU_ARRAYS=textures\|nostorage` | read the scene's arrays from textures, as on OpenGL chips without storage buffers in the vertex shader (or without any: no per-pixel lamp light) - tests of old cards |
 | `OMSI_RENDER_OCCLUDED=1` | draw even while the window is hidden (tests) |
 | `OMSI_CHECK_OBSTACLES=1` | offscreen: drive every lane as a bus and list the objects that would stop it |
 | `OMSI_DEBUG_REPEATERS=1` | list the spline object rows whose start the map and the spline chain disagree about |

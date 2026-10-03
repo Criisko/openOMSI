@@ -12,6 +12,8 @@ export OPENOMSI_VERSION="${OPENOMSI_VERSION:-$(sh scripts/version.sh 2>/dev/null
 cargo build --locked --release -p omsi-app
 mkdir -p "$dest"
 cp target/release/openomsi "$dest/openomsi"
+# (Steam's library beside it, x86-64 only: the program does not start without it there)
+[ -f target/release/libsteam_api.so ] && cp target/release/libsteam_api.so "$dest/"
 cp scripts/server/start.sh "$dest/start.sh"
 cp docs/SERVER.md "$dest/README.md"
 chmod +x "$dest/start.sh" "$dest/openomsi"

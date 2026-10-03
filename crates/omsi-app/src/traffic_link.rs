@@ -71,6 +71,7 @@ pub(crate) fn traffic_inputs(
     t: &mut traffic::Traffic,
     cam: Option<&Camera>,
     aspect: f64,
+    extent: Option<(f64, f64)>,
     fog: f64,
     clock: &omsi_sim::SimClock,
     humans: Option<&humans::Humans>,
@@ -80,6 +81,7 @@ pub(crate) fn traffic_inputs(
     if let Some(c) = cam {
         t.viewer = Some(
             traffic::Viewer::new(c, aspect, fog)
+                .with_extent(extent)
                 .with_culling(render.min_obj_size, render.max_obj_dist),
         );
     }

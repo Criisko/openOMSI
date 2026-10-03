@@ -23,7 +23,8 @@
 //! `OMSI_UPDATE_URL=<url or file:///…json>` points the check at another release description
 //! (for testing: a file in the GitHub API's format whose asset URLs may be `file://` too),
 //! `OMSI_NO_UPDATE=1` switches the check off. A development build (run from a cargo `target`
-//! folder) checks, but never replaces itself.
+//! folder) checks, but never replaces itself. A pull request's test build (a version such as
+//! `0.1.1313-pr1192`) is never offered a release: it would replace the build being tested.
 
 // (a phone installs through the system: the unpacking and swapping below are the computers')
 #![cfg_attr(target_os = "android", allow(dead_code))]
@@ -181,6 +182,11 @@ fn version_parts(v: &str) -> Vec<u64> {
     v.trim().trim_start_matches(['v', 'V']).split(['.', '-', '+']).map_while(|p| p.parse::<u64>().ok()).collect()
 }
 
+/// A pull request's test build: `release.yml` gives it the version `<release>-pr<number>`.
+pub fn is_test_build(version: &str) -> bool {
+    version.contains("-pr")
+}
+
 /// Whether `candidate` is a newer version than `current`.
 pub fn newer(candidate: &str, current: &str) -> bool {
     let (mut a, mut b) = (version_parts(candidate), version_parts(current));
@@ -249,6 +255,10 @@ pub fn latest() -> anyhow::Result<Option<Release>> {
 fn parse_release(v: &serde_json::Value, current: &str) -> anyhow::Result<Option<Release>> {
     let tag = v["tag_name"].as_str().ok_or_else(|| anyhow::anyhow!("the release has no tag"))?;
     let version = tag.trim_start_matches(['v', 'V']).to_string();
+    if is_test_build(current) {
+        log::info!("update check: {current} is a pull request's test build, {version} is not offered");
+        return Ok(None);
+    }
     if v["draft"].as_bool() == Some(true) || v["prerelease"].as_bool() == Some(true) || !newer(&version, current) {
         return Ok(None);
     }
@@ -682,6 +692,9 @@ mod tests {
         let mut n = v.clone();
         n["assets"] = serde_json::json!([]);
         assert!(parse_release(&n, "0.1.7").unwrap().is_none());
+        // a pull request's test build keeps itself, however new the release
+        assert!(parse_release(&v, "0.1.7-pr12").unwrap().is_none());
+        assert!(is_test_build("0.1.1313-pr1192") && !is_test_build("0.1.1313"));
     }
 
     #[test]

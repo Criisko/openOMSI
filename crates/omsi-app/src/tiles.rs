@@ -258,6 +258,21 @@ impl MapIndex {
                     let Some(first) = row_start(a, s, None).and_then(|st| place_on(a, s, origin, None, st).into_iter().next()) else { continue };
                     part.objects.entry(a.id).or_insert(((*tx, *ty), first.pose.pos, [first.pose.heading(), 0.0, 0.0]));
                 }
+                // an object hung on another (`[attachObj]`: the stops of Ahlheim and many
+                // other maps hang on their shelters): at its parent's place - a few metres
+                // off at most, and the placed object gives the exact place once its tile is
+                // loaded. They were in no index at all: a duty's stop beyond the loaded tiles
+                // had no place, never showed on the map and was never reached (#1014, #975).
+                for o in &tile.attach_objects {
+                    let Some(parent) = o.parent_id.and_then(|id| part.objects.get(&id).copied()) else { continue };
+                    part.objects.entry(o.id).or_insert(((*tx, *ty), parent.1, [parent.2[0] + o.rot[0], 0.0, 0.0]));
+                    if o.extra.len() >= 2 {
+                        part.stop_weights.insert(o.id, stop_exit_weight(&o.extra));
+                        part.stop_enter.insert(o.id, stop_enter(&o.extra));
+                        part.stop_side.insert(o.id, stop_side(&o.extra));
+                        part.stop_length.insert(o.id, stop_length(&o.extra));
+                    }
+                }
                 part.tiles_read = 1;
                 Some((part, rows, lights))
             })
@@ -768,6 +783,17 @@ fn tile_candidates(
     candidates
 }
 
+fn initial_stall_due(
+    stalled_for: std::time::Duration,
+    since_last_stall: Option<std::time::Duration>,
+) -> bool {
+    stalled_for >= std::time::Duration::from_secs(15)
+        && match since_last_stall {
+            Some(age) => age >= std::time::Duration::from_secs(30),
+            None => true,
+        }
+}
+
 /// Loads the tiles around a few points as they move (the camera, and the player's bus,
 /// which must not lose the ground under it when the free camera flies off), like OMSI's
 /// tile streaming: the tiles within `load_radius` of any of them are read, tessellated and
@@ -803,6 +829,15 @@ pub struct Streamer {
     pub slow_frames: usize,
     started: std::time::Instant,
     last_summary: std::time::Instant,
+    /// First-area diagnostics are deliberately tiny: one progress line per tile and a
+    /// rate-limited stall line. They exist only while the loading screen is up.
+    initial_last_done: usize,
+    initial_last_progress: std::time::Instant,
+    initial_last_stall_log: Option<std::time::Instant>,
+    /// The worker batch currently being prepared, for a useful stall message.
+    inflight_batch: Option<(Vec<(i32, i32)>, std::time::Instant)>,
+    /// One initial tile may take several frames to upload/place; time it across those frames.
+    initial_upload: Option<((i32, i32), std::time::Instant)>,
     /// Tiles loaded and unloaded when the heap's free pages were last given back, and when.
     relieved_at: (usize, usize, std::time::Instant),
 }
@@ -839,6 +874,11 @@ impl Streamer {
             slow_frames: 0,
             started: std::time::Instant::now(),
             last_summary: std::time::Instant::now(),
+            initial_last_done: 0,
+            initial_last_progress: std::time::Instant::now(),
+            initial_last_stall_log: None,
+            inflight_batch: None,
+            initial_upload: None,
             relieved_at: (0, 0, std::time::Instant::now()),
         };
         let first: hashbrown::HashSet<(i32, i32)> = s.tiles.iter().filter(|t| Self::nearest(centers, t.0, t.1) <= initial_radius.min(load_radius)).map(|t| (t.0, t.1)).collect();
@@ -912,6 +952,14 @@ impl Streamer {
         let mut changed = false;
         while let Ok((asked, prepared, stats, secs)) = self.rx.try_recv() {
             self.inflight = false;
+            if let Some((keys, started)) = self.inflight_batch.take() {
+                let elapsed = started.elapsed().as_secs_f64();
+                if elapsed >= 2.0 {
+                    log::warn!("tile loading: first-area worker batch {:?} returned after {:.2} s", keys, elapsed);
+                } else {
+                    log::info!("tile loading: first-area worker batch {:?} returned in {:.2} s", keys, elapsed);
+                }
+            }
             // a tile the worker could not make is let go (else it stayed "requested" for
             // ever: never retried, never unloaded, and the loading screen waited for it)
             let made: hashbrown::HashSet<(i32, i32)> = prepared.iter().map(|p| (p.tx, p.ty)).collect();
@@ -935,6 +983,9 @@ impl Streamer {
         while let Some(mut p) = self.queue.pop_front() {
             let key = p.key();
             let initial = self.initial.as_ref().map(|(set, _)| set.contains(&key)).unwrap_or(false);
+            if initial && self.initial_upload.as_ref().map(|(k, _)| *k) != Some(key) {
+                self.initial_upload = Some((key, std::time::Instant::now()));
+            }
             if !initial && Self::nearest(centers, key.0, key.1) > self.unload_radius {
                 // gone out of range while it was being prepared: what it already holds on
                 // the GPU goes back with it
@@ -955,6 +1006,19 @@ impl Streamer {
                 break;
             }
             self.requested.remove(&key);
+            if initial {
+                let secs = self
+                    .initial_upload
+                    .take()
+                    .filter(|(k, _)| *k == key)
+                    .map(|(_, started)| started.elapsed().as_secs_f64())
+                    .unwrap_or(ms / 1000.0);
+                if secs >= 2.0 {
+                    log::warn!("tile loading: slow upload/place tile {},{} took {:.2} s", key.0, key.1, secs);
+                } else {
+                    log::info!("tile loading: uploaded/placed tile {},{} in {:.2} s", key.0, key.1, secs);
+                }
+            }
             let mut stats = crate::scene::LoadStats::default();
             self.world.commit_upload(p, &mut stats);
             self.stats.objects += stats.objects;
@@ -975,6 +1039,8 @@ impl Streamer {
         let mut unloaded = 0usize;
         if self.initial.as_ref().map(|(set, done)| *done >= set.len()).unwrap_or(false) {
             let (set, _) = self.initial.take().unwrap();
+            self.inflight_batch = None;
+            self.initial_upload = None;
             log::info!("tile streaming: first area of {} tiles loaded in {:.2} s", set.len(), self.started.elapsed().as_secs_f64());
         }
         // Far tiles go (never the ones on their way in), the farthest first and only as many
@@ -1033,6 +1099,49 @@ impl Streamer {
         if self.initial.is_none() {
             self.worst_frame_ms = self.worst_frame_ms.max(total.as_secs_f64() * 1000.0);
         }
+
+        // While the loading screen is up, make a stuck worker visible without writing once
+        // per frame. Progress is at most one line per initial tile; a genuine stall is one
+        // warning after 15 s and then at most one every 30 s.
+        if let Some((done, total_initial)) = self.initial.as_ref().map(|(set, done)| (*done, set.len())) {
+            let now = std::time::Instant::now();
+            if done != self.initial_last_done {
+                self.initial_last_done = done;
+                self.initial_last_progress = now;
+                self.initial_last_stall_log = None;
+                log::info!(
+                    "tile loading: first area progress {}/{} after {:.1} s",
+                    done,
+                    total_initial,
+                    self.started.elapsed().as_secs_f64()
+                );
+            } else {
+                let stalled_for = now.duration_since(self.initial_last_progress);
+                let since_last = self.initial_last_stall_log.map(|t| now.duration_since(t));
+                if initial_stall_due(stalled_for, since_last) {
+                    let worker = self
+                        .inflight_batch
+                        .as_ref()
+                        .map(|(keys, t)| format!("worker {:?} running {:.1} s", keys, t.elapsed().as_secs_f64()))
+                        .unwrap_or_else(|| "worker idle".to_string());
+                    let upload = self
+                        .initial_upload
+                        .as_ref()
+                        .map(|(key, t)| format!("upload/place {},{} running {:.1} s", key.0, key.1, t.elapsed().as_secs_f64()))
+                        .unwrap_or_else(|| format!("{} prepared tile(s) waiting for upload", self.queue.len()));
+                    log::warn!(
+                        "tile loading: first area stalled at {}/{} for {:.1} s; {}; {}",
+                        done,
+                        total_initial,
+                        stalled_for.as_secs_f64(),
+                        worker,
+                        upload
+                    );
+                    self.initial_last_stall_log = Some(now);
+                }
+            }
+        }
+
         if !self.inflight {
             let missing = self.missing(centers);
             if !missing.is_empty() {
@@ -1047,11 +1156,15 @@ impl Streamer {
                 let tx = self.tx.clone();
                 // the first area gets every core; later tiles only the loader's own threads
                 let first = self.initial.is_some();
+                if first {
+                    log::info!("tile loading: first-area worker batch {:?} started", keys);
+                    self.inflight_batch = Some((keys.clone(), std::time::Instant::now()));
+                }
                 let spawned = std::thread::Builder::new().name("tile loader".into()).spawn(move || {
                     let t = std::time::Instant::now();
                     // (a panic on a damaged file must not end the streaming: the batch comes
                     // back empty and its tiles are let go)
-                    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if first { world.prepare_tiles(&batch) } else { loader_pool().install(|| world.prepare_tiles(&batch)) }));
+                    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if first { world.prepare_tiles_initial(&batch) } else { loader_pool().install(|| world.prepare_tiles(&batch)) }));
                     let (prepared, stats) = made.unwrap_or_else(|_| {
                         log::error!("tile streaming: loading tiles {:?} failed", batch.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>());
                         Default::default()
@@ -1061,6 +1174,7 @@ impl Streamer {
                 if let Err(e) = spawned {
                     log::warn!("tile loader thread: {e}");
                     self.inflight = false;
+                    self.inflight_batch = None;
                     for k in keys {
                         self.requested.remove(&k);
                     }
@@ -1074,6 +1188,22 @@ impl Streamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_area_stall_log_is_delayed_and_rate_limited() {
+        use std::time::Duration;
+
+        assert!(!initial_stall_due(Duration::from_secs(14), None));
+        assert!(initial_stall_due(Duration::from_secs(15), None));
+        assert!(!initial_stall_due(
+            Duration::from_secs(60),
+            Some(Duration::from_secs(29))
+        ));
+        assert!(initial_stall_due(
+            Duration::from_secs(60),
+            Some(Duration::from_secs(30))
+        ));
+    }
 
     /// An active chrono patch with `[terrain]`/`[water]` and their files beside it gives the
     /// tile its ground and water (#923, #925); one without them leaves the map's own.

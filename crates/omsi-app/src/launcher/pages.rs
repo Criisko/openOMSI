@@ -75,6 +75,13 @@ impl PadsView {
             }
         }
     }
+
+    /// Give every controller handle up before handing the hardware to the game. The normal
+    /// controller list uses non-exclusive DirectInput too, not only the force-feedback test.
+    pub(super) fn release_io(&mut self) {
+        self.cancel_feedback_test();
+        self.io = None;
+    }
 }
 
 fn release_feedback(io: &mut Option<crate::controllers::Devices>, active: &mut bool) {
@@ -727,9 +734,16 @@ fn camera_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, co
         }
         *dirty = 0.3;
     }
-    let mut fov = get(s, "fov").as_f64().unwrap_or(0.0) as f32;
+    let fov_key = if get(s, "triple_screen").as_bool().unwrap_or(false)
+        && !get(s, "vr").as_bool().unwrap_or(false)
+    {
+        "triple_fov_deg"
+    } else {
+        "fov"
+    };
+    let mut fov = get(s, fov_key).as_f64().unwrap_or(0.0) as f32;
     if ui.slider("s-fov", c.row(), &mut fov, 0.0, 120.0, 1.0, "Field of view", &|v| if v < 20.0 { "Default".to_string() } else { format!("{v:.0}°") }) {
-        s["fov"] = json!(if fov < 20.0 { 0.0 } else { fov.round() });
+        s[fov_key] = json!(if fov < 20.0 { 0.0 } else { fov.round() });
         *dirty = 0.3;
     }
     let mut look = get(s, "look_sens").as_f64().unwrap_or(1.0) as f32;
@@ -774,6 +788,122 @@ fn camera_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, co
     toggle_setting(ui, s, dirty, c.row(), "Driver at the wheel (outside views)", "driver");
     c.section(ui, "Head tracking");
     toggle_setting(ui, s, dirty, c.row(), "Head tracking (TrackIR and others through opentrack, UDP 4242)", "head_tracking");
+    c.section(ui, "Triple screen");
+    toggle_setting(
+        ui,
+        s,
+        dirty,
+        c.row(),
+        "Three screen projections",
+        "triple_screen",
+    );
+    toggle_setting(
+        ui,
+        s,
+        dirty,
+        c.row(),
+        "Span three monitors at startup",
+        "triple_span",
+    );
+    toggle_setting(
+        ui,
+        s,
+        dirty,
+        c.row(),
+        "HUD on centre screen",
+        "triple_hud_center",
+    );
+    if get(s, "triple_screen").as_bool().unwrap_or(false) {
+        ui.label(
+            c.row(),
+            "Three equal screens in a horizontal row. OpenXR takes priority.",
+        );
+        let mut value = get(s, "triple_width_mm").as_f64().unwrap_or(600.0) as f32;
+        if ui.slider(
+            "s-triple-width_mm",
+            c.row(),
+            &mut value,
+            200.0,
+            2000.0,
+            10.0,
+            "Visible width of one panel",
+            &|v| format!("{v:.0} mm"),
+        ) {
+            s["triple_width_mm"] = json!(value);
+            *dirty = 0.3;
+        }
+        let mut value = get(s, "triple_distance_mm").as_f64().unwrap_or(650.0) as f32;
+        if ui.slider(
+            "s-triple-distance_mm",
+            c.row(),
+            &mut value,
+            200.0,
+            3000.0,
+            10.0,
+            "Eye to centre screen",
+            &|v| format!("{v:.0} mm"),
+        ) {
+            s["triple_distance_mm"] = json!(value);
+            s["triple_fov_deg"] = json!(0.0);
+            *dirty = 0.3;
+        }
+        let mut value = get(s, "triple_bezel_mm").as_f64().unwrap_or(0.0) as f32;
+        if ui.slider(
+            "s-triple-bezel_mm",
+            c.row(),
+            &mut value,
+            0.0,
+            100.0,
+            1.0,
+            "Both frames at each join",
+            &|v| format!("{v:.0} mm"),
+        ) {
+            s["triple_bezel_mm"] = json!(value);
+            *dirty = 0.3;
+        }
+        let mut value = get(s, "triple_left_angle_deg").as_f64().unwrap_or(45.0) as f32;
+        if ui.slider(
+            "s-triple-left_angle_deg",
+            c.row(),
+            &mut value,
+            0.0,
+            90.0,
+            1.0,
+            "Left screen inward angle",
+            &|v| format!("{v:.0}°"),
+        ) {
+            s["triple_left_angle_deg"] = json!(value);
+            *dirty = 0.3;
+        }
+        let mut value = get(s, "triple_right_angle_deg").as_f64().unwrap_or(45.0) as f32;
+        if ui.slider(
+            "s-triple-right_angle_deg",
+            c.row(),
+            &mut value,
+            0.0,
+            90.0,
+            1.0,
+            "Right screen inward angle",
+            &|v| format!("{v:.0}°"),
+        ) {
+            s["triple_right_angle_deg"] = json!(value);
+            *dirty = 0.3;
+        }
+        let mut value = get(s, "triple_eye_height_mm").as_f64().unwrap_or(0.0) as f32;
+        if ui.slider(
+            "s-triple-eye_height_mm",
+            c.row(),
+            &mut value,
+            -500.0,
+            500.0,
+            1.0,
+            "Eye above screen centre",
+            &|v| format!("{v:.0} mm"),
+        ) {
+            s["triple_eye_height_mm"] = json!(value);
+            *dirty = 0.3;
+        }
+    }
     if cfg!(windows) {
         c.section(ui, "Virtual reality");
         toggle_setting(ui, s, dirty, c.row(), "Use OpenXR headset", "vr");
@@ -877,6 +1007,16 @@ fn general_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, c
         TEXT_FAINT,
     );
     c.y += help_height + 3.0;
+    toggle_setting(ui, s, dirty, c.row(), "Voice chat through GreenTeaSpeak (multiplayer)", "voice_chat");
+    let help_height = ui.paragraph(
+        "Players near you are heard from where they stand, when GreenTeaSpeak runs with the openOMSI plugin and the server names a voice server.",
+        Vec2::new(c.inner.x + 12.0, c.y - 5.0),
+        c.inner.w - 24.0,
+        11.5,
+        omsi_ui::Weight::Regular,
+        TEXT_FAINT,
+    );
+    c.y += help_height + 3.0;
     // (the texts over the picture, the menu, the timetable and the navigator: larger for
     // those who find them hard to read, smaller for more of the picture; on a window taller
     // than 1080p they grow with it as well, and the launcher grows with its window anyway)
@@ -939,6 +1079,7 @@ fn general_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, c
             out.check_updates = true;
         }
         let text = match &out.update {
+            Status::UpToDate if crate::updater::is_test_build(crate::updater::current_version()) => format!("{} is a test build: it is not updated", crate::updater::current_version()),
             Status::UpToDate => format!("{} is the latest version", crate::updater::current_version()),
             Status::Available(rel) => format!("{} is available", rel.version),
             Status::Failed(_) => "The last check failed".to_string(),
@@ -1474,6 +1615,7 @@ fn game_controllers(l: &mut Launcher, body: Rect) {
         let cw = (w - GAP * (cols - 1) as f32) / cols as f32;
         let per_row = ROW + 4.0;
         let rows = shown_buttons.div_ceil(cols);
+        let latching = &mut d.latching;
         for (b, (act, _)) in d.buttons.iter_mut().take(shown_buttons).enumerate() {
             let (col, row) = (b / rows.max(1), b % rows.max(1));
             let r = Rect::new(x0 + col as f32 * (cw + GAP), y + row as f32 * per_row, cw, ROW);
@@ -1485,9 +1627,21 @@ fn game_controllers(l: &mut Launcher, body: Rect) {
                 ui.p().rounded(Rect::new(r.x - 4.0, r.y - 2.0, r.w + 8.0, r.h + 4.0), 6.0, ACCENT.alpha(0.28));
             }
             ui.label(Rect::new(r.x, r.y, 90.0, r.h), &label);
+            // (a latching switch - a turn signal lever, a lit hazard button - also switches
+            // when it comes out)
+            let latch_w = 104.0;
             let mut sel = actions.iter().position(|a| a.eq_ignore_ascii_case(act)).unwrap_or(0);
-            if ui.select(&format!("pad-btn-{b}"), Rect::new(r.x + 90.0, r.y, r.w - 90.0, r.h), &mut sel, &labels) {
+            if ui.select(&format!("pad-btn-{b}"), Rect::new(r.x + 90.0, r.y, r.w - 90.0 - latch_w - GAP, r.h), &mut sel, &labels) {
                 *act = if sel == 0 { String::new() } else { actions[sel].clone() };
+                dirty = true;
+            }
+            let mut latched = latching.contains(&b);
+            if ui.toggle(&format!("pad-latch-{b}"), Rect::new(r.right() - latch_w, r.y, latch_w, r.h), &mut latched, "Latching") {
+                latching.retain(|x| *x != b);
+                if latched {
+                    latching.push(b);
+                    latching.sort_unstable();
+                }
                 dirty = true;
             }
         }
@@ -2368,8 +2522,34 @@ mod settings_tests {
             "s-wrange", "s-wlock", "s-pedt", "s-pedb", "set-ff_enabled", "set-ff_invert", "s-wreset", "s-go-pads",
         ];
         let mut camera = vec![
-            "s-seaty", "s-seatz", "s-seatx", "s-seatreset", "s-fov", "s-look-sens", "s-look-smoothing", "s-head-idle", "s-head-idle-pace", "set-steer_look", "s-steer-look-angle", "s-steer-look-response", "set-head_movement", "set-driverview_smooth", "set-hands_in_cab", "set-alt_view",
-            "set-camera_collision", "set-driver", "set-head_tracking",
+            "s-seaty",
+            "s-seatz",
+            "s-seatx",
+            "s-seatreset",
+            "s-fov",
+            "s-look-sens",
+            "s-look-smoothing",
+            "s-head-idle",
+            "s-head-idle-pace",
+            "set-steer_look",
+            "s-steer-look-angle",
+            "s-steer-look-response",
+            "set-head_movement",
+            "set-driverview_smooth",
+            "set-hands_in_cab",
+            "set-alt_view",
+            "set-camera_collision",
+            "set-driver",
+            "set-head_tracking",
+            "set-triple_screen",
+            "set-triple_span",
+            "set-triple_hud_center",
+            "s-triple-width_mm",
+            "s-triple-distance_mm",
+            "s-triple-bezel_mm",
+            "s-triple-left_angle_deg",
+            "s-triple-right_angle_deg",
+            "s-triple-eye_height_mm",
         ];
         if cfg!(windows) {
             camera.extend(["set-vr", "s-vr-scale", "s-vr-head-smoothing", "s-vr-mirror-rate", "set-vr_desktop_mirror", "s-go-vr-keys"]);
@@ -2380,7 +2560,7 @@ mod settings_tests {
             "s-maint", "set-collision_vehicles", "set-collision_objects", "set-collision_pedestrians", "set-use_real_time", "set-use_real_date", "set-time_sync", "set-metar_sync", "s-timespeed",
         ];
         let general = vec![
-            "s-lang", "set-machine_translation", "set-launcher_rest", "set-discord_status", "s-uiscale", "set-ui_scale_window", "s-uiop", "set-tooltips", "set-show_fps", "set-notes", "set-chat", "set-name_tags",
+            "s-lang", "set-machine_translation", "set-launcher_rest", "set-discord_status", "set-voice_chat", "s-uiscale", "set-ui_scale_window", "s-uiop", "set-tooltips", "set-show_fps", "set-notes", "set-chat", "set-name_tags",
             "set-navigator", "set-nav_arrows", "set-nav_ai", "corner-top-left", "corner-top-right", "corner-bottom-left", "corner-bottom-right",
             "set-update_check", "set-update_auto", "s-upd-check", "s-upd-github", "s-reset",
         ];
@@ -2390,6 +2570,7 @@ mod settings_tests {
     /// Settings that show every row: Enhanced (Vanilla hides the shadows and effects), VR on.
     fn all_rows() -> Value {
         let mut s = core::settings_from_text(None);
+        s["triple_screen"] = json!(true);
         s["graphics"] = json!("enhanced");
         s["vr"] = json!(true);
         s

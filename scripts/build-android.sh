@@ -18,6 +18,12 @@ version="${OPENOMSI_VERSION:-$(sh scripts/version.sh 2>/dev/null || echo 0.0.0)}
 export OPENOMSI_VERSION="$version"
 # the version code: the commit count (each release one higher)
 code=$(git rev-list --count HEAD 2>/dev/null || echo 1)
+# a pull request's test build (OPENOMSI_PR=<number>) is an app of its own, "openOMSI PR #N":
+# it installs beside the release without replacing it or being refused for its signing key,
+# and shares the openOMSI folder (settings, content) with it
+package=org.openomsi.game
+label=openOMSI
+if [ -n "${OPENOMSI_PR:-}" ]; then package=org.openomsi.game.pr; label="openOMSI PR #$OPENOMSI_PR"; fi
 target=aarch64-linux-android
 build=android/build
 rm -rf "$build"
@@ -52,8 +58,8 @@ fi
     $(find "$build/classes" -name '*.class')
 
 # --- the package
-sed -e "s/@VERSION_CODE@/$code/" -e "s/@VERSION_NAME@/$version/" android/AndroidManifest.xml > "$build/AndroidManifest.xml"
-"$BUILD_TOOLS/aapt" package -f -M "$build/AndroidManifest.xml" -S android/res -I "$ANDROID_JAR" -F "$build/unsigned.apk"
+sed -e "s/@VERSION_CODE@/$code/" -e "s/@VERSION_NAME@/$version/" -e "s/android:label=\"openOMSI\"/android:label=\"$label\"/"     android/AndroidManifest.xml > "$build/AndroidManifest.xml"
+"$BUILD_TOOLS/aapt" package -f --rename-manifest-package "$package" -M "$build/AndroidManifest.xml" -S android/res -I "$ANDROID_JAR" -F "$build/unsigned.apk"
 ( cd "$build/apk" && "$BUILD_TOOLS/aapt" add ../unsigned.apk classes.dex lib/arm64-v8a/* >/dev/null )
 "$BUILD_TOOLS/zipalign" -f -p 4 "$build/unsigned.apk" "$build/aligned.apk"
 key=android/debug.keystore

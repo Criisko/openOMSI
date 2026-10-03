@@ -260,6 +260,18 @@ impl Vehicle {
         self.coupling_front.is_some() && !self.has_friendly_name
     }
 
+    /// A rail vehicle: a car of a `.zug` runs on rails, which Omsi.exe stands end to end by
+    /// their model bodies (its cars' declared coupling points need not be at the cars' ends).
+    /// A road vehicle, a trailer or an articulated-bus rear section keeps its declared
+    /// `[coupling_front]` / `[coupling_back]`.
+    ///
+    /// Rails are what the file says they are: a `[boogies]`, a `[contact_shoe]` or a
+    /// `[rail_body_osc]` (`rail_drive::is_rail` reads the same three; a rail car has all of
+    /// a bogie, and Omsi.exe's `[type] 2` marks the same vehicles).
+    pub fn is_rail(&self) -> bool {
+        self.boogies.is_some() || !self.contact_shoes.is_empty() || self.rail_body_osc.is_some()
+    }
+
     pub fn parse(file: &CfgFile) -> Vehicle {
         let is_ovh = file.path.extension().map(|e| e.eq_ignore_ascii_case("ovh")).unwrap_or(false);
         let mut v = Vehicle { path: file.path.clone(), kind: if is_ovh { VehicleKind::Other(0) } else { VehicleKind::Bus }, mass: 1000.0, ..Default::default() };
@@ -328,7 +340,15 @@ impl Vehicle {
                 "set_camera_outside_center" => v.camera_outside_center = r.f32s::<3>(),
                 "mass" => v.mass = r.f32(),
                 "momentofintertia" => v.moment_of_inertia = r.f32s::<3>(),
-                "boundingbox" => v.bounding_box = Some(r.f32s::<6>()),
+                "boundingbox" => {
+                    // (the sizes as magnitudes: a mod's box given -2.62 m wide crossed the
+                    // bounds of the walkers' clamp about it and the game stopped, #986)
+                    let mut bb = r.f32s::<6>();
+                    for x in &mut bb[..3] {
+                        *x = x.abs();
+                    }
+                    v.bounding_box = Some(bb);
+                }
                 "cog" => v.cog = Some(r.f32s::<3>()),
                 "schwerpunkt" => v.cog_height = r.f32(),
                 "rollwiderstand" => v.rolling_resistance = r.f32(),
@@ -566,6 +586,12 @@ mod tests {
         assert_eq!((b.long, b.max_width, b.min_width, b.wheel_diameter, b.spring, b.max_force, b.damper, b.driven, b.inertia_inv), (-2.577, 2.4, 1.4, 1.023, 280.0, 116.0, 20.0, true, 0.015));
         assert_eq!(v.mass, 10.9);
         assert_eq!(v.cog, Some([0.0, 0.2, 0.8]));
+    }
+
+    #[test]
+    fn a_bounding_box_given_negative_is_its_size() {
+        let v = Vehicle::parse(&CfgFile::from_str("x.bus", "[boundingbox]\n-2.62\n12.2\n-3.4\n0\n-0.3\n1.7\n"));
+        assert_eq!(v.bounding_box, Some([2.62, 12.2, 3.4, 0.0, -0.3, 1.7]));
     }
 
     #[test]

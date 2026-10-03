@@ -100,6 +100,24 @@ fn host_action(app: &mut App, action: &str, by: Option<u32>) {
     let (verb, arg) = action.split_once(' ').unwrap_or((action, ""));
     let id = arg.trim().parse::<u32>().ok();
     match verb {
+        // a notification (`notify <id|all> <notice id> <seconds> <kind> <text>`): to the other
+        // players through the session, and on the host's own screen for `all` or its own number
+        "notify" => {
+            let Some((who, rest)) = arg.trim().split_once(' ') else { return };
+            let Some((nid, n)) = crate::ui::Notice::parse(rest) else { return };
+            let mut here = false;
+            if let Some(l) = app.lan.as_mut() {
+                let (ids, local) = notice_targets(who, l.peers().map(|p| p.pose.id), l.my_id);
+                for id in ids {
+                    l.command(id, &format!("notify {}", rest.trim()));
+                }
+                here = local;
+            }
+            if here {
+                log::info!("LAN: the server's notice {nid}: {}", n.text);
+                crate::ui::push_notice(&mut app.notices, n);
+            }
+        }
         "kick" | "ban" => {
             if let (Some(l), Some(id)) = (app.lan.as_mut(), id) {
                 l.kick(id, if verb == "ban" { "sent away for this session" } else { "sent away by the host" }, verb == "ban");
@@ -375,12 +393,56 @@ pub(crate) fn command(app: &mut App, from: u32, text: &str) {
                 l.command(1, &format!("auth {}", response(arg.trim(), &pw)));
             }
         }
+        // (host → us) a duty given by the server's dispatch: `duty <line> <tour> <trip> <stop>`
+        // - that trip of the tour (by its place among the tour's trips, as the tour list counts
+        // them), from that stop (its number among the trip's stations; a stop the trip does not
+        // serve: the next one it serves), as the tour list's start button does: the bus stays
+        // where it is. The host hears `duty-ok <line> <tour> <trip> <stop>` or `duty-no <why>`.
+        "duty" if from == 1 => {
+            let reply = match parse_duty(arg) {
+                None => "duty-no malformed".to_string(),
+                Some((line, tour, trip, station)) => {
+                    let stops = app.schedule.as_ref().map(|s| s.tour_trip_stops(&line, &tour, trip)).unwrap_or_default();
+                    match stops.iter().position(|s| s.1 >= station).or(stops.len().checked_sub(1)) {
+                        None => "duty-no unknown tour or trip".to_string(),
+                        Some(chosen) => {
+                            crate::game_lists::start_duty_at(app, &line, &tour, trip, chosen);
+                            let ok = app.duty.as_ref().is_some_and(|d| d.line.eq_ignore_ascii_case(&line) && d.tour.eq_ignore_ascii_case(&tour));
+                            log::info!("LAN: the server gave us line {line} tour {tour}, trip {trip} from stop {chosen}: {}", if ok { "taken" } else { "not taken" });
+                            if ok {
+                                format!("duty-ok {}", duty_arg(&line, &tour, trip, stops[chosen].1))
+                            } else {
+                                "duty-no no duty".to_string()
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some(l) = app.lan.as_mut() {
+                l.command(1, &reply);
+            }
+        }
+        // (host → us) a notification over the navigator for a few seconds: `notify <id>
+        // <seconds> <info|warn|alert> <text>`; the host hears that it was shown (`notify-seen
+        // <id>`): a game that does not know `notify` stays silent, and the host can say it in
+        // the chat instead
+        "notify" if from == 1 => {
+            if let Some((id, n)) = crate::ui::Notice::parse(arg) {
+                log::info!("LAN: the server's notice {id}: {}", n.text);
+                crate::ui::push_notice(&mut app.notices, n);
+                if let Some(l) = app.lan.as_mut() {
+                    l.command(1, &format!("notify-seen {id}"));
+                }
+            }
+        }
         "admin-locked" if from == 1 => app.service_msg = Some(("Too many wrong admin passwords: try again later".into(), 4.0)),
         "admin-ok" if from == 1 => {
             app.is_admin = true;
             app.service_msg = Some(("You administer this server now: Esc menu, Administration".into(), 6.0));
         }
         "admin-no" if from == 1 => app.service_msg = Some(("Wrong admin password".into(), 4.0)),
+        // (a game hosting by code sent a notice: the player's game showed it)
+        "notify-seen" => log::info!("LAN: player {from} saw notice {}", arg.trim()),
         // (host by code: only the host administers its own game)
         _ => log::info!("LAN: command '{text}' from player {from} not taken"),
     }
@@ -438,6 +500,8 @@ pub(crate) const LOCAL_ADMIN: u32 = u32::MAX;
 pub(crate) fn server_command(lan: &mut LanSession, from: u32, text: &str, adm: &mut ServerAdmin, positions: &dyn Fn(u32) -> Option<(glam::DVec3, f64)>) {
     let (verb, arg) = text.split_once(' ').unwrap_or((text, ""));
     match verb {
+        // a joining game asks which voice server the session talks on (`voice`)
+        "voice?" => lan.command(from, &crate::voice::VoiceServer::command(crate::voice::hosted().as_ref())),
         "auth?" => {
             if adm.password.is_empty() {
                 lan.command(from, "admin-no");
@@ -520,6 +584,28 @@ pub(crate) fn server_command(lan: &mut LanSession, from: u32, text: &str, adm: &
                         }
                     }
                 }
+                // a duty for one player: `duty <id> <line> <tour> <trip> <stop>` (see `command`)
+                "duty" => {
+                    if let Some((who, rest)) = a.trim().split_once(' ') {
+                        if let (Ok(id), Some(_)) = (who.parse::<u32>(), parse_duty(rest)) {
+                            lan.command(id, &format!("duty {}", rest.trim()));
+                        }
+                    }
+                }
+                // a notification on one player's screen, or everybody's: `notify <id|all> <notice
+                // id> <seconds> <info|warn|alert> <text>` (a game that shows it answers
+                // `notify-seen <notice id>`)
+                // (a dedicated server has no screen: its own number is nobody's)
+                "notify" => {
+                    if let Some((who, rest)) = a.trim().split_once(' ') {
+                        if crate::ui::Notice::parse(rest).is_some() {
+                            let (ids, _) = notice_targets(who, lan.peers().map(|p| p.pose.id), lan.my_id);
+                            for id in ids {
+                                lan.command(id, &format!("notify {}", rest.trim()));
+                            }
+                        }
+                    }
+                }
                 "bringall" => {
                     if let Some((pos, h)) = positions(from) {
                         let ids: Vec<u32> = lan.peers().map(|p| p.pose.id).filter(|id| *id != from && *id != lan.my_id).collect();
@@ -552,6 +638,12 @@ pub(crate) fn server_command(lan: &mut LanSession, from: u32, text: &str, adm: &
                 _ => {}
             }
         }
+        // a player's game took the duty it was given (`duty`), or could not: said for the tool
+        // that gave it
+        "duty-ok" => log::info!("server: player {from} took duty {}", arg.trim()),
+        "duty-no" => log::info!("server: player {from} could not take the duty: {}", arg.trim()),
+        // a player's game showed a notification (`notify`): said for the tool that sent it
+        "notify-seen" => log::info!("server: player {from} saw notice {}", arg.trim()),
         _ => log::info!("server: command '{text}' from player {from} not taken"),
     }
 }
@@ -589,6 +681,71 @@ pub(crate) fn guard_fall(app: &mut App, dt: f32) {
             app.safe_age = 0.0;
             app.safe_pose = Some((glam::DVec3::new(at.x, at.y, g), p.vehicle.heading));
         }
+    }
+}
+
+/// `duty`'s argument: `<line> <tour> <trip> <stop>`, a space in the line or tour name written
+/// `%20` (and `%` as `%25`).
+pub(crate) fn duty_arg(line: &str, tour: &str, trip: usize, stop: usize) -> String {
+    let esc = |s: &str| s.trim().replace('%', "%25").replace(' ', "%20");
+    format!("{} {} {trip} {stop}", esc(line), esc(tour))
+}
+
+/// `duty_arg` read back: (line, tour, trip, stop).
+pub(crate) fn parse_duty(arg: &str) -> Option<(String, String, usize, usize)> {
+    let unesc = |s: &str| s.replace("%20", " ").replace("%25", "%");
+    let v: Vec<&str> = arg.split_whitespace().collect();
+    let [line, tour, trip, stop] = v[..] else { return None };
+    Some((unesc(line), unesc(tour), trip.parse().ok()?, stop.parse().ok()?))
+}
+
+#[cfg(test)]
+mod duty_tests {
+    use super::{duty_arg, parse_duty};
+
+    #[test]
+    fn a_duty_goes_to_the_game_and_back() {
+        assert_eq!(duty_arg("15", "5", 2, 7), "15 5 2 7");
+        assert_eq!(parse_duty("15 5 2 7"), Some(("15".into(), "5".into(), 2, 7)));
+        // names with spaces and percent signs
+        let a = duty_arg("KI-Zug", "ZOB RB 100%", 0, 0);
+        assert_eq!(a, "KI-Zug ZOB%20RB%20100%25 0 0");
+        assert_eq!(parse_duty(&a), Some(("KI-Zug".into(), "ZOB RB 100%".into(), 0, 0)));
+        // missing or extra parts, not numbers: not a duty
+        for bad in ["", "15", "15 5", "15 5 2", "15 5 2 7 9", "15 5 x 7", "15 5 2 -1"] {
+            assert_eq!(parse_duty(bad), None, "{bad}");
+        }
+    }
+}
+
+/// Who a `notify` is for: `all`, every other player and the host's own screen; a player's
+/// number, that player - or the host's own screen when it is the host's number (`peers` has
+/// only the others, and `LanSession::command` sends nothing to oneself).
+fn notice_targets(who: &str, others: impl Iterator<Item = u32>, my_id: u32) -> (Vec<u32>, bool) {
+    if who == "all" {
+        return (others.filter(|id| *id != my_id).collect(), true);
+    }
+    match who.trim().parse::<u32>() {
+        Ok(id) if id == my_id => (Vec::new(), true),
+        Ok(id) => (vec![id], false),
+        Err(_) => (Vec::new(), false),
+    }
+}
+
+#[cfg(test)]
+mod notice_target_tests {
+    use super::notice_targets;
+
+    #[test]
+    fn all_is_every_player_and_the_host_itself() {
+        // the host is player 1, the others 2 and 5
+        assert_eq!(notice_targets("all", [2, 5].into_iter(), 1), (vec![2, 5], true));
+        assert_eq!(notice_targets("all", [].into_iter(), 1), (vec![], true));
+        // one player; the host's own number: its own screen, nothing sent
+        assert_eq!(notice_targets("5", [2, 5].into_iter(), 1), (vec![5], false));
+        assert_eq!(notice_targets("1", [2, 5].into_iter(), 1), (vec![], true));
+        // not a number: nobody
+        assert_eq!(notice_targets("x", [2, 5].into_iter(), 1), (vec![], false));
     }
 }
 

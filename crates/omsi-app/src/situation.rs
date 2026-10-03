@@ -133,9 +133,11 @@ pub(crate) fn apply_situation_parsed(sit: &omsi_content::situation::Situation, a
         if !v.paint.trim().is_empty() {
             args.hof = Some(v.paint.clone());
         }
+        args.situation_next_stop = None;
         if v.timetable.len() >= 2 {
             args.line = Some(v.timetable[0].clone());
             args.tour = Some(v.timetable[1].clone());
+            args.situation_next_stop = v.timetable.get(3).and_then(|s| s.trim().parse().ok());
             // the third value is the trip of the tour under way (0 = the first); the duty
             // goes on from there with the rest of the tour, as it was driven (taken as a
             // picked trip, it was the whole duty, and the next save wrote it as trip 0 of
@@ -390,6 +392,7 @@ mod tests {
                     file: "Vehicles/MAN_NL_NG/MAN_EN92.bus".into(),
                     is_my_vehicle: false,
                     vars: vec![("Colorscheme".into(), 4.0)],
+                    string_vars: vec![("destination".into(), "  Manual destination  ".into())],
                     ..Default::default()
                 },
             ],
@@ -400,6 +403,10 @@ mod tests {
         assert_eq!(args.paint.as_deref(), Some("1"));
         assert_eq!(args.situation_others.len(), 1);
         assert_eq!(args.situation_others[0].paint.as_deref(), Some("4"));
+        assert_eq!(
+            args.situation_others[0].strvars,
+            vec![("destination".into(), "  Manual destination  ".into())]
+        );
     }
 
     /// #653: a saved duty goes on at the trip of the tour it was saved on, with the rest of
@@ -420,5 +427,38 @@ mod tests {
         apply_situation_parsed(&sit, &mut args);
         assert_eq!((args.line.as_deref(), args.tour.as_deref(), args.trip.as_deref()), (Some("137"), Some("4"), Some("4")));
         assert!(args.whole_tour);
+        assert_eq!(args.situation_next_stop, Some(2));
+    }
+
+    #[test]
+    fn legacy_and_invalid_saved_stop_fields_keep_legacy_selection() {
+        let mut args = crate::cli::Args::parse_from(["openomsi"]);
+        for fields in [
+            vec!["109", "65104", "16"],
+            vec!["109", "65104", "16", "-1"],
+            vec!["109", "65104", "16", "invalid"],
+            vec![],
+        ] {
+            args.situation_next_stop = Some(9);
+            let sit = omsi_content::situation::Situation {
+                vehicles: vec![omsi_content::situation::SituationVehicle {
+                    is_my_vehicle: true,
+                    timetable: fields.into_iter().map(String::from).collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            apply_situation_parsed(&sit, &mut args);
+            assert_eq!(args.situation_next_stop, None);
+        }
+    }
+
+    #[test]
+    fn a_string_only_snapshot_is_a_resume() {
+        let mut args = crate::cli::Args::parse_from(["openomsi"]);
+        assert!(!args.is_resuming());
+        args.situation_strvars
+            .push(("destination".into(), "Manual".into()));
+        assert!(args.is_resuming());
     }
 }

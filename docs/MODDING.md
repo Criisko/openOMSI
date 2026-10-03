@@ -68,6 +68,46 @@ Normal, roughness, metalness and occlusion maps beside a texture, up to 4096 × 
 - Lua plugins can read and write script variables, fire triggers and react to game events:
   see [Plugins](PLUGINS.md).
 
+## Radio: a map's stations and a bus's display
+
+What a player sees and hears is in the [user guide](USER_GUIDE.md#radio); here is what a map
+or a bus can add. Omsi.exe reads none of it, so a map or bus made for both games loses
+nothing in OMSI 2.
+
+**A map's own stations.** `radio.cfg` beside the map's `global.cfg`, written like the
+player's (`name = address` a line). Its stations come first on the station buttons while the
+map is driven, the player's follow (one with the same address as a map's is left out). Its `volume`
+line is not read: loudness stays the player's business. The file is read again when another
+map is loaded.
+
+**Frequencies.** Behind the address may stand the frequencies the station is on, for radios
+that show one: `| 94.6` is the station's frequency everywhere, `| 94.6 @ x, y` the one near
+that place of the map. A station may have as many as it has transmitters along the route:
+
+```
+# name = address | frequency @ x, y | ...
+Radiozurnal = https://rozhlas.stream/radiozurnal.mp3 | 94.6 @ 25500, 20000 | 90.9 @ 2307, -717
+Regional    = https://example.org/regional.mp3 | 97.9
+```
+
+`x, y` are the game's metres: the tile's column and row times 300 m plus the place within
+the tile. The easiest way to get them is the log: `spawned at entry point 38 "Chlum,hl.sil."
+(12810.6, 3735.5, 60.3)` when a bus is put on the map, or an entry point's own numbers in
+`global.cfg` (`[entrypoints]`: the place in the tile, then the tile's index into `[map]`).
+The place nearest to the bus decides which frequency is shown; there is no blending, so one
+place per town along the route is enough. A map's places are map positions, not
+coordinates on the globe: many maps shorten and bend their routes.
+
+**A bus's display.** A radio script that wants the station and the song in its display
+declares the string variable `Snd_Radio_Text` (in a `[stringvarnamelist]` file of the bus)
+and shows it in a text texture: openOMSI writes the text there, ten characters, a longer
+text running through, while the radio plays. The variables the radio itself sets are those
+of OMSI's radio plugins - `Snd_Radio` (1 while a cassette or the radio plays: the first
+station), or `SndExt_Radio` (the station button, 0 = off) with `SndVol_Radio` (the volume,
+0..1, up to 2). Dmitrij's "Magnitola" is served as it comes: while it shows its track,
+its `magnitola_1` (`frequency@station`, `@` the line break) gets the map's frequency for the
+place in its first line and the station and song in its second.
+
 ## What stays as in OMSI 2
 
 The following behave as in OMSI 2 so that existing content works unchanged:

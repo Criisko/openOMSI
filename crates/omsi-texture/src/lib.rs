@@ -274,11 +274,22 @@ fn find_texture_elsewhere(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
         return None;
     }
     let first = dirs.first()?;
-    let top = first.ancestors().find(|a| {
-        a.file_name().and_then(|f| f.to_str()).is_some_and(|f| f.eq_ignore_ascii_case("Splines") || f.eq_ignore_ascii_case("Sceneryobjects"))
+    let top = first.ancestors().find_map(|a| {
+        a.file_name().and_then(|f| f.to_str()).filter(|f| f.eq_ignore_ascii_case("Splines") || f.eq_ignore_ascii_case("Sceneryobjects")).map(|f| f.to_ascii_lowercase())
     })?;
-    static INDEX: std::sync::OnceLock<Mutex<HashMap<PathBuf, Arc<HashMap<String, Vec<PathBuf>>>>>> = std::sync::OnceLock::new();
-    let index = INDEX.get_or_init(|| Mutex::new(HashMap::new())).lock().entry(top.to_path_buf()).or_insert_with(|| Arc::new(texture_index(top))).clone();
+    static INDEX: std::sync::OnceLock<Mutex<HashMap<String, (u64, Arc<HashMap<String, Vec<PathBuf>>>)>>> = std::sync::OnceLock::new();
+    let generation = omsi_cfg::content_generation();
+    let index = {
+        let mut all = INDEX.get_or_init(|| Mutex::new(HashMap::new())).lock();
+        match all.get(&top) {
+            Some((g, i)) if *g == generation => i.clone(),
+            _ => {
+                let i = Arc::new(texture_index(&top));
+                all.insert(top.clone(), (generation, i.clone()));
+                i
+            }
+        }
+    };
     let key = |p: &Path| p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase());
     let want = Path::new(name);
     if !want.extension().and_then(|x| x.to_str()).is_some_and(|x| ["dds", "bmp", "jpg", "jpeg", "png", "tga"].iter().any(|t| x.eq_ignore_ascii_case(t))) {
@@ -296,14 +307,21 @@ fn find_texture_elsewhere(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
     Some(found)
 }
 
-fn texture_index(top: &Path) -> HashMap<String, Vec<PathBuf>> {
+/// Image files under `top` (`splines`/`sceneryobjects`) of every content root and mounted archive, by stem.
+fn texture_index(top: &str) -> HashMap<String, Vec<PathBuf>> {
     let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    let mut stack = vec![top.to_path_buf()];
+    let mut stack: Vec<PathBuf> = omsi_cfg::content_roots()
+        .into_iter()
+        .filter_map(|r| {
+            let (name, _) = omsi_cfg::vfs::list_dir(&r)?.into_iter().find(|(n, d)| *d && n.to_str().is_some_and(|n| n.eq_ignore_ascii_case(top)))?;
+            Some(r.join(name))
+        })
+        .collect();
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for e in entries.flatten() {
-            let p = e.path();
-            if e.file_type().is_ok_and(|t| t.is_dir()) {
+        let Some(entries) = omsi_cfg::vfs::list_dir(&dir) else { continue };
+        for (name, is_dir) in entries {
+            let p = dir.join(name);
+            if is_dir {
                 stack.push(p);
             } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| ["dds", "bmp", "jpg", "png", "tga"].iter().any(|t| x.eq_ignore_ascii_case(t))) {
                 if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
@@ -675,8 +693,13 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("gehweg.bmp"), b"x").unwrap();
         std::fs::write(other.join("0.png"), b"x").unwrap();
+        omsi_cfg::add_content_root(dir.clone());
         assert_eq!(find_texture_uncached("gehweg.bmp", &[&own]), Some(other.join("gehweg.bmp")));
         assert_eq!(find_texture_uncached("0", &[&own]), None);
+        // content installed while the game runs is indexed again
+        std::fs::write(other.join("late.bmp"), b"x").unwrap();
+        omsi_cfg::content_changed();
+        assert_eq!(find_texture_uncached("late.bmp", &[&own]), Some(other.join("late.bmp")));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

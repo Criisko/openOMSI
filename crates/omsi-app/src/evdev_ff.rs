@@ -121,6 +121,15 @@ impl Drop for Wheel {
     }
 }
 
+/// A device with a constant force is connected (a wheel: openOMSI drives its forces itself).
+pub(crate) fn wheel_connected() -> bool {
+    let Ok(dir) = std::fs::read_dir("/sys/class/input") else { return false };
+    dir.filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("event")).any(|e| {
+        let caps = std::fs::read_to_string(e.path().join("device/capabilities/ff")).unwrap_or_default();
+        has_bit(&caps, FF_CONSTANT)
+    })
+}
+
 fn has_bit(bitmap: &str, bit: usize) -> bool {
     let words: Vec<u64> = bitmap.split_whitespace().rev().filter_map(|w| u64::from_str_radix(w, 16).ok()).collect();
     words.get(bit / 64).is_some_and(|w| w >> (bit % 64) & 1 != 0)
