@@ -161,6 +161,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path crates/omsi-render/src/dlss.rs)) { throw 'dlss.rs is gone' }
+          if (-not (Test-Path crates/omsi-app/src/head_idle.rs)) { throw 'head_idle.rs is gone' }
           $mentions = @{
             'dlss' = @(
               'crates/omsi-app/src/settings.rs',
@@ -176,6 +177,14 @@ jobs:
               'crates/omsi-app/src/game_lists.rs',
               'crates/omsi-app/src/launcher/pages.rs',
               'crates/omsi-launcher-core/src/lib.rs'
+            )
+            'head_idle' = @(
+              'crates/omsi-app/src/settings.rs',
+              'crates/omsi-app/src/game_lists.rs',
+              'crates/omsi-app/src/launcher/pages.rs',
+              'crates/omsi-launcher-core/src/lib.rs',
+              'crates/omsi-app/src/app_events.rs',
+              'crates/omsi-app/src/player.rs'
             )
           }
           foreach ($needle in $mentions.Keys) {
