@@ -809,6 +809,7 @@ fn steps_of(verb: &str) -> Option<Vec<f32>> {
         "mouse_sens" => (10..=300).map(|v| v as f32 / 100.0).collect(),
         "look_sens" => (2..=40).map(|v| v as f32 * 0.05).collect(),
         "look_smoothing_ms" => (0..=20).map(|v| v as f32 * 10.0).collect(),
+        "head_idle" => (0..=20).map(|v| v as f32 * 0.05).collect(),
         "seat" => (-50..=50).map(|v| v as f32 / 100.0).collect(),
         "hour" => (0..24).map(|v| v as f32).collect(),
         "minute" => (0..60).map(|v| v as f32).collect(),
@@ -918,6 +919,7 @@ fn option_now(app: &App, verb: &str, arg: &str) -> Option<f32> {
         "mouse_sens" => s.mouse_sens,
         "look_sens" => s.look_sens,
         "look_smoothing_ms" => s.look_smoothing_ms,
+        "head_idle" => s.head_idle,
         "ui_scale" => s.ui_scale,
         "ui_opacity" => s.ui_opacity,
         "vol_ai" => s.vol_ai,
@@ -994,6 +996,10 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
         "look_smoothing_ms" => {
             app.settings.look_smoothing_ms = v.round();
             Some(("look_smoothing_ms", app.settings.look_smoothing_ms.to_string()))
+        }
+        "head_idle" => {
+            app.settings.head_idle = (v * 100.0).round() / 100.0;
+            Some(("head_idle", app.settings.head_idle.to_string()))
         }
         "mouse_sens" => {
             app.settings.mouse_sens = (v * 100.0).round() / 100.0;
@@ -1870,6 +1876,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "headtrack", "Head tracking", &format!("Head tracking with opentrack (UDP port {})", s.head_tracking_port)),
         slider_row(app, "look_sens", "Mouse look sensitivity", "How fast the view turns when looking round with the mouse (100% is OMSI's)", &pct),
         slider_row(app, "look_smoothing_ms", "Smooth the mouse look", "How long the view takes to come round to where the mouse or the stick turned it (off: at once, as OMSI)", &|v| if v <= 0.0 { "Off".to_string() } else { format!("{v:.0} ms") }),
+        slider_row(app, "head_idle", "Idle head sway", "How much the view sways on its own when nothing is done to it - a head at rest is never quite still, most of it seen while the bus waits at a stop", &|v| if v <= 0.0 { "Off".to_string() } else { format!("{:.0}%", v * 100.0) }),
         switch_row(app, "alt_view", "Right mouse button turns the view", "Shift+right zooms; off: right zooms as in OMSI, the wheel button turns"),
         slider_row(app, "fov", "Field of view", "The view angle of the views from the vehicle", &|v| if v < 20.0 { "Default".to_string() } else { format!("{v:.0}°") }),
         slider_row(app, "seat 1", "Seat forward and back", "Adjust the driver's seat position forward or backward", &cm),

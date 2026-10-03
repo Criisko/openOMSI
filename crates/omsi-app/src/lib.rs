@@ -11,6 +11,7 @@
 
 mod admin;
 mod discord;
+mod head_idle;
 mod headtrack;
 #[cfg(windows)]
 mod openxr;

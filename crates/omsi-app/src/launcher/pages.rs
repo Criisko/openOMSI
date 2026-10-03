@@ -742,6 +742,11 @@ fn camera_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, co
         s["look_smoothing_ms"] = json!(smooth.round());
         *dirty = 0.3;
     }
+    let mut idle = get(s, "head_idle").as_f64().unwrap_or(0.0) as f32;
+    if ui.slider("s-head-idle", c.row(), &mut idle, 0.0, 1.0, 0.05, "Idle head sway", &|v| if v <= 0.0 { "Off".to_string() } else { format!("{:.0}%", v * 100.0) }) {
+        s["head_idle"] = json!((idle * 100.0).round() / 100.0);
+        *dirty = 0.3;
+    }
     toggle_setting(ui, s, dirty, c.row(), "Driver's view turns with the steering", "steer_look");
     let mut angle = get(s, "steer_look_angle").as_f64().unwrap_or(30.0) as f32;
     if ui.slider("s-steer-look-angle", c.row(), &mut angle, 0.0, 60.0, 1.0, "Steering view angle", &|v| format!("{v:.0}°")) {
@@ -2357,7 +2362,7 @@ mod settings_tests {
             "s-wrange", "s-wlock", "s-pedt", "s-pedb", "set-ff_enabled", "set-ff_invert", "s-wreset", "s-go-pads",
         ];
         let mut camera = vec![
-            "s-seaty", "s-seatz", "s-seatx", "s-seatreset", "s-fov", "s-look-sens", "s-look-smoothing", "set-steer_look", "s-steer-look-angle", "s-steer-look-response", "set-head_movement", "set-driverview_smooth", "set-hands_in_cab", "set-alt_view",
+            "s-seaty", "s-seatz", "s-seatx", "s-seatreset", "s-fov", "s-look-sens", "s-look-smoothing", "s-head-idle", "set-steer_look", "s-steer-look-angle", "s-steer-look-response", "set-head_movement", "set-driverview_smooth", "set-hands_in_cab", "set-alt_view",
             "set-camera_collision", "set-driver", "set-head_tracking",
         ];
         if cfg!(windows) {
