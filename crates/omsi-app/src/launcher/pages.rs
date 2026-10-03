@@ -742,13 +742,14 @@ fn camera_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, co
         s["look_smoothing_ms"] = json!(smooth.round());
         *dirty = 0.3;
     }
+    c.section(ui, "A head at rest");
     let mut idle = get(s, "head_idle").as_f64().unwrap_or(0.0) as f32;
-    if ui.slider("s-head-idle", c.row(), &mut idle, 0.0, 1.0, 0.05, "Idle head sway", &|v| if v <= 0.0 { "Off".to_string() } else { format!("{:.0}%", v * 100.0) }) {
+    if ui.slider("s-head-idle", c.row(), &mut idle, 0.0, 1.0, 0.05, "Head sway at a standstill", &|v| if v <= 0.0 { "Off".to_string() } else { format!("{:.0}%", v * 100.0) }) {
         s["head_idle"] = json!((idle * 100.0).round() / 100.0);
         *dirty = 0.3;
     }
     let mut pace = get(s, "head_idle_pace").as_f64().unwrap_or(1.0) as f32;
-    if ui.slider("s-head-idle-pace", c.row(), &mut pace, 0.5, 2.0, 0.05, "Sway pace", &|v| format!("{v:.2}x")) {
+    if ui.slider("s-head-idle-pace", c.row(), &mut pace, 0.5, 2.0, 0.05, "Sway pace", &|v| format!("{:.0}%", v * 100.0)) {
         s["head_idle_pace"] = json!((pace * 100.0).round() / 100.0);
         *dirty = 0.3;
     }
