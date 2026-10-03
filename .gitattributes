@@ -1,10 +1,10 @@
 # Files both sides write to, where a merge should keep what each added rather than stop on a
-# conflict: the changelog the project and this fork each append to, and the settings the fork's
-# own rows sit in the middle of.
+# conflict. The changelog qualifies: the project and this fork each append to it, and a union
+# cannot drop a line.
 #
-# The nightly merge is what this is for (see .github/workflows/sync-upstream.yml): a union cannot
-# drop a line, so the worst a merge of these two can do is fail to compile - and a release is
-# only published after a build that passed, so that cannot reach a player. A conflict anywhere
-# else still stops the job, which leaves the newest release exactly where it was.
+# The settings were on this list once, and that was a mistake. Both sides rewrite the same one
+# long `Self { ... }` defaults literal often, and a union settles that by keeping both copies -
+# two statements in a row, which does not compile. A conflict there now stops the nightly merge
+# (see .github/workflows/sync-upstream.yml) and leaves the newest release where it was, which is
+# the right outcome: that one wants a person.
 CHANGELOG.md merge=union
-crates/omsi-app/src/settings.rs merge=union
