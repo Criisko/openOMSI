@@ -20,7 +20,10 @@ anyhow.workspace = true
 winit.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Foundation"] }
+# (DLSS: NVIDIA Streamline on wgpu's own D3D12 device and queue, see `dlss`)
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D12", "Win32_Foundation", "Win32_System_LibraryLoader"] }
+windows-core = "0.62"
+wgpu-hal = { version = "29", features = ["dx12"] }
 
 [dev-dependencies]
 naga = { version = "29", features = ["spv-out", "glsl-out"] }
