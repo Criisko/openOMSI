@@ -45,8 +45,9 @@ is tagged `dlss-ours-2026-10-03`. Its `dlss.rs`, `upscale.wgsl`, `shader.wgsl` a
 ## The rest of the arrangement
 
 `.github/workflows/sync-upstream.yml` merges the project's `main` into this fork's `main`
-every night; a merge that conflicts fails that job and leaves the fork exactly where it was,
-and a build that fails publishes no release (`windows.yml`). `windows.yml` builds without
-running the tests, so a merge that silently drops part of a change is not caught by it -
-that is why the change itself is kept here, and why a merge touching the DLSS files is worth
-reading rather than rubber-stamping.
+every night; a merge that conflicts fails that job and leaves the fork exactly where it was.
+Before `.github/workflows/windows.yml` publishes anything, it checks that what this fork adds
+is still whole - the DLSS file, the keys that carry it where they are read, the view toggle,
+the look smoothing, and the project's own two contracts (the settings round trip, and every
+launcher row named in `by_tab()`). A failure there publishes nothing, so a merge that silently
+dropped part of a change is a red run and no update, rather than a release without the feature.

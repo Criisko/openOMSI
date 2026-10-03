@@ -151,6 +151,47 @@ jobs:
           Compress-Archive -Path dist/windows/* -DestinationPath "out/$name.zip"
           Get-ChildItem out
 
+      # What this fork adds on top of the project is checked before anything is handed to
+      # anyone. The build above compiles happily with a setting's key, or a launcher row,
+      # quietly gone - and the nightly merge (.github/workflows/sync-upstream.yml) is where
+      # that could happen. A failure here publishes nothing, exactly like a merge that
+      # conflicts, so a silent loss is a red run and no update rather than a release
+      # without the feature.
+      - name: What the fork adds is still whole
+        shell: pwsh
+        run: |
+          if (-not (Test-Path crates/omsi-render/src/dlss.rs)) { throw 'dlss.rs is gone' }
+          $mentions = @{
+            'dlss' = @(
+              'crates/omsi-app/src/settings.rs',
+              'crates/omsi-app/src/launcher/pages.rs',
+              'crates/omsi-launcher-core/src/lib.rs'
+            )
+            'view_toggle_interior' = @(
+              'crates/omsi-app/src/input_script.rs',
+              'crates/omsi-app/src/launcher/pages.rs'
+            )
+            'look_smoothing_ms' = @(
+              'crates/omsi-app/src/settings.rs',
+              'crates/omsi-app/src/game_lists.rs',
+              'crates/omsi-app/src/launcher/pages.rs',
+              'crates/omsi-launcher-core/src/lib.rs'
+            )
+          }
+          foreach ($needle in $mentions.Keys) {
+            foreach ($file in $mentions[$needle]) {
+              if (-not (Select-String -Path $file -Pattern $needle -Quiet)) {
+                throw "$file does not mention $needle any more"
+              }
+            }
+          }
+          # The project's own contracts: every key both readers of settings.cfg must know,
+          # and every row of a launcher tab named in by_tab().
+          cargo test --release --target $env:TARGET -p omsi-launcher-core --lib the_games_options_survive_a_save
+          if ($LASTEXITCODE -ne 0) { throw 'the settings round trip failed' }
+          cargo test --release --target $env:TARGET -p omsi-app --lib every_setting_is_on_exactly_one_tab
+          if ($LASTEXITCODE -ne 0) { throw 'a launcher row is not named in by_tab()' }
+
       - name: Publish
         shell: bash
         env:
