@@ -33,7 +33,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// The project on GitHub: where a bug report or a question belongs, whatever build is running.
-pub const REPO: &str = "openOMSI-Project/openOMSI";
 pub const REPO_URL: &str = "https://github.com/openOMSI-Project/openOMSI";
 /// The fork this build is from, and the releases it updates from. It has to ask itself rather
 /// than the project: the project's own releases carry no ReShade workaround, and the update
