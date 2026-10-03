@@ -105,7 +105,7 @@ impl Launcher {
                 self.ui.icon("download", icon_at, 26.0, ACCENT);
                 self.ui.text_in(&format!("Downloading openOMSI {}", release.version), title_r, 18.0, Weight::Bold, TEXT, Align::Left);
                 let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                self.ui.paragraph(&format!("{} of {} from github.com/{}", mb(done), mb(total), updater::REPO), body_at, inner.w, 13.0, Weight::Regular, TEXT_DIM);
+                self.ui.paragraph(&format!("{} of {} from github.com/{}", mb(done), mb(total), updater::RELEASES_REPO), body_at, inner.w, 13.0, Weight::Regular, TEXT_DIM);
                 self.ui.progress(Rect::new(inner.x, body_at.y + 40.0, inner.w, 10.0), frac, true);
             }
             Status::Installing(release) | Status::Restarting(release) => {
@@ -131,7 +131,7 @@ impl Launcher {
                     self.update.check();
                 }
                 if self.ui.button("upd-github", Rect::new(inner.x, buttons_y, 170.0, 38.0), "Open on GitHub", Some("open_in_new"), ButtonKind::Ghost) {
-                    updater::open_url(&format!("{}/releases/latest", updater::REPO_URL));
+                    updater::open_url(&format!("{}/releases/latest", updater::RELEASES_URL));
                 }
             }
             _ => {}

@@ -1,9 +1,11 @@
-//! Updates from the project's GitHub releases (github.com/openOMSI-Project/openOMSI).
+//! Updates from this build's own releases (the fork behind it is github.com/Criisko/openOMSI;
+//! the project itself is github.com/openOMSI-Project/openOMSI).
 //!
-//! Every push to main publishes a release `v<MAJOR.MINOR.COMMIT>` with one archive per
-//! platform (see .github/workflows/release.yml). The launcher asks the GitHub API for the
-//! latest release when it starts (setting `update_check`), and when it is newer than this
-//! build it offers it - or, with `update_auto`, installs it at once:
+//! Every push to the fork's main publishes a release `v<MAJOR.MINOR.COMMIT>` with one archive
+//! per platform (see .github/workflows/windows.yml): the project's own code, merged with the one
+//! local change the fork carries (the workaround that lets ReShade load). The launcher asks the
+//! GitHub API for the latest release when it starts (setting `update_check`), and when it is
+//! newer than this build it offers it - or, with `update_auto`, installs it at once:
 //!
 //! * **Windows, macOS, Linux**: the archive is downloaded (and checked against the SHA-256
 //!   GitHub lists for it), unpacked into `.openomsi-update` beside the program, and every
@@ -30,10 +32,15 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// The project on GitHub.
+/// The project on GitHub: where a bug report or a question belongs, whatever build is running.
 pub const REPO: &str = "openOMSI-Project/openOMSI";
 pub const REPO_URL: &str = "https://github.com/openOMSI-Project/openOMSI";
-const LATEST_API: &str = "https://api.github.com/repos/openOMSI-Project/openOMSI/releases/latest";
+/// The fork this build is from, and the releases it updates from. It has to ask itself rather
+/// than the project: the project's own releases carry no ReShade workaround, and the update
+/// check is what hands the player the newest project code together with that one local change.
+pub const RELEASES_REPO: &str = "Criisko/openOMSI";
+pub const RELEASES_URL: &str = "https://github.com/Criisko/openOMSI";
+const LATEST_API: &str = "https://api.github.com/repos/Criisko/openOMSI/releases/latest";
 
 /// A release newer than this build, with the file for this platform.
 #[derive(Clone, Debug, PartialEq)]
@@ -254,7 +261,7 @@ fn parse_release(v: &serde_json::Value, current: &str) -> anyhow::Result<Option<
     };
     Ok(Some(Release {
         version,
-        page: v["html_url"].as_str().map(str::to_string).unwrap_or_else(|| format!("{REPO_URL}/releases/tag/{tag}")),
+        page: v["html_url"].as_str().map(str::to_string).unwrap_or_else(|| format!("{RELEASES_URL}/releases/tag/{tag}")),
         notes: v["body"].as_str().unwrap_or("").to_string(),
         asset_name: want,
         asset_url: a["browser_download_url"].as_str().ok_or_else(|| anyhow::anyhow!("the release file has no address"))?.to_string(),
