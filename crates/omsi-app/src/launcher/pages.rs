@@ -1009,6 +1009,7 @@ fn known_action(a: &str) -> Option<String> {
         ("view_set_passenger", "Passenger view"),
         ("view_set_outside", "Outside view"),
         ("view_toggle_viewpoint", "Next view"),
+        ("view_toggle_interior", "Cabin and outside, one key"),
         ("vr_recenter", "VR: Reset view"),
         ("vr_toggle_desktop_mirror", "VR: Monitor preview"),
         ("vr_toggle_mode", "VR: Switch VR / desktop"),
@@ -1373,7 +1374,7 @@ fn game_controllers(l: &mut Launcher, body: Rect) {
         }
     }
     // the game's own view actions (looking around while held, the cameras, the views)
-    for a in ["doors_all", "door_4", "door_3", "door_2", "door_1", "gear_up", "gear_down", "view_look_left", "view_look_right", "view_look_up", "view_look_down", "view_reset_direction", "view_interiorcam_plus", "view_interiorcam_minus", "view_toggle_viewpoint", "view_set_driver", "view_set_passenger", "view_set_outside", "sim_pause", "screenshot", "quicksave", "toggel_mouse_ctrl", "toggel_ctrler"] {
+    for a in ["doors_all", "door_4", "door_3", "door_2", "door_1", "gear_up", "gear_down", "view_look_left", "view_look_right", "view_look_up", "view_look_down", "view_reset_direction", "view_interiorcam_plus", "view_interiorcam_minus", "view_toggle_viewpoint", "view_toggle_interior", "view_set_driver", "view_set_passenger", "view_set_outside", "sim_pause", "screenshot", "quicksave", "toggel_mouse_ctrl", "toggel_ctrler"] {
         if !actions.iter().any(|x| x == a) {
             actions.insert(1, a.to_string());
         }

@@ -3201,6 +3201,14 @@ impl App {
             "view_set_driver" => self.view = "driver".into(),
             "view_set_passenger" => self.view = "pax".into(),
             "view_set_outside" => self.view = "outside".into(),
+            // the cabin (the driver's or the passenger's) and the outside, one press apart:
+            // what a single button on a controller wants. `view_toggle_viewpoint` is the
+            // four-mode cycle, with the map in it, and stays where it is.
+            "view_toggle_interior" => {
+                if !self.ego {
+                    self.view = if self.view == "outside" { "driver".into() } else { "outside".into() };
+                }
+            }
             "view_set_map" => {
                 // OMSI's map view (F4) is a camera flown over the map; the city map of the
                 // navigator stays on Shift+M
