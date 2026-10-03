@@ -2356,7 +2356,7 @@ mod settings_tests {
             "s-wrange", "s-wlock", "s-pedt", "s-pedb", "set-ff_enabled", "set-ff_invert", "s-wreset", "s-go-pads",
         ];
         let mut camera = vec![
-            "s-seaty", "s-seatz", "s-seatx", "s-seatreset", "s-fov", "s-look-sens", "set-steer_look", "s-steer-look-angle", "s-steer-look-response", "set-head_movement", "set-driverview_smooth", "set-hands_in_cab", "set-alt_view",
+            "s-seaty", "s-seatz", "s-seatx", "s-seatreset", "s-fov", "s-look-sens", "s-look-smoothing", "set-steer_look", "s-steer-look-angle", "s-steer-look-response", "set-head_movement", "set-driverview_smooth", "set-hands_in_cab", "set-alt_view",
             "set-camera_collision", "set-driver", "set-head_tracking",
         ];
         if cfg!(windows) {
