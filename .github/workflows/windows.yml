@@ -111,6 +111,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
           New-Item -ItemType Directory -Force dist/windows | Out-Null
           Copy-Item "target/$env:TARGET/release/openomsi.exe", "target/$env:TARGET/release/openomsi-launcher.exe" dist/windows/
+          # Steam's rich presence: the x64 program imports its library and does not start at
+          # all without it beside the program ("steam_api64.dll was not found"), so the archive
+          # has to carry it as well (the project's own scripts/build-windows.cmd copies the
+          # same file, and this is the only thing it does that this build does not).
+          Copy-Item "assets/steam_redist/steam_api64.dll" dist/windows/
           Get-ChildItem dist/windows
 
       # Microsoft's shader compiler for DirectX 12 (dxcompiler.dll, dxil.dll beside the
