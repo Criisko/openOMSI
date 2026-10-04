@@ -1172,7 +1172,38 @@ pub mod env {
         C.get_or_init(Default::default)
     }
 
+    #[derive(Default)]
+    struct Fnv(u64);
+
+    impl std::hash::Hasher for Fnv {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            let mut h = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
+            for b in bytes {
+                h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+            self.0 = h;
+        }
+    }
+
+    type Local = std::cell::RefCell<HashMap<String, Option<OsString>, std::hash::BuildHasherDefault<Fnv>>>;
+
+    thread_local! {
+        static LOCAL: Local = Default::default();
+    }
+
     pub fn var_os(name: &str) -> Option<OsString> {
+        if let Some(v) = LOCAL.with(|l| l.borrow().get(name).cloned()) {
+            return v;
+        }
+        let v = shared(name);
+        LOCAL.with(|l| l.borrow_mut().insert(name.to_string(), v.clone()));
+        v
+    }
+
+    fn shared(name: &str) -> Option<OsString> {
         if let Some(v) = cache().read().ok().and_then(|c| c.get(name).cloned()) {
             return v;
         }

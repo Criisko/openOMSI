@@ -30,6 +30,7 @@ use std::sync::Arc;
 /// each and a minute of stutter after loading Spandau.
 pub const AI_SCHEMES: usize = 4;
 const SCRIPT_UPLOAD_BUDGET: usize = 4 << 20;
+const AI_JOB_SECS: f32 = 50e-6;
 
 /// Start a vehicle of type `ty` once and throw it away: its `{init}` and its displays read
 /// the files they need (depot data, fonts) into the caches before the first real one of the
@@ -226,6 +227,7 @@ pub struct AiCar {
     /// A rail vehicle: the track it has come along, (odometer, point), oldest first -
     /// where its rear bogie and its coupled cars and sections run (see `rail_behind`).
     pub rail_trail: std::collections::VecDeque<(f64, DVec3)>,
+    pub ai_secs: f32,
     /// A train turned round as a whole (its last car leads now): what a trip's
     /// `[trainreverse]` is compared with (Omsi.exe's vehicle +0x4e1).
     pub consist_reversed: bool,
@@ -2913,12 +2915,40 @@ impl Traffic {
             light_at: None,
             pull_out: 0.0,
             rail_trail: Default::default(),
+            ai_secs: 0.0,
             consist_reversed: false,
             park: None,
             seed,
             scheme,
         });
+        if kind != LaneKind::Air {
+            let i = self.cars.len() - 1;
+            if let Some(gap) = self.red_ahead(i) {
+                let st = &mut self.cars[i].state;
+                st.speed = st.speed.min((2.0 * st.decel * (gap - 1.0).max(0.0)).sqrt());
+            }
+        }
         id
+    }
+
+    fn red_ahead(&self, i: usize) -> Option<f32> {
+        let st = &self.cars[i].state;
+        let way = self.way_lanes(st, 200.0);
+        for (k, &(_, d)) in way.iter().enumerate().skip(1) {
+            if d > 150.0 {
+                break;
+            }
+            let Some((c, li)) = self.light_at_entry(&way, k) else {
+                continue;
+            };
+            let Some(ctl) = self.lights.get(c) else {
+                continue;
+            };
+            if !matches!(TrafficLightController::aspect(ctl.state(li)), Aspect::Green | Aspect::Dark) {
+                return Some(d - st.front);
+            }
+        }
+        None
     }
 
     /// The vehicle/paint sets the random traffic draws from.
@@ -4318,7 +4348,11 @@ impl Traffic {
                 }
                 // decided to go on yellow and too close to stop now, or past stopping at all
                 Aspect::Red | Aspect::RedYellow => {
-                    (amber == Some((c, li)) && gap < comfortable) || gap < possible - 0.5
+                    let go = (amber == Some((c, li)) && gap < comfortable) || gap < possible - 0.5;
+                    if !go && amber == Some((c, li)) {
+                        amber = None;
+                    }
+                    go
                 }
             };
             if !go {
@@ -6152,22 +6186,29 @@ impl Traffic {
         {
             use rayon::prelude::*;
             let net = &self.net;
-            type Work<'a> = (&'a AiState, &'a mut AiBody, &'a mut VehicleInstance, &'a mut AiFrame, &'a mut std::collections::VecDeque<(f64, DVec3)>);
+            type Work<'a> = (&'a AiState, &'a mut AiBody, &'a mut VehicleInstance, &'a mut AiFrame, &'a mut std::collections::VecDeque<(f64, DVec3)>, &'a mut f32);
             let mut work: Vec<Work> = self
                 .cars
                 .iter_mut()
                 .zip(frames.iter_mut())
                 .filter_map(|(c, f)| {
                     let f = f.as_mut()?;
-                    Some((&c.state, &mut c.body, &mut c.vehicle, f, &mut c.rail_trail))
+                    Some((&c.state, &mut c.body, &mut c.vehicle, f, &mut c.rail_trail, &mut c.ai_secs))
                 })
                 .collect();
+            work.sort_by(|a, b| b.5.total_cmp(a.5));
+            let mut jobs: Vec<Vec<Work>> = Vec::new();
+            for w in work {
+                match jobs.last_mut() {
+                    Some(job) if *w.5 < AI_JOB_SECS && *job[0].5 < AI_JOB_SECS && job.len() < 4 => job.push(w),
+                    _ => jobs.push(vec![w]),
+                }
+            }
             let profile = omsi_cfg::env::var_os("OMSI_PROFILE").is_some();
             // (a few cars per job: every job handed out wakes a worker, and the waking cost
             // the main thread more than a car's work)
-            work.par_iter_mut()
-                .with_min_len(4)
-                .for_each(|(state, body, vehicle, frame, trail)| {
+            jobs.into_par_iter().flatten_iter()
+                .for_each(|(state, body, vehicle, frame, trail, secs)| {
                     let t0 = std::time::Instant::now();
                     let ground = vehicle.ground.clone();
                     let contact = vehicle.contact.clone();
@@ -6175,7 +6216,7 @@ impl Traffic {
                     if rail {
                         record_rail_trail(trail, state.odometer as f64, state.way_point(net, 0.0));
                     }
-                    let trail = &**trail;
+                    let trail = &*trail;
                     let behind = |d: f64| rail_behind(trail, state, net, d);
                     body.step(
                         dt,
@@ -6195,6 +6236,7 @@ impl Traffic {
                     frame.steer_deg = body.steer;
                     let t1 = std::time::Instant::now();
                     vehicle.update_ai(dt, frame);
+                    *secs = t0.elapsed().as_secs_f32();
                     if profile && t0.elapsed().as_secs_f64() > 0.01 {
                         log::info!(
                             "  slow AI frame: {} body {:.1} ms, scripts {:.1} ms",
@@ -6720,6 +6762,24 @@ impl Traffic {
         car.gone = true;
     }
 
+    /// Take all random AI cars off the road now, keeping timetable buses. Returns how many
+    /// vehicles were removed. The configured target is unchanged, so random traffic can
+    /// populate the roads again normally.
+    pub fn clear_random(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene) -> usize {
+        let ids: Vec<u64> = self.cars.iter().filter(|c| !c.is_bus()).map(|c| c.id).collect();
+        let removed = ids.len();
+        for id in ids {
+            self.remove_car(world, renderer, scene, id);
+        }
+        removed
+    }
+
+    /// The AI on the roads: (cars, buses, cars asleep far from everybody, parked cars).
+    pub fn counts(&self) -> (usize, usize, usize, usize) {
+        let buses = self.cars.iter().filter(|c| c.is_bus()).count();
+        (self.cars.len() - buses, buses, self.dormant.len(), self.parked.values().map(Vec::len).sum())
+    }
+
     /// Take a car off the road now (the player took over its tour).
     pub fn remove_car(
         &mut self,
@@ -6793,18 +6853,12 @@ impl Traffic {
     }
 
     /// Tell a scheduled bus's script who wants in or out (`PAX_Entry<i>_Req`,
-    /// `PAX_Exit<i>_Req`): the stock AI door scripts open the rear doors only for a stop
-    /// request, which comes from the exit requests.
-    pub fn set_pax_requests(&mut self, id: u64, entry: &[bool], exit: &[bool]) {
+    /// `PAX_Exit<i>_Req`) and who stands in its doorways (`_Busy`): the stock AI door
+    /// scripts open the rear doors only for a stop request, which comes from the exit
+    /// requests.
+    pub fn set_pax_requests(&mut self, id: u64, doors: &crate::humans::DoorWants) {
         if let Some(c) = self.cars.iter_mut().find(|c| c.id == id) {
-            for (i, r) in entry.iter().enumerate() {
-                c.vehicle
-                    .set_var(&format!("PAX_Entry{i}_Req"), *r as i32 as f32);
-            }
-            for (i, r) in exit.iter().enumerate() {
-                c.vehicle
-                    .set_var(&format!("PAX_Exit{i}_Req"), *r as i32 as f32);
-            }
+            crate::humans::Humans::write_door_requests(&mut c.vehicle, doors);
         }
     }
 
@@ -7047,6 +7101,21 @@ impl Traffic {
                         }
                     }
                 }
+            }
+            if !lamp.animated {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (state, request).hash(&mut h);
+                if let Some(script) = lamp.script.as_ref() {
+                    for v in &script.lock().state.vars {
+                        v.to_bits().hash(&mut h);
+                    }
+                }
+                let sig = h.finish();
+                if lamp.shown == Some(sig) {
+                    continue;
+                }
+                lamp.shown = Some(sig);
             }
             // Traffic lamps do not enter World's ordinary scripted-object update path.
             // Switch their materials here too, so [matl_item] nightmaps light the LEDs.
@@ -7453,6 +7522,7 @@ impl Traffic {
             light_at: None,
             pull_out: 0.0,
             rail_trail: Default::default(),
+            ai_secs: 0.0,
             consist_reversed: false,
             park: None,
         });

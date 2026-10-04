@@ -67,6 +67,13 @@ impl WindingVotes {
     }
 }
 
+/// Entries and exits of a vehicle with variables of their own (`PAX_Entry<n>_Open` …
+/// `PAX_Exit<n>_Req`): Omsi.exe's eight, and eight more for buses with more doors than
+/// that (#719). A cabin's entries and exits past the eighth that the scripts give no
+/// variables of their own open with the eighth, as in Omsi.exe, and ask through the eighth's
+/// `_Req` (openOMSI's choice: Omsi.exe's request arrays have eight slots and lose them).
+pub const PAX_DOORS: usize = 16;
+
 /// Built-in variables every road vehicle has (`program/varlist_roadvehicle.txt` + generated).
 pub fn builtin_vars(root: &Path) -> Vec<String> {
     let mut v: Vec<String> =
@@ -105,6 +112,19 @@ pub fn builtin_vars(root: &Path) -> Vec<String> {
         for n in ["alpha", "beta", "gamma"] {
             v.push(format!("articulation_{i}_{n}"));
         }
+    }
+    // the doors past Omsi.exe's eight (#719), after all of its own variables
+    for a in 8..PAX_DOORS {
+        v.push(format!("PAX_Entry{a}_Open"));
+        v.push(format!("PAX_Entry{a}_Req"));
+        v.push(format!("PAX_Exit{a}_Open"));
+        v.push(format!("PAX_Exit{a}_Req"));
+    }
+    // somebody standing in the doorway (openOMSI's, #720: what a door's light barrier
+    // sees), after those
+    for a in 0..PAX_DOORS {
+        v.push(format!("PAX_Entry{a}_Busy"));
+        v.push(format!("PAX_Exit{a}_Busy"));
     }
     v
 }
@@ -1006,8 +1026,9 @@ pub struct VehicleInstance {
     /// wheels besides each wheel's own `Axle_Brakeforce_*`.
     v_brakeforce: Option<omsi_script::VarId>,
     v_clutch: Option<omsi_script::VarId>,
-    /// `PAX_Entry0..7_Req` and `PAX_Exit0..7_Req`: set by the passengers every frame and
-    /// cleared after the scripts' frame (see `clear_pax_requests`).
+    /// `PAX_Entry<n>_Req` and `PAX_Exit<n>_Req` ([`PAX_DOORS`]), and their `_Busy`: set by
+    /// the passengers every frame and cleared after the scripts' frame (see
+    /// `clear_pax_requests`).
     v_pax_req: Vec<omsi_script::VarId>,
     v_accel: [Option<omsi_script::VarId>; 3],
     v_wheels: Vec<[[Option<omsi_script::VarId>; 5]; 2]>,
@@ -1221,7 +1242,10 @@ impl VehicleInstance {
             v_brake: v("Brake").or_else(|| v("brake_pedal")),
             v_brakeforce: v("Brakeforce"),
             v_clutch: v("Clutch").or_else(|| v("clutch_pedal")),
-            v_pax_req: (0..8).flat_map(|i| [format!("PAX_Entry{i}_Req"), format!("PAX_Exit{i}_Req")]).filter_map(|n| v(&n)).collect(),
+            v_pax_req: (0..PAX_DOORS)
+                .flat_map(|i| [format!("PAX_Entry{i}_Req"), format!("PAX_Exit{i}_Req"), format!("PAX_Entry{i}_Busy"), format!("PAX_Exit{i}_Busy")])
+                .filter_map(|n| v(&n))
+                .collect(),
             v_accel: [v("A_Trans_X"), v("A_Trans_Y"), v("A_Trans_Z")],
             v_wheels,
             ty,
@@ -1900,13 +1924,12 @@ impl VehicleInstance {
 
     /// Where variable `name` sits among the script's variables (`State::vars`).
     pub fn var_slot(&self, name: &str) -> Option<usize> {
-        self.var_index.get(&name.to_ascii_lowercase()).map(|&i| i as usize)
+        omsi_script::compile::with_lower(name, |k| self.var_index.get(k).map(|&i| i as usize))
     }
 
     pub fn var(&self, name: &str) -> Option<f32> {
-        self.var_index
-            .get(&name.to_ascii_lowercase())
-            .map(|&i| self.state.vars[i as usize])
+        omsi_script::compile::with_lower(name, |k| self.var_index.get(k).copied())
+            .map(|i| self.state.vars[i as usize])
     }
 
     /// Whether variable `name` was declared in the vehicle's script set (as opposed to built-in host variables).
@@ -1923,8 +1946,8 @@ impl VehicleInstance {
     }
 
     pub fn set_var(&mut self, name: &str, v: f32) -> bool {
-        match self.var_index.get(&name.to_ascii_lowercase()) {
-            Some(&i) => {
+        match omsi_script::compile::with_lower(name, |k| self.var_index.get(k).copied()) {
+            Some(i) => {
                 self.state.vars[i as usize] = v;
                 true
             }
@@ -2258,9 +2281,9 @@ impl VehicleInstance {
     }
 
     /// The passengers' door requests are pulses: Omsi.exe clears all eight of each kind
-    /// after the vehicle's scripts ran (0x7d6214) and the passengers set them again every
-    /// frame. Kept, a timetable bus that drove out of the passengers' reach kept its last
-    /// request, and its automatic door never shut.
+    /// (here all [`PAX_DOORS`]) after the vehicle's scripts ran (0x7d6214) and the
+    /// passengers set them again every frame. Kept, a timetable bus that drove out of the
+    /// passengers' reach kept its last request, and its automatic door never shut.
     fn clear_pax_requests(&mut self) {
         for &id in &self.v_pax_req {
             self.state.vars[id as usize] = 0.0;
@@ -2679,10 +2702,12 @@ impl VehicleInstance {
             let mut ps = std::mem::take(&mut self.particles);
             let mut parts: Vec<ParticleSet> = self.trailers.iter_mut().map(|t| std::mem::take(&mut t.particles)).collect();
             {
+                // (each puff keeps the height of the road under it - the plane the wheels
+                // stand on - for the renderer to fade it out into, see `particles`)
                 let value = |n: &str| self.var(n).unwrap_or(0.0);
-                ps.update(dt, self.position, self.body_rotation(), &value);
+                ps.update_over(dt, self.position, self.body_rotation(), &|| self.particle_ground(), &value);
                 for (t, set) in self.trailers.iter().zip(parts.iter_mut()) {
-                    set.update(dt, t.position, t.body_rotation(), &value);
+                    set.update_over(dt, t.position, t.body_rotation(), &|| [-t.ground_lift(), 0.0, 0.0], &value);
                 }
             }
             self.particles = ps;
@@ -3383,6 +3408,12 @@ impl TrailerPart {
         (self.pitch, self.axle_z, self.track)
     }
 
+    /// How far the part's origin stands above the plane its wheels touch (m): the road is
+    /// at z = -this in its own frame (where its shadow blob lies, and the tyre spray starts).
+    pub fn ground_lift(&self) -> f32 {
+        self.ground_lift
+    }
+
     pub fn new(
         ty: Arc<VehicleType>,
         main: &VehicleType,
@@ -4015,6 +4046,18 @@ impl VehicleInstance {
             return [-self.ai_rest_offset().0, 0.0, 0.0];
         }
         fit_plane(&points)
+    }
+
+    /// The ground its `[smoke]` puffs are set off over, as a plane of the body frame (see
+    /// `contact_plane`): the driven one's where its tyres touch the road; an AI copy's the
+    /// plane it is placed `ai_rest_offset` over (the road its axles were set on), without
+    /// asking the ground under every wheel again for the exhaust of every car on the map.
+    fn particle_ground(&self) -> [f32; 3] {
+        if self.rigid.is_some() {
+            self.contact_plane()
+        } else {
+            [-self.ai_rest_offset().0, 0.0, 0.0]
+        }
     }
 
     /// Position/direction of a `.bus` camera in world space: (eye, yaw, pitch).

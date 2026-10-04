@@ -52,6 +52,8 @@ enum Btn {
     InteriorCam,
     Screenshot,
     CloseMenu,
+    /// On foot: down on the knees and up again (C).
+    Kneel,
 }
 
 impl Btn {
@@ -93,6 +95,10 @@ enum Role {
     Mouse,
     /// The game menu's (or the chooser's) list: a drag scrolls it, a tap picks a line.
     Menu,
+    /// The small navigator: a tap opens the city map, a drag moves it (as the mouse does,
+    /// #940), where it then stays - out of the middle of the screen, which it covered on a
+    /// phone (#1138).
+    Navigator,
 }
 
 struct Touched {
@@ -146,6 +152,9 @@ pub struct Touch {
     gear: Option<&'static str>,
     /// A word about what a button did (bottom middle), and how long it stays.
     note: Option<(String, f32)>,
+    /// The room the information bar has (`ui::Frame::info_room`): between the buttons along
+    /// the top, which it lay under in the middle of the screen (#1164).
+    pub info_room: Option<[f32; 3]>,
 }
 
 impl Touch {
@@ -181,6 +190,7 @@ impl Touch {
             painter: Painter::new(),
             note: None,
             gear: None,
+            info_room: None,
         }
     }
 
@@ -207,6 +217,18 @@ const PANEL_BG: Color = Color::rgba(14, 16, 20, 0.62);
 const PANEL_ON: Color = Color::rgba(232, 160, 48, 0.92);
 const TEXT: Color = Color::rgba(240, 240, 240, 1.0);
 const DIM: Color = Color::rgba(240, 240, 240, 0.55);
+
+/// Where the information bar goes on a screen `w` wide whose buttons along the top leave the
+/// gap from `left` to `right` (`pad` from the edges, the buttons' bottom at `bottom`): in the
+/// gap, or under the buttons across the screen where the gap is too narrow for it.
+fn info_room(w: f32, pad: f32, left: f32, right: f32, bottom: f32, u: f32) -> [f32; 3] {
+    let (l, r) = (left + 8.0 * u, right - 8.0 * u);
+    if r - l >= w * 0.35 {
+        [l, r, pad]
+    } else {
+        [pad, w - pad, bottom + 8.0 * u]
+    }
+}
 
 impl App {
     /// Where the controls are, for a picture of `w` x `h` physical pixels, and what they
@@ -235,6 +257,7 @@ impl App {
             } else {
                 push(&mut b, Btn::Map, rb(w - pad - r, pad + r, r), "close", "", false, true);
             }
+            t.info_room = Some(info_room(w, pad, pad, w - pad - r * 2.0, pad + r * 2.0, u));
             t.buttons = b;
             return;
         }
@@ -247,10 +270,12 @@ impl App {
             push(&mut b, btn, rb(x, y, r), icon, "", btn == Btn::Pause && self.paused, true);
             x += step;
         }
+        let left_end = x - step + r;
         let mut x = w - pad - r;
         let hidden = t.hidden;
         push(&mut b, Btn::Hide, rb(x, y, r), if hidden { "visibility" } else { "visibility" }, "", hidden, true);
         if hidden {
+            t.info_room = Some(info_room(w, pad, left_end, x - r, pad + r * 2.0, u));
             t.buttons = b;
             return;
         }
@@ -265,10 +290,16 @@ impl App {
         }
         x -= step;
         push(&mut b, Btn::Screenshot, rb(x, y, r), "photo_camera", "", false, true);
+        t.info_room = Some(info_room(w, pad, left_end, x - r, pad + r * 2.0, u));
         if !driving {
             // on foot or the free camera: a stick to walk or fly
             t.stick_r = 62.0 * u;
             t.stick_c = Vec2::new(pad + t.stick_r + 10.0 * u, h - pad - t.stick_r - 10.0 * u);
+            // on foot, out of the eyes: kneel for a picture from low down (#1148)
+            if let Some(f) = self.on_foot.as_ref().filter(|f| f.cam == crate::on_foot::FootCam::First && f.seat.is_none()) {
+                let kr = 26.0 * u;
+                push(&mut b, Btn::Kneel, rb(w - pad - kr, h - pad - kr, kr), "keyboard_arrow_down", "", f.kneel, true);
+            }
         } else {
             t.stick_r = 0.0;
         }
@@ -444,6 +475,8 @@ impl App {
                 let d = p - t.wheel_c;
                 Role::Wheel(d.y.atan2(d.x), d.length())
             }
+        } else if self.navigator.as_ref().is_some_and(|n| n.over_panel(p.x, p.y)) {
+            Role::Navigator
         } else {
             // the cockpit's switch under the finger, else the camera's
             self.on_cursor(p.x, p.y);
@@ -460,7 +493,7 @@ impl App {
                     self.touch_button(event_loop, b, true);
                 }
             }
-            Role::Mouse => {
+            Role::Mouse | Role::Navigator => {
                 self.on_cursor(p.x, p.y);
                 self.left_button(event_loop, true);
             }
@@ -519,6 +552,13 @@ impl App {
                 let d = p - self.touch.stick_c;
                 self.touch.stick_at = Some((self.touch.stick_c, d.clamp_length_max(self.touch.stick_r)));
                 self.stick_keys(d / self.touch.stick_r);
+            }
+            // (only a finger that has gone a way drags it: one wavering on a tap still opens
+            // the city map)
+            Role::Navigator => {
+                if self.touch.fingers[k].moved {
+                    self.on_cursor(p.x, p.y);
+                }
             }
             Role::Cockpit | Role::Mouse => {
                 if let (Role::Mouse, Some(_)) = (role, self.touch.pinch) {
@@ -595,6 +635,18 @@ impl App {
             Role::Cockpit | Role::Mouse => {
                 self.on_cursor(p.x, p.y);
                 self.left_button(event_loop, false);
+            }
+            Role::Navigator => {
+                if f.moved {
+                    self.on_cursor(p.x, p.y);
+                }
+                match (cancelled, f.moved, self.navigator.as_mut()) {
+                    // (a tap taken away by the system opens nothing)
+                    (true, false, Some(n)) => {
+                        n.panel_release();
+                    }
+                    _ => self.left_button(event_loop, false),
+                }
             }
             Role::Menu => {
                 if !f.moved && !cancelled {
@@ -707,6 +759,7 @@ impl App {
                 }
             }
             Btn::Pause => self.toggle_pause(),
+            Btn::Kneel => self.kneel(),
             Btn::Camera => {
                 // driver → outside → passenger → driver (on foot: back to the bus)
                 self.view = match self.view.as_str() {
@@ -800,7 +853,7 @@ impl App {
                     n.enabled = !n.enabled;
                 }
             }
-            Btn::Info => self.info_bar = !self.info_bar,
+            Btn::Info => self.set_info_bar(!self.info_bar),
             Btn::Tilt => {
                 self.touch.tilt = !self.touch.tilt;
                 crate::platform::set_tilt(self.touch.tilt);
@@ -822,8 +875,14 @@ impl App {
                 t.steer = s;
             }
         } else if !t.steering {
-            let back = (1.2 + 1.5 * t.steer.abs()) * dt;
-            t.steer = if t.steer.abs() <= back { 0.0 } else { t.steer - back * t.steer.signum() };
+            // let go: back as the bus's wheel comes back by itself with the keys - the castor's
+            // pull, slow standing and brisker rolling (OMSI's steady pace with Steering
+            // linearity, less at speed with Dynamic steering), not at all with Old Steering;
+            // it sprang back to the middle in a third of a second whatever the speed (#1090)
+            t.steer = match self.player.as_ref() {
+                Some(p) => p.axes.let_go(t.steer, dt),
+                None => 0.0,
+            };
         }
         if let Some((_, left)) = t.note.as_mut() {
             *left -= dt;
@@ -1085,6 +1144,14 @@ fn steer_curve(s: f32) -> f32 {
 mod tests {
     use super::touch_lock_angle;
     use crate::settings::Settings;
+
+    /// The information bar keeps to the gap between the buttons along the top (it lay under
+    /// them, its ends hidden, #1164), or goes under them where the gap is narrow.
+    #[test]
+    fn the_information_bar_keeps_clear_of_the_buttons_along_the_top() {
+        assert_eq!(super::info_room(1280.0, 14.0, 278.0, 914.0, 56.0, 1.0), [286.0, 906.0, 14.0]);
+        assert_eq!(super::info_room(720.0, 14.0, 278.0, 470.0, 56.0, 1.0), [14.0, 706.0, 64.0]);
+    }
 
     #[test]
     fn the_screen_wheel_turns_as_the_wheel_settings_say() {

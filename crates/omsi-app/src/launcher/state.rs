@@ -47,6 +47,18 @@ pub struct ServerEntry {
     pub address: String,
 }
 
+/// How the Multiplayer page joins a server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JoinProto {
+    /// The web gateway where the server answered, else UDP.
+    #[default]
+    Auto,
+    /// Straight to the game port over UDP (no status needed).
+    Udp,
+    /// Through the server's web gateway (a WebSocket).
+    WebSocket,
+}
+
 /// A code host's status page (its gateway is the session's port + 10).
 fn host_status(code: &str) -> Result<omsi_net::ws::ServerInfo, String> {
     let c = omsi_net::SessionCode::decode(code)?;
@@ -150,7 +162,18 @@ fn choice_path() -> std::path::PathBuf {
 
 impl Choice {
     pub fn load() -> Choice {
-        let mut c: Choice = std::fs::read_to_string(choice_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let c: Choice = std::fs::read_to_string(choice_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        Self::fresh(c)
+    }
+
+    /// A duty read back from the file, as a new launcher starts with it.
+    fn fresh(mut c: Choice) -> Choice {
+        // A server is joined on purpose, in the launcher's own session (Multiplayer page): a
+        // join left in the file made every later start connect to it, with no sign of it on
+        // the Drive page ("Leave Server" is only there for a server joined since the launch).
+        if c.lan_mode == "join" {
+            c.lan_mode = "off".into();
+        }
         if c.version < 2 {
             // the start was always the map's first entry point: now it is automatic
             c.entry = -1;
@@ -488,29 +511,53 @@ impl State {
     }
 
     /// The Drive page joins `address`: the server's map is the map, the session is joined.
-    pub fn join_server(&mut self, address: &str) {
-        let Some((_, Ok(info))) = self.server_info.get(address).cloned() else {
-            self.set_status("The server has not answered yet (is its address right? is it running?)", true);
-            return;
+    /// `proto` says how: over UDP straight to the game port, over the server's web gateway
+    /// (a WebSocket), or `Auto` (the web gateway where the server answered, else UDP).
+    pub fn join_server(&mut self, address: &str, proto: JoinProto) {
+        let info = self.server_info.get(address).cloned().and_then(|(_, r)| r.ok());
+        let is_web = omsi_net::ws::ws_url(address).is_some() || omsi_net::official::is_alias(address);
+        let proto = match (proto, &info) {
+            (JoinProto::Auto, Some(_)) => JoinProto::WebSocket,
+            (JoinProto::Auto, None) if !is_web => JoinProto::Udp,
+            (p, _) => p,
         };
-        // A map not installed here comes with the server's mods when the game joins
-        // (`lan_mods`), so this is a notice, not a refusal. The Drive page needs a map of
-        // this installation chosen, so the choice stays as it is then: `duty()` starts the
-        // game on the server's map anyway.
-        if !self.maps.is_empty() && !self.maps.iter().any(|m| m.file.eq_ignore_ascii_case(&info.map)) {
-            self.set_status(format!("The server plays {}, which is not installed here: it is fetched from the server on joining.", info.map), false);
-        } else {
-            self.choice.map = info.map.clone();
+        let lan_addr = match proto {
+            JoinProto::Udp => {
+                if is_web {
+                    self.set_status("UDP needs the game's address (host or host:port), not a web link", true);
+                    return;
+                }
+                address.to_string()
+            }
+            _ => {
+                let Some(info) = info.as_ref() else {
+                    self.set_status("The server has not answered yet (is its address right? is it running?)", true);
+                    return;
+                };
+                // (a server added by its bare address is joined where it answered: its web gateway)
+                if !is_web && !info.reached_at.is_empty() { info.reached_at.clone() } else { address.to_string() }
+            }
+        };
+        if let Some(info) = info.as_ref() {
+            // A map not installed here comes with the server's mods when the game joins
+            // (`lan_mods`), so this is a notice, not a refusal.
+            // The Drive page needs a map of this installation chosen, so the choice stays
+            // as it is then: `duty()` starts the game on the server's map anyway.
+            if !self.maps.is_empty() && !self.maps.iter().any(|m| m.file.eq_ignore_ascii_case(&info.map)) {
+                self.set_status(format!("The server plays {}, which is not installed here: it is fetched from the server on joining.", info.map), false);
+            } else {
+                self.choice.map = info.map.clone();
+            }
         }
         self.choice.lan_mode = "join".into();
-        // (a server added by its bare address is joined where it answered: its web gateway)
-        let bare = omsi_net::ws::ws_url(address).is_none() && !omsi_net::official::is_alias(address);
-        self.choice.lan_addr = if bare && !info.reached_at.is_empty() { info.reached_at.clone() } else { address.to_string() };
+        self.choice.lan_addr = lan_addr;
         self.joined_server = Some(address.to_string());
-        self.join = (true, format!("the server {}", info.name));
+        let name = info.as_ref().map(|i| i.name.clone()).unwrap_or_else(|| address.to_string());
+        self.join = (true, format!("the server {name}"));
         self.join_checked = address.to_string();
         self.touched();
-        self.set_status(format!("Joined {} - choose your bus and duty, then Start the duty", info.name), false);
+        let how = if proto == JoinProto::Udp { " over UDP" } else { "" };
+        self.set_status(format!("Joined {name}{how} - choose your bus and duty, then Start the duty"), false);
     }
 
     /// Back to playing alone (the Drive page's "Leave Server").
@@ -1199,8 +1246,8 @@ pub fn root_problem(root: &str) -> String {
 /// adapter", a fatal message) and the last lines of the log. None for a game that ended as
 /// it should.
 pub fn crash_of(log: &std::path::Path) -> Option<(String, String)> {
-    let text = std::fs::read(log).ok()?;
-    let text = String::from_utf8_lossy(&text[text.len().saturating_sub(64 * 1024)..]).to_string();
+    let bytes = std::fs::read(log).ok()?;
+    let text = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(64 * 1024)..]).to_string();
     let all: Vec<&str> = text.lines().collect();
     // (the run itself only: an error the launcher logged before the game started - a
     // preview's picture left out - titled the report of a game that died much later, and
@@ -1226,21 +1273,44 @@ pub fn crash_of(log: &std::path::Path) -> Option<(String, String)> {
     let first = lines[at].split_once("] ").map(|x| x.1).unwrap_or(lines[at]).trim();
     // (a panic's message is on the following lines)
     let mut what = first.to_string();
+    // (and stops at the next record: a lost device's line had "game ends" and the tile
+    // loading after it in the report's title, #1187)
     for l in lines.iter().skip(at + 1).take(6) {
-        if l.trim().is_empty() || l.trim_start().starts_with("0:") {
+        if l.trim().is_empty() || l.trim_start().starts_with("0:") || l.starts_with('[') {
             break;
         }
         what.push(' ');
         what.push_str(l.trim());
     }
-    let tail = all[all.len().saturating_sub(150)..].join("\n");
+    // the computer, its graphics card and the command line (the map) from the start of the
+    // run, before the end of the log and a line `…`: a report of the end alone never said
+    // what it happened on (#1187). Its GitHub link keeps them and shortens only the end.
+    let whole = String::from_utf8_lossy(&bytes);
+    let machine: Vec<&str> = MACHINE_LINES.iter().filter_map(|k| whole.lines().rfind(|l| l.contains(k))).collect();
+    let end = all[all.len().saturating_sub(150)..].join("\n");
+    let tail = if machine.is_empty() { end } else { format!("{}\n{CRASH_TAIL_GAP}\n{end}", machine.join("\n")) };
     Some((what.chars().take(600).collect(), tail))
 }
+
+/// The log lines that tell what a game ran on (see `crash_of`).
+const MACHINE_LINES: [&str; 4] = ["] system: ", "] graphics adapter: ", "] opening graphics device: ", "] command line: "];
+
+/// The line between the machine and the end of the log in a crash's tail.
+pub const CRASH_TAIL_GAP: &str = "…";
 
 #[cfg(test)]
 mod choice_tests {
     /// `launcher-duty.json` from before the number plate field: the missing key falls back to
     /// the default (no plate), and a typed plate survives a round trip.
+    #[test]
+    fn a_remembered_join_is_not_resumed_at_launch() {
+        let saved: super::Choice = serde_json::from_str(r#"{"lan_mode":"join","lan_addr":"main.example.org"}"#).unwrap();
+        assert_eq!(saved.lan_mode, "join");
+        assert_eq!(super::Choice::fresh(saved).lan_mode, "off");
+        let host: super::Choice = serde_json::from_str(r#"{"lan_mode":"host"}"#).unwrap();
+        assert_eq!(super::Choice::fresh(host).lan_mode, "host");
+    }
+
     #[test]
     fn an_old_duty_file_loads_and_a_typed_plate_is_kept() {
         let old: super::Choice = serde_json::from_str(r#"{"bus":"Vehicles/x.bus","map":"maps/x/global.cfg"}"#).unwrap();
@@ -1292,6 +1362,28 @@ mod crash_tests {
         // an error before the game started, or one it got over, is not the crash
         std::fs::write(&p, "[t ERROR omsi_render] a part of the picture could not be recorded (left out)\n[t INFO x] starting the game: omsi\n[t INFO omsi_render] renderer: compiling the sky and clouds shaders\n").unwrap();
         assert!(super::crash_of(&p).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The report says what the game ran on (the start of the log), and its title is the
+    /// error alone, not the records after it (#1187).
+    #[test]
+    fn the_report_has_the_computer_and_a_clean_title() {
+        let dir = std::env::temp_dir().join(format!("openomsi-crash-machine-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("game.log");
+        let mut log = String::from("[t INFO openomsi_game::applog] system: windows x86_64 (10.0), 8 threads, 8192 MB memory\n[t INFO openomsi_game::applog] command line: openomsi --map maps/X/global.cfg\n[t INFO omsi_render] graphics adapter: GTX 750 (DiscreteGpu, Dx12, 2048 MB of its own), texture memory taken for it: 716 MB\n");
+        // (more than the end that goes with the report)
+        for k in 0..400 {
+            log.push_str(&format!("[t INFO openomsi_game::scene] tile loading: placed tile {k},0\n"));
+        }
+        log.push_str("[t ERROR openomsi_game::app_events] ending the session: the graphics device was lost (Unknown: Out of memory)\n[t INFO openomsi_game::app_events] game ends\n[t WARN openomsi_game::scene] tile loading: first-area batch prepared in 352.71 s\n");
+        std::fs::write(&p, log).unwrap();
+        let (what, tail) = super::crash_of(&p).unwrap();
+        assert_eq!(what, "ending the session: the graphics device was lost (Unknown: Out of memory)");
+        let (machine, end) = tail.split_once(&format!("\n{}\n", super::CRASH_TAIL_GAP)).unwrap();
+        assert!(machine.contains("8192 MB memory") && machine.contains("GTX 750") && machine.contains("maps/X/global.cfg"), "{machine}");
+        assert!(end.contains("352.71 s") && !end.contains("placed tile 0,0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

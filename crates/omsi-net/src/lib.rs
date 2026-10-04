@@ -79,6 +79,7 @@ pub mod addrs;
 pub mod bridge;
 pub mod wire;
 pub mod world;
+pub mod vars;
 pub mod ws;
 pub mod tunnel;
 pub mod official;
@@ -1394,6 +1395,9 @@ pub struct LanSession {
     /// The shared world (see `world`): frames, descriptions and handed-over passengers
     /// the host sent (client), and what the clients asked for (host).
     world_in: Vec<(Instant, world::WorldFrame)>,
+    /// Every script variable of our vehicle going out (`vars.rs`), and the others' coming in.
+    var_sender: vars::VarSender,
+    vars_in: Vec<vars::VarsIn>,
     descs: Vec<world::Desc>,
     wants: Vec<(u32, Vec<world::EntityRef>)>,
     claims: Vec<(u32, Vec<u32>)>,
@@ -1495,6 +1499,8 @@ impl LanSession {
             sent: Cell::new(0),
             received: 0,
             world_in: Vec::new(),
+            var_sender: vars::VarSender::default(),
+            vars_in: Vec::new(),
             descs: Vec::new(),
             wants: Vec::new(),
             claims: Vec::new(),
@@ -2517,6 +2523,10 @@ impl LanSession {
                 self.on_state(&data, from);
                 continue;
             }
+            if data[0] == vars::VARS_MAGIC {
+                self.on_vars(&data, from);
+                continue;
+            }
             let Ok(text) = std::str::from_utf8(&data) else {
                 continue;
             };
@@ -2716,6 +2726,54 @@ impl LanSession {
         }
         peer.last_seen = Instant::now();
         Some(peer)
+    }
+
+    /// Every script variable of our vehicle (see `vars.rs`): `float_ids[k]` holds
+    /// `floats[k]`, the same for the strings, `table` names them (a hash of their names). Called
+    /// every frame; it sends what is due.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_vars(&mut self, table: u32, float_ids: &[u16], floats: &[f32], string_ids: &[u16], strings: &[String], dt: f32) {
+        let msgs = self.var_sender.tick(PROTOCOL as u8, self.my_id, table, float_ids, floats, string_ids, strings, dt);
+        for m in msgs {
+            match self.role {
+                Role::Host => self.broadcast(&m, None),
+                Role::Client => {
+                    if let Some(h) = self.host {
+                        self.send(&m, h);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The others' vehicle variables that came since the last call, oldest first.
+    pub fn take_vars(&mut self) -> Vec<vars::VarsIn> {
+        std::mem::take(&mut self.vars_in)
+    }
+
+    fn on_vars(&mut self, data: &[u8], from: SocketAddr) {
+        let Some(v) = vars::decode(data, PROTOCOL as u8) else { return };
+        if v.id == self.my_id || v.id == 0 {
+            return;
+        }
+        match self.role {
+            // (as a state: only a player we welcomed, from its address, within its rate)
+            Role::Host => {
+                if self.checked_peer(v.id, from, STATE_RATE, true).is_none() {
+                    return;
+                }
+                self.broadcast(data, Some(v.id));
+            }
+            Role::Client => {
+                if !self.peers.contains_key(&v.id) {
+                    return;
+                }
+            }
+        }
+        // (a game that stopped reading does not pile them up without end)
+        if self.vars_in.len() < 1024 {
+            self.vars_in.push(v);
+        }
     }
 
     fn on_state(&mut self, data: &[u8], from: SocketAddr) {

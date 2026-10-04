@@ -161,7 +161,9 @@ pub fn snow_on_glass(root: &std::path::Path) -> omsi_texture::Image {
     // the same grain as the rain film it stands in for (`regen.tga`, 1024 x 1024 with
     // drops a dozen pixels across and a mean alpha of 7 %)
     const SIDE: usize = 512;
-    let mut rgba = vec![0u8; SIDE * SIDE * 4];
+    // white where it is clear as well, so that the smaller mip levels stay white specks
+    // and do not grey towards the black of transparent texels
+    let mut rgba = [255u8, 255, 255, 0].repeat(SIDE * SIDE);
     let flake =
         omsi_texture::decode_file(&omsi_cfg::resolve_path(root, "Texture\\snowflake.tga")).ok();
     let mut rng = 0x9E37_79B9_7F4A_7C15u64;
@@ -222,8 +224,41 @@ pub fn snow_on_glass(root: &std::path::Path) -> omsi_texture::Image {
     }
 }
 
+/// The snow-on-glass picture (`snow_on_glass`) on the GPU, with its mip chain: one level
+/// alone, its specks of a pixel or two were point-sampled across a whole windscreen and
+/// glittered with every move of the head (#946).
+pub fn add_snow_on_glass(
+    renderer: &omsi_render::Renderer,
+    scene: &mut omsi_render::Scene,
+    root: &std::path::Path,
+) -> omsi_render::TextureId {
+    renderer.add_texture(scene, &snow_on_glass(root), true)
+}
+
 #[cfg(test)]
 mod tests {
+    /// The snow on the glass goes up with its mip levels, and it is white throughout (a
+    /// level made smaller stays white, only less opaque).
+    #[test]
+    fn snow_on_glass_has_mip_levels_and_stays_white() {
+        let img = super::snow_on_glass(std::path::Path::new("/nonexistent"));
+        assert!(img.rgba.chunks_exact(4).all(|p| p[..3] == [255, 255, 255]));
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
+        let instance = wgpu::Instance::new(descriptor);
+        let renderer = pollster::block_on(omsi_render::Renderer::new_with(
+            &instance,
+            None,
+            Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            omsi_render::RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() },
+        ))
+        .expect("noop renderer");
+        let mut scene = renderer.new_scene();
+        let id = super::add_snow_on_glass(&renderer, &mut scene, std::path::Path::new("/nonexistent"));
+        assert_eq!(renderer.texture_levels(&scene, id), Some((512, 512, 10)));
+    }
+
     #[test]
     fn snow_on_glass_is_mostly_clear_and_thickest_at_the_rim() {
         // no content root here: the procedural specks

@@ -24,8 +24,8 @@ const SEESAW_WEIGHT: f64 = 0.05;
 /// Kilometres that wear the penalty down by one (P −= km / 30).
 const PENALTY_KM: f64 = 30.0;
 /// A stop's arrival later than this (s) is late, its departure earlier than minus that early.
-const LATE_ARRIVAL: f64 = 180.0;
-const EARLY_DEPARTURE: f64 = -120.0;
+pub(crate) const LATE_ARRIVAL: f64 = 180.0;
+pub(crate) const EARLY_DEPARTURE: f64 = -120.0;
 
 pub struct Career {
     pub driver: Option<Driver>,

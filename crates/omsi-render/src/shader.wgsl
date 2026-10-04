@@ -414,6 +414,8 @@ struct VsOut {
     // it: from the sun (light A) and from the light above (light B)
     @location(5) spec_sun: vec3<f32>,
     @location(6) spec_sky: vec3<f32>,
+    // where a [matl_envmap] reads its sphere map, made at the vertex (see `sphere_map_uv`)
+    @location(7) env_uv: vec2<f32>,
 };
 // What the fragment shaders take: VsOut without the invariant on the position. The
 // invariant belongs to the vertex output; on a fragment input naga's GLSL writer turns it
@@ -427,7 +429,29 @@ struct FsIn {
     @location(4) params2: vec4<f32>,
     @location(5) spec_sun: vec3<f32>,
     @location(6) spec_sky: vec3<f32>,
+    @location(7) env_uv: vec2<f32>,
 };
+
+// Direct3D's D3DTSS_TCI_SPHEREMAP, by which Omsi.exe's environment stage reads the sphere
+// map of a [matl_envmap] (0x7ff670): at the vertex, from the reflection R in camera space
+// (x right, y up, z ahead), u = Rx/m + 0.5 and v = Ry/m + 0.5 with m = 2|R - (0, 0, 1)| -
+// as Windows draws it (wine's d3d9 test_generated_texcoords, measured there). What a pane
+// facing the camera mirrors is the map's middle, at half the scale of the u = Rx/2 + 0.5
+// taken before (which showed the whole street of the picture across a bus's flank); the
+// map's rim is the reflection running on away from the camera, at a grazing angle, where
+// the picture swings round between two vertices - the seam the original shows there.
+// `eye` is the camera's position, or its mirror image under the road for the player
+// vehicle seen in a puddle; the camera's own axes lay the map out either way.
+// (The headset: laid out by the bus's heading, level, not by each eye's view.)
+fn sphere_map_uv(world: vec3<f32>, n: vec3<f32>, eye: vec3<f32>) -> vec2<f32> {
+    let r = reflect(normalize(world - eye), n);
+    let vr_env = camera.cam_up.w > 0.5;
+    let right = select(camera.cam_right.xyz, vec3<f32>(cos(camera.cam_right.w), -sin(camera.cam_right.w), 0.0), vr_env);
+    let up = select(camera.cam_up.xyz, vec3<f32>(0.0, 0.0, 1.0), vr_env);
+    let rc = vec3<f32>(dot(r, right), dot(r, up), dot(r, cross(up, right)));
+    let m = 2.0 * length(rc - vec3<f32>(0.0, 0.0, 1.0));
+    return rc.xy / max(m, 1e-6) + 0.5;
+}
 
 // Direct3D's specular term at a vertex (Omsi.exe switches it on in FormActivate, 0x8254e0):
 // Omsi.exe's sun (light 0, 0x7089f0: directional, specular = light A) and the light from
@@ -470,18 +494,24 @@ fn vertex_main(in_pos: vec3<f32>, in_normal: vec3<f32>, in_uv: vec2<f32>, in_ins
     let m = model_matrix(e);
     let wp = m * vec4<f32>(in_pos, 1.0);
     var out: VsOut;
-    // Legacy surfaces are pulled towards the eye along the line of sight. OMSI splines and
-    // [surface] objects use a fixed 8 cm world lift; ordered scenery phases use their authored
-    // world positions. Both use code 0.9 to keep weather classification without view-space pull.
-    // Painted ground (0.75) stays put.
+    // Road surfaces (splines, the objects lying on them, a shadow blob) are pulled towards
+    // the eye along the line of sight - the picture does not move, only the depth - so that
+    // they win over the flush ground beside them. Code 0.9 keeps the surface shading without
+    // the pull; painted ground (0.75) stays put.
     let surf = inst_params[e * 2u + 1u].w;
     var cp = wp.xyz;
     if (surf > 0.9) {
         let to = wp.xyz - camera.cam_pos.xyz;
         let d = length(to);
-        // (legacy surface objects, 1.25, a little more than the splines under them)
+        // The same share of the way to the eye at every vertex (0.3 %, a few millimetres of
+        // height seen from the cab): the pulled road is still the plane it was, so a spline
+        // laid a millimetre over another - the rails or markings over a road - stays over it
+        // however the two are cut into triangles. A fixed 2 cm more along each vertex's own
+        // line of sight bowed the road's long triangles over the short ones of what lies on
+        // it, by millimetres near the eye, and the rails went under the road there (#1196).
+        // (surface objects, 1.25, a little more than the splines under them)
         let decal = select(0.0, 0.01 + 0.001 * d, surf > 1.1 && surf < 1.5);
-        let pull = min(0.02 + 0.002 * d + decal, d * 0.3);
+        let pull = min(0.003 * d + decal, d * 0.3);
         cp = wp.xyz - to / max(d, 1e-3) * pull;
     }
     out.clip = camera.view_proj * vec4<f32>(cp, 1.0);
@@ -490,6 +520,7 @@ fn vertex_main(in_pos: vec3<f32>, in_normal: vec3<f32>, in_uv: vec2<f32>, in_ins
     let sp = vertex_specular(wp.xyz, out.normal);
     out.spec_sun = sp[0];
     out.spec_sky = sp[1];
+    out.env_uv = sphere_map_uv(wp.xyz, out.normal, camera.cam_pos.xyz);
     let pr = inst_params[e * 2u];
     out.uv = in_uv + pr.zw;
     out.params = pr;
@@ -519,6 +550,8 @@ fn vs_puddle_vehicle(in: VsIn) -> VsOut {
     out.spec_sun = vec3<f32>(0.0);
     out.spec_sky = vec3<f32>(0.0);
     let plane = vehicle_reflection.plane;
+    // the sphere map from the reflected eye fs_puddle_vehicle shades the vehicle from
+    out.env_uv = sphere_map_uv(out.world, out.normal, camera.cam_pos.xyz - 2.0 * plane.xyz * (dot(plane.xyz, camera.cam_pos.xyz) - plane.w));
     let reflected = out.world - 2.0 * plane.xyz * (dot(plane.xyz, out.world) - plane.w);
     out.clip = camera.view_proj * vec4<f32>(reflected, 1.0);
     if (out.params.y < 0.5) { out.clip = vec4<f32>(0.0, 0.0, 2.0, 1.0); }
@@ -1633,14 +1666,7 @@ fn shade_vanilla(in: FsIn, puddle_weight: ptr<function, f32>, eye: vec3<f32>) ->
     if (material.params2.y > 0.0) {
         // [matl_envmap]: sphere map reflection, masked by the diffuse alpha like the original
         let vdir = normalize(in.world - eye);
-        let r = reflect(vdir, n);
-        // (the headset: laid out by the bus's heading, level, not by each eye's view)
-        let vr_env = camera.cam_up.w > 0.5;
-        let env_right = select(camera.cam_right.xyz, vec3<f32>(cos(camera.cam_right.w), -sin(camera.cam_right.w), 0.0), vr_env);
-        let env_up = select(camera.cam_up.xyz, vec3<f32>(0.0, 0.0, 1.0), vr_env);
-        let rx = dot(r, env_right);
-        let ry = dot(r, env_up);
-        var env_uv = vec2<f32>(rx * 0.5 + 0.5, 0.5 + ry * 0.5);
+        var env_uv = in.env_uv;
         if (material.bump.y > 0.5) {
             env_uv = env_uv + bump_offset(duv);
         }

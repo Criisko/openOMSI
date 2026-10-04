@@ -70,6 +70,77 @@ pub struct Input {
     pub touch: bool,
 }
 
+/// Shift, Ctrl, Alt and the logo key as the launcher knows them. The window says when they
+/// change (`ModifiersChanged`) - except on Android, whose winit backend never does: Shift or
+/// Ctrl held on a phone's keyboard went unseen there, a key bound with Shift was saved as the
+/// letter alone and Ctrl+V typed a "v" (#634). Until the window has said it once, the
+/// modifier keys' own presses and releases tell what is held.
+#[derive(Default, Clone, Copy)]
+pub struct Modifiers {
+    /// The modifier keys held, a bit each (left and right apart: one let go of while the
+    /// other is still down keeps it held).
+    keys: u8,
+    /// What the window last said, once it has said anything.
+    told: Option<winit::keyboard::ModifiersState>,
+}
+
+impl Modifiers {
+    fn bit(code: winit::keyboard::KeyCode) -> Option<u8> {
+        use winit::keyboard::KeyCode as K;
+        let k = [K::ShiftLeft, K::ShiftRight, K::ControlLeft, K::ControlRight, K::AltLeft, K::AltRight, K::SuperLeft, K::SuperRight];
+        k.iter().position(|c| *c == code).map(|i| 1 << i)
+    }
+
+    /// A key went down or up; true when it was a modifier key.
+    pub fn key(&mut self, code: winit::keyboard::KeyCode, pressed: bool) -> bool {
+        let Some(b) = Self::bit(code) else { return false };
+        if pressed {
+            self.keys |= b;
+        } else {
+            self.keys &= !b;
+        }
+        true
+    }
+
+    /// The window's `ModifiersChanged`.
+    pub fn told(&mut self, m: winit::keyboard::ModifiersState) {
+        self.told = Some(m);
+    }
+
+    /// The keyboard went to another window: what is let go of there is not held here.
+    pub fn release_keys(&mut self) {
+        self.keys = 0;
+    }
+
+    pub fn state(&self) -> winit::keyboard::ModifiersState {
+        use winit::keyboard::ModifiersState as M;
+        if let Some(m) = self.told {
+            return m;
+        }
+        let mut m = M::empty();
+        for (bits, flag) in [(0b11, M::SHIFT), (0b1100, M::CONTROL), (0b11_0000, M::ALT), (0b1100_0000, M::SUPER)] {
+            if self.keys & bits != 0 {
+                m |= flag;
+            }
+        }
+        m
+    }
+
+    /// Ctrl, or the logo key (Cmd on a Mac): the one for copy and paste.
+    pub fn command(&self) -> bool {
+        let m = self.state();
+        m.control_key() || m.super_key()
+    }
+
+    /// Into the widgets' input.
+    pub fn apply(&self, input: &mut Input) {
+        let m = self.state();
+        input.shift = m.shift_key();
+        input.ctrl = self.command();
+        input.alt = m.alt_key();
+    }
+}
+
 /// An open dropdown: its options are drawn last, over everything.
 #[derive(Clone)]
 struct Popup {
@@ -1354,6 +1425,34 @@ mod tests {
         let (layers, _, ranges) = ui.finish();
         assert_eq!(layers.len(), ranges.len());
         assert!(layers.len() < 128, "{} layers", layers.len());
+    }
+
+    /// Where the window never says which modifiers are held (Android), their keys do: a key
+    /// bound with Shift or Ctrl held keeps them, and Ctrl+V is a paste (#634).
+    #[test]
+    fn modifier_keys_count_where_the_window_does_not_tell_them() {
+        use winit::keyboard::{KeyCode as K, ModifiersState as M};
+        let mut m = Modifiers::default();
+        let mut input = Input::default();
+        assert!(!m.key(K::KeyA, true));
+        assert!(m.key(K::ShiftLeft, true) && m.key(K::ControlRight, true));
+        m.apply(&mut input);
+        assert!(input.shift && input.ctrl && !input.alt && m.command());
+        assert_eq!(omsi_content::input::chord(input.shift, input.ctrl, input.alt), omsi_content::input::KEY_SHIFT | omsi_content::input::KEY_CTRL);
+        // (both Shift keys down, one let go of: still held)
+        m.key(K::ShiftRight, true);
+        m.key(K::ShiftLeft, false);
+        m.key(K::ControlRight, false);
+        assert_eq!(m.state(), M::SHIFT);
+        // (the keyboard taken away: nothing is held any more)
+        m.release_keys();
+        assert_eq!(m.state(), M::empty());
+        // where the window does tell them, its word holds
+        m.key(K::AltLeft, true);
+        m.told(M::CONTROL);
+        assert_eq!(m.state(), M::CONTROL);
+        m.apply(&mut input);
+        assert!(!input.shift && input.ctrl && !input.alt);
     }
 
     /// What was clicked and typed while the launcher drew nothing (a game ran) is gone:

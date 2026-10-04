@@ -35,7 +35,7 @@ use ui::{Key, Ui};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -114,7 +114,7 @@ pub struct Launcher {
     pub icons: std::collections::HashMap<String, usize>,
     pub icons_pending: Vec<(String, image::RgbaImage)>,
     last: Instant,
-    modifiers: ModifiersState,
+    modifiers: ui::Modifiers,
     /// Right or left drag over the showroom.
     dragging: Option<Vec2>,
     clipboard: Option<Clipboard>,
@@ -191,7 +191,7 @@ impl Launcher {
         icons: Default::default(),
         icons_pending: Vec::new(),
         last: Instant::now(),
-        modifiers: ModifiersState::empty(),
+        modifiers: ui::Modifiers::default(),
         dragging: None,
         clipboard: Clipboard::new().ok(),
         // OMSI_LAUNCHER_EXIT=secs, OMSI_LAUNCHER_SHOT=secs:file.png, OMSI_LAUNCHER_PAGE=mods:
@@ -440,10 +440,8 @@ impl ApplicationHandler for Launcher {
                 }
             }
             WindowEvent::ModifiersChanged(m) => {
-                self.modifiers = m.state();
-                self.ui.input.shift = self.modifiers.shift_key();
-                self.ui.input.ctrl = self.modifiers.control_key() || self.modifiers.super_key();
-                self.ui.input.alt = self.modifiers.alt_key();
+                self.modifiers.told(m.state());
+                self.modifiers.apply(&mut self.ui.input);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let p = Vec2::new(position.x as f32, position.y as f32) / scale;
@@ -493,10 +491,16 @@ impl ApplicationHandler for Launcher {
                 self.ui.input.wheel += d;
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // (Shift, Ctrl, Alt from their keys where the window never says: Android)
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if self.modifiers.key(code, event.state == ElementState::Pressed) {
+                        self.modifiers.apply(&mut self.ui.input);
+                    }
+                }
                 if event.state != ElementState::Pressed {
                     return;
                 }
-                let cmd = self.modifiers.control_key() || self.modifiers.super_key();
+                let cmd = self.modifiers.command();
                 // a phone's back key: out of the storage browser, else like Escape
                 if event.physical_key == PhysicalKey::Code(KeyCode::BrowserBack) {
                     if self.browser.is_some() {
@@ -691,6 +695,8 @@ impl Launcher {
         self.focused = f;
         if !f {
             self.pages.pads.cancel_feedback_test();
+            self.modifiers.release_keys();
+            self.modifiers.apply(&mut self.ui.input);
         }
         // (only once the game is on its way: the launcher has the focus while Start is
         // pressed, and gives the device up then as before)

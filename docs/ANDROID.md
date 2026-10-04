@@ -16,7 +16,7 @@ maps, buses and mods. Only the way it is worked is new:
 
 | Where | What |
 |---|---|
-| bottom left | the steering wheel: take the rim and turn it round - it follows the finger, 120° of rim is the full lock (it comes back when let go) - or tilt the phone (panel → Tilt steering) |
+| bottom left | the steering wheel: take the rim and turn it round - it follows the finger, 120° of rim is the full lock (let go, it comes back as the bus's wheel does with the keys: slowly standing, brisker rolling, not at all with Old Steering) - or tilt the phone (panel → Tilt steering) |
 | bottom right | the brake and the accelerator: the higher up the pedal, the harder |
 | above the pedals | the gearbox (R N D of an automatic, − N + of a manual), a button for each door, front to back |
 | beside the pedals | the parking brake, the stop brake / door release |
@@ -27,8 +27,11 @@ maps, buses and mods. Only the way it is worked is new:
 
 Everything else is in the cab itself, as in OMSI: a tap works the switch under the finger (the
 IBIS, the ticket printer, the light switches), a finger dragged from a switch turns it (knobs,
-the ignition key, the sun blind), a drag elsewhere looks round, two fingers zoom. On foot and
-with the free camera a stick at the bottom left walks (pushed to the edge: runs). The game
+the ignition key, the sun blind), a drag elsewhere looks round, two fingers zoom. The
+navigator stands in the top middle (under the information bar when that is on): a tap opens the
+city map, a finger dragged on it puts it somewhere else, where it stays. On foot and
+with the free camera a stick at the bottom left walks (pushed to the edge: runs); on foot the
+button at the bottom right kneels, for a picture from low down, and stands up again. The game
 menu and its lists scroll with the finger and a tap picks a line (a finger put down to scroll
 no longer picks the line it lands on); on the city map the fingers are the mouse. The back key
 is Escape. The launcher is laid out for the phone: the text at least at the system's own

@@ -192,6 +192,16 @@ pub struct Spotlight {
     pub values: [f32; 12],
 }
 
+/// `[spotlight_2]` (openOMSI): a `[spotlight]`'s twelve numbers, then the variable that
+/// switches it (0 off, 1 full, a constant too) and a flag: 0 (or none) puts a twin lamp on
+/// the other side of the vehicle, mirrored across its axis, 1 keeps the one lamp.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Spotlight2 {
+    pub values: [f32; 12],
+    pub variable: String,
+    pub mirrored: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct InteriorLight {
     pub variable: String,
@@ -283,7 +293,11 @@ pub struct ParticleSystemDef {
 
 impl ParticleSystemDef {
     /// `[smoke]`: position, direction, then speed, its spread, frequency, lifetime, brake
-    /// factor, gravity, start size, growth, initial and final alpha, red, green, blue.
+    /// factor, gravity, start size, growth, initial alpha, a line Omsi.exe skips, red,
+    /// green, blue (the reader at 0x5f5e58: two lines on after the alpha, 0x5f654c). The
+    /// final alpha is not read: it stays 0, as Omsi.exe sets it before the lines
+    /// (0x5f5ec1) - a puff fades out over its life. (Taken from the skipped line, the
+    /// stock buses' `10`, every exhaust puff went opaque within a few tenths of a second.)
     pub fn from_smoke(p: &[String]) -> ParticleSystemDef {
         let f = |i: usize| p.get(i).map(|s| omsi_cfg::parse_f32(s)).unwrap_or(0.0);
         let v = |i: usize| p.get(i).map(|s| PsValue::parse(s)).unwrap_or_default();
@@ -299,7 +313,7 @@ impl ParticleSystemDef {
             size_start: c(12),
             size_grow: c(13),
             alpha_initial: c(14),
-            alpha_final: c(15),
+            alpha_final: (PsValue::Const(0.0), PsValue::Const(0.0)),
             rgb: [c(16), c(17), c(18)],
             calc_dist: 500.0,
             ..Default::default()
@@ -387,6 +401,7 @@ pub struct Model {
     pub smokes: Vec<Smoke>,
     pub particle_emitters: Vec<ParticleEmitter>,
     pub spotlights: Vec<Spotlight>,
+    pub spotlights_2: Vec<Spotlight2>,
     pub interior_lights: Vec<InteriorLight>,
     /// `[light]` legacy lights (raw).
     pub lights: Vec<Vec<String>>,
@@ -735,6 +750,20 @@ impl Model {
                 }
             }
             "spotlight" => self.spotlights.push(Spotlight { values: r.f32s::<12>() }),
+            "spotlight_2" => {
+                let values = r.f32s::<12>();
+                let variable = r.str().to_string();
+                // (the flag may be left out: a keyword next is not it)
+                let mut ahead = r.clone();
+                let flag = ahead.line();
+                let mirrored = if omsi_cfg::keyword_of(flag).is_some() {
+                    true
+                } else {
+                    *r = ahead;
+                    omsi_cfg::parse_f32(flag) < 0.5
+                };
+                self.spotlights_2.push(Spotlight2 { values, variable, mirrored });
+            }
             "interiorlight" => {
                 let variable = r.str().to_string();
                 let range = r.f32();
@@ -1076,6 +1105,23 @@ mod tests {
         assert_eq!(model.terrain_hole_meshes().collect::<Vec<_>>(), ["first.o3d", "second.o3d", "third.o3d", "legacy.o3d"]);
     }
 
+    /// `[spotlight_2]`: the spot's numbers, its variable and whether it has a mirrored twin
+    /// (yes unless the flag says 1, also when the flag is left out).
+    #[test]
+    fn a_spotlight_2_reads_its_variable_and_mirror_flag() {
+        let spot = "0\n5.95\n0.652\n0\n1\n-0.3\n255\n255\n233\n200\n30\n80\n";
+        let text = format!("[spotlight]\n{spot}\n[spotlight_2]\n{spot}lights_fern\n0\n\n[spotlight_2]\n{spot}door_light\n1\n[spotlight_2]\n{spot}lights_nebel\n[mesh]\nbody.o3d\n");
+        let m = super::Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", &text));
+        assert_eq!(m.spotlights.len(), 1);
+        let s = &m.spotlights_2;
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0].values, m.spotlights[0].values);
+        assert_eq!((s[0].variable.as_str(), s[0].mirrored), ("lights_fern", true));
+        assert_eq!((s[1].variable.as_str(), s[1].mirrored), ("door_light", false));
+        assert_eq!((s[2].variable.as_str(), s[2].mirrored), ("lights_nebel", true));
+        assert_eq!(m.meshes.len(), 1);
+    }
+
     /// Two [matl] blocks of one material are one material (Absperrung_grau.sco).
     #[test]
     fn a_second_matl_block_goes_on_with_the_same_material() {
@@ -1101,6 +1147,24 @@ mod tests {
     }
 
     use super::*;
+
+    /// The SD202's exhaust `[smoke]` read as Omsi.exe reads it: its 16th line (`10`) is
+    /// skipped, the colour is the three after it and a puff fades out to nothing.
+    #[test]
+    fn a_smoke_skips_the_line_after_its_alpha_and_fades_out() {
+        let text = "[smoke]\n-1.100\n-5.334\n0.406\n-1\n-0.7\n0\nauspuff_vel\n0.2\nauspuff_freq\nauspuff_leben\n0.95\n-0.2\n0.5\n3\nauspuff_alpha\n10\n0.66\n0.66\n0.8\n";
+        let m = Model::parse(&CfgFile::from_str("model.cfg", text));
+        let d = &m.particle_systems()[0];
+        assert_eq!(d.pos, [-1.1, -5.334, 0.406]);
+        assert_eq!(d.velocity, (PsValue::Var("auspuff_vel".into()), PsValue::Const(0.2)));
+        assert_eq!(d.freq.0, PsValue::Var("auspuff_freq".into()));
+        assert_eq!(d.life.0, PsValue::Var("auspuff_leben".into()));
+        assert_eq!((d.brake.0.clone(), d.gravity.0.clone()), (PsValue::Const(0.95), PsValue::Const(-0.2)));
+        assert_eq!((d.size_start.0.clone(), d.size_grow.0.clone()), (PsValue::Const(0.5), PsValue::Const(3.0)));
+        assert_eq!(d.alpha_initial.0, PsValue::Var("auspuff_alpha".into()));
+        assert_eq!(d.alpha_final.0, PsValue::Const(0.0));
+        assert_eq!(d.rgb.clone().map(|c| c.0), [PsValue::Const(0.66), PsValue::Const(0.66), PsValue::Const(0.8)]);
+    }
 
     /// `[setvar]` belongs to the `[item]` before it (a paint scheme in the model.cfg), as
     /// Omsi.exe files it; one before any item sets nothing.

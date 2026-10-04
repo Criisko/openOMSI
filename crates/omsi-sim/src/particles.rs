@@ -2,10 +2,18 @@
 //! OMSI runs them (TRauch / TRauchInst: the original emits, the original sets a particle
 //! off, the original moves it). An emitter keeps at most 100 particles. A particle leaves along
 //! the emitter's direction at its speed plus a random spread; every frame its velocity is
-//! multiplied by the brake factor (per frame, not per second: taken at OMSI's default 30 fps
-//! here) and gravity pulls it down (a negative factor makes it rise); it grows from its start
-//! size by `size_grow` a second, and its alpha goes linearly from the initial value at
-//! birth to the final one at the end of its life.
+//! multiplied by the brake factor raised to 20 times the frame's seconds (Omsi.exe keeps
+//! 20 ln(brake) per emitter, 0x5a145c, and takes e to that times dt, 0x5a238c: the factor
+//! is per twentieth of a second, whatever the frame rate) and gravity pulls it down (a
+//! negative factor makes it rise); it grows from its start size by `size_grow` a second, and
+//! its alpha goes linearly from the initial value at birth to the final one at the end of
+//! its life (0x5a183c). Its picture is turned by a random angle (0x5a1d54).
+//!
+//! Nothing stops one at the ground: Omsi.exe lets it fall on through the road until its
+//! life is over (0x5a238c moves it and tests nothing but its age). Each particle remembers
+//! the height of the ground under the place it was set off from, though - the plane its
+//! owner stands on - so that the renderer can let it fade out into the road instead of
+//! being cut off by it in a straight line (see `omsi_render::SmokeParticle::ground`).
 
 use glam::{DVec3, Mat4, Vec3};
 use omsi_model::{ParticleSystemDef, PsRange, PsValue};
@@ -13,8 +21,11 @@ use std::sync::RwLock;
 
 /// Particles an emitter keeps at most (OMSI's 100).
 pub const MAX_PER_EMITTER: usize = 100;
-/// The frame rate a brake factor is written for.
-const FRAME_RATE: f32 = 30.0;
+/// How many times a second a particle's brake factor slows it (Omsi.exe 0x5a145c keeps
+/// 20 ln(brake), of a brake no lower than 0.1).
+const BRAKE_RATE: f32 = 20.0;
+/// The lowest brake factor Omsi.exe takes (0x5a145c).
+const BRAKE_MIN: f32 = 0.1;
 
 /// Where the camera is: emitters farther than their `calc_dist` send no new particles.
 static EYE: RwLock<Option<DVec3>> = RwLock::new(None);
@@ -40,6 +51,12 @@ pub struct Particle {
     pub color: [f32; 3],
     pub brake: f32,
     pub gravity: f32,
+    /// The angle its picture is turned by about the line of sight (radians, 0..2 pi; drawn
+    /// so by Omsi.exe, 0x5a1d54 -> 0x5a2b5c).
+    pub spin: f32,
+    /// World z of the ground under where it was set off (the plane its owner stands on;
+    /// minus infinity where it has none).
+    pub ground: f64,
 }
 
 impl Particle {
@@ -62,9 +79,9 @@ pub struct Emitter {
     carry: f32,
     /// The burst of a free emitter has gone off.
     burst_done: bool,
-    /// Where and how fast its particles were going when they ended this frame (for an
-    /// emitter attached in burst mode).
-    ended: Vec<(DVec3, Vec3)>,
+    /// Where and how fast its particles were going when they ended this frame, and the
+    /// ground under them (for an emitter attached in burst mode).
+    ended: Vec<(DVec3, Vec3, f64)>,
 }
 
 /// The particle systems of one vehicle part or scenery object.
@@ -117,10 +134,20 @@ impl ParticleSet {
 
     /// One frame: age and move the particles and send new ones off. `origin` and `rot` place
     /// the owner (a vehicle's frame: x right, y forward, z up), `value` reads its variables.
+    /// The ground is the owner's own z = 0 (a scenery object stands on it).
     pub fn update(&mut self, dt: f32, origin: DVec3, rot: Mat4, value: &dyn Fn(&str) -> f32) {
+        self.update_over(dt, origin, rot, &|| [0.0; 3], value);
+    }
+
+    /// `update` for an owner whose ground is the plane z = p[0] + p[1] x + p[2] y of its own
+    /// frame (a vehicle's: where its wheels touch the road, see
+    /// `VehicleInstance::contact_plane`). `ground` is asked at most once, and only when a
+    /// particle is set off from the emitter itself.
+    pub fn update_over(&mut self, dt: f32, origin: DVec3, rot: Mat4, ground: &dyn Fn() -> [f32; 3], value: &dyn Fn(&str) -> f32) {
         if self.emitters.is_empty() || dt <= 0.0 {
             return;
         }
+        let mut plane: Option<[f32; 3]> = None;
         let eye = eye();
         for i in 0..self.emitters.len() {
             // move what is there
@@ -130,10 +157,10 @@ impl ParticleSet {
                 e.particles.retain_mut(|p| {
                     p.age += dt;
                     if p.age >= p.life {
-                        ended.push((p.pos, p.vel));
+                        ended.push((p.pos, p.vel, p.ground));
                         return false;
                     }
-                    p.vel *= p.brake.clamp(0.0, 1.5).powf(dt * FRAME_RATE);
+                    p.vel *= p.brake.clamp(BRAKE_MIN, 1.5).powf(dt * BRAKE_RATE);
                     p.vel.z -= 9.81 * p.gravity * dt;
                     p.pos += p.vel.as_dvec3() * dt as f64;
                     true
@@ -149,28 +176,38 @@ impl ParticleSet {
             }
             let dir = rot.transform_vector3(Vec3::from(def.dir)).normalize_or_zero();
             // where new particles start: the emitter itself, or the particles of the one it
-            // is attached to
-            let mut sources: Vec<(DVec3, Vec3)> = Vec::new();
-            let mut burst_sources: Vec<(DVec3, Vec3)> = Vec::new();
+            // is attached to - and the ground under them: the owner's under the emitter, a
+            // parent particle's own
+            let freq = eval(&def.freq.0, value).max(0.0);
+            let mut sources: Vec<(DVec3, Vec3, f64)> = Vec::new();
+            let mut burst_sources: Vec<(DVec3, Vec3, f64)> = Vec::new();
             match def.attach {
                 Some((parent, mode)) if parent < i => {
                     let pe = &self.emitters[parent];
                     match mode {
                         1 => burst_sources = pe.ended.clone(),
-                        _ => sources = pe.particles.iter().map(|p| (p.pos, if mode == 2 { -p.vel } else { dir })).collect(),
+                        _ => sources = pe.particles.iter().map(|p| (p.pos, if mode == 2 { -p.vel } else { dir }, p.ground)).collect(),
                     }
                 }
                 Some(_) => {}
                 None => {
-                    sources.push((own, dir));
-                    if !self.emitters[i].burst_done && def.burst.is_some() {
-                        burst_sources.push((own, dir));
+                    let bursts = !self.emitters[i].burst_done && def.burst.is_some();
+                    // (asked for only when something will be set off from here)
+                    let floor = if freq > 0.0 || bursts {
+                        let g = *plane.get_or_insert_with(ground);
+                        let under = Vec3::new(def.pos[0], def.pos[1], g[0] + g[1] * def.pos[0] + g[2] * def.pos[1]);
+                        origin.z + rot.transform_vector3(under).z as f64
+                    } else {
+                        f64::NEG_INFINITY
+                    };
+                    sources.push((own, dir, floor));
+                    if bursts {
+                        burst_sources.push((own, dir, floor));
                         self.emitters[i].burst_done = true;
                     }
                 }
             }
             // continuous emission
-            let freq = eval(&def.freq.0, value).max(0.0);
             let mut n = 0usize;
             if freq > 0.0 && !sources.is_empty() {
                 let e = &mut self.emitters[i];
@@ -178,7 +215,7 @@ impl ParticleSet {
                 n = e.carry.floor() as usize;
                 e.carry -= n as f32;
             }
-            let mut spawn: Vec<(DVec3, Vec3)> = Vec::new();
+            let mut spawn: Vec<(DVec3, Vec3, f64)> = Vec::new();
             for _ in 0..n {
                 spawn.extend(sources.iter().copied());
             }
@@ -188,11 +225,12 @@ impl ParticleSet {
                     spawn.extend(std::iter::repeat(*s).take(count));
                 }
             }
-            for (at, d) in spawn {
+            for (at, d, floor) in spawn {
                 if self.emitters[i].particles.len() >= MAX_PER_EMITTER {
                     break;
                 }
-                let p = self.new_particle(&def, at, d.normalize_or_zero(), value);
+                let mut p = self.new_particle(&def, at, d.normalize_or_zero(), value);
+                p.ground = floor;
                 self.emitters[i].particles.push(p);
             }
         }
@@ -224,6 +262,8 @@ impl ParticleSet {
             color,
             brake: self.draw(&def.brake, value),
             gravity: self.draw(&def.gravity, value),
+            spin: (self.rand() + 1.0) * std::f32::consts::PI,
+            ground: f64::NEG_INFINITY,
         }
     }
 }
@@ -250,6 +290,75 @@ mod tests {
         assert!(oldest.size() > 2.5, "grown to {}", oldest.size());
         assert!(oldest.alpha() < 0.5, "faded to {}", oldest.alpha());
         assert!(oldest.vel.length() < 2.0, "slowed to {}", oldest.vel.length());
+    }
+
+    /// One puff of `def` set off on the first frame (its frequency read from `f`), then
+    /// `frames` more of `dt`.
+    fn one_puff(mut def: ParticleSystemDef, dt: f32, frames: usize) -> Particle {
+        def.freq.0 = PsValue::Var("f".into());
+        let mut s = ParticleSet::new(vec![def], 11);
+        s.update(dt, DVec3::ZERO, Mat4::IDENTITY, &|_| 1.01 / dt);
+        for _ in 0..frames {
+            s.update(dt, DVec3::ZERO, Mat4::IDENTITY, &|_| 0.0);
+        }
+        let ps: Vec<&Particle> = s.particles().map(|(p, _)| p).collect();
+        assert_eq!(ps.len(), 1);
+        ps[0].clone()
+    }
+
+    /// Omsi.exe brakes a particle by its factor every twentieth of a second (0x5a145c keeps
+    /// 20 ln(brake), 0x5a238c takes e to that times dt), whatever the frame rate.
+    #[test]
+    fn a_brake_factor_is_per_twentieth_of_a_second() {
+        let mut def = smoke(0.0);
+        def.brake = (PsValue::Const(0.5), PsValue::Const(0.0));
+        def.gravity = (PsValue::Const(0.0), PsValue::Const(0.0));
+        def.velocity = (PsValue::Const(2.0), PsValue::Const(0.0));
+        let at_60 = one_puff(def.clone(), 1.0 / 60.0, 30).vel.length();
+        let at_30 = one_puff(def, 1.0 / 30.0, 15).vel.length();
+        let want = 2.0 * 0.5f32.powi(10);
+        assert!((at_60 - want).abs() < want * 0.01 && (at_30 - want).abs() < want * 0.01, "half a second at 60 fps {at_60}, at 30 fps {at_30}, want {want}");
+    }
+
+    /// A puff remembers the height of the ground under where it was set off: the plane its
+    /// owner stands on (a vehicle's tilted with the road), or the owner's own z = 0.
+    #[test]
+    fn a_puff_knows_the_ground_it_was_set_off_over() {
+        let asked = std::cell::Cell::new(0);
+        let plane = || {
+            asked.set(asked.get() + 1);
+            [-0.1, 0.0, 0.02]
+        };
+        let rot = Mat4::from_rotation_z(1.0);
+        let mut s = ParticleSet::new(vec![smoke(31.0)], 5);
+        s.update_over(1.0 / 30.0, DVec3::new(100.0, 200.0, 10.0), rot, &plane, &|_| 0.0);
+        let p = s.particles().next().unwrap().0;
+        // the emitter at (0, -5, 0.4): the plane 0.2 m under the origin there
+        assert!((p.ground - 9.8).abs() < 1e-4, "ground {}", p.ground);
+        assert!(p.pos.z > p.ground, "set off {} over the ground {}", p.pos.z, p.ground);
+        assert_eq!(asked.get(), 1);
+        // (nothing set off: the plane is not asked for)
+        let mut quiet = ParticleSet::new(vec![smoke(0.0)], 5);
+        quiet.update_over(1.0 / 30.0, DVec3::ZERO, rot, &plane, &|_| 0.0);
+        assert_eq!(asked.get(), 1);
+        // a scenery object's: its own z = 0
+        let mut o = ParticleSet::new(vec![smoke(31.0)], 5);
+        o.update(1.0 / 30.0, DVec3::new(0.0, 0.0, 33.0), Mat4::IDENTITY, &|_| 0.0);
+        assert_eq!(o.particles().next().unwrap().0.ground, 33.0);
+    }
+
+    /// Every puff's picture is turned its own way (Omsi.exe 0x5a1d54: a random angle).
+    #[test]
+    fn every_puff_is_turned_its_own_way() {
+        let mut s = ParticleSet::new(vec![smoke(60.0)], 9);
+        for _ in 0..30 {
+            s.update(1.0 / 30.0, DVec3::ZERO, Mat4::IDENTITY, &|_| 0.0);
+        }
+        let spins: Vec<f32> = s.particles().map(|(p, _)| p.spin).collect();
+        assert!(spins.len() > 40);
+        assert!(spins.iter().all(|a| (0.0..std::f32::consts::TAU).contains(a)), "{spins:?}");
+        let (lo, hi) = spins.iter().fold((f32::MAX, f32::MIN), |(lo, hi), a| (lo.min(*a), hi.max(*a)));
+        assert!(lo < 1.0 && hi > 5.0, "spins {lo}..{hi}");
     }
 
     #[test]

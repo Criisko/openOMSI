@@ -63,6 +63,8 @@ pub(crate) static LEFT_HAND: std::sync::atomic::AtomicBool = std::sync::atomic::
 
 /// How far outside the bus side somebody stands at a door (m).
 const DOOR_OUT: f32 = 0.5;
+/// Entries and exits with door variables of their own in Omsi.exe (`PAX_Entry0..7` ...).
+const OMSI_PAX_DOORS: usize = 8;
 /// Body radius for the crowd outside (m): shoulders and swinging arms. With the cabin's
 /// radius people on the pavement came within 0.46 m, and two walking past each other or a
 /// group crossing the road merged into one another in the picture.
@@ -121,6 +123,21 @@ impl Eye {
     }
 }
 
+/// What the passengers tell a bus's scripts in a frame: about its doors, entry by entry and
+/// exit by exit, and its places (see [`Humans::write_door_requests`]).
+#[derive(Debug, Clone, Default)]
+pub struct DoorWants {
+    /// `PAX_Entry<i>_Req` / `PAX_Exit<i>_Req`: somebody wants in / out there.
+    pub entry_req: Vec<bool>,
+    pub exit_req: Vec<bool>,
+    /// `PAX_Entry<i>_Busy` / `PAX_Exit<i>_Busy`: somebody stands in that doorway.
+    pub entry_busy: Vec<bool>,
+    pub exit_busy: Vec<bool>,
+    /// The occupancy variables the `[passpos]` places name (#721): whether somebody is on
+    /// each.
+    pub places: Vec<(String, bool)>,
+}
+
 /// A bus as the passengers know it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BusId {
@@ -150,10 +167,28 @@ struct Door {
     button: bool,
     /// Where people getting off wait for the door to open: the path point next to it.
     wait: Vec3,
+    /// The sections it belongs to that people walk between (see `Cabin::groups`).
+    group: usize,
 }
 
 impl Door {
-
+    /// Somebody standing at `p` (bus frame) is in the doorway (`PAX_Entry<n>_Busy`,
+    /// `PAX_Exit<n>_Busy`, #720): within a body's width of the way through the door, from
+    /// its threshold point across the bus side to the step outside - where a door's light
+    /// barrier sees them. Not the queue waiting outside a shut door, nor the deck above it.
+    /// It ends 0.4 m out from the bus side, clear of the line 0.5 m out that the people
+    /// walking along a bus keep to (`clamp_x`), so they do not set it as they pass.
+    fn in_doorway(&self, p: Vec3) -> bool {
+        const BODY: f32 = 0.3;
+        if p.z > self.inside.z + 1.0 {
+            return false;
+        }
+        let a = self.inside.truncate();
+        let b = glam::Vec2::new(self.outside.x - self.side * (DOOR_OUT - 0.1), self.inside.y);
+        let ab = b - a;
+        let t = if ab.length_squared() > 1e-6 { ((p.truncate() - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+        (a + ab * t - p.truncate()).length() < BODY
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +206,12 @@ struct Seat {
     /// among the `[passpos]` and `[drivpos]`, the sections behind counted on after those
     /// in front (0x7d39a4 asks the next one for a number past its own places).
     omsi_seat: usize,
+    /// openOMSI's variables of the place (#721): the one that switches it on and off, and the
+    /// one its occupancy is written into.
+    switch_var: Option<String>,
+    taken_var: Option<String>,
+    /// The sections it lies in that people walk between (see `Cabin::groups`).
+    group: usize,
 }
 
 /// What passengers need to know about one vehicle type's cabin.
@@ -192,13 +233,20 @@ struct Cabin {
     /// The sections (one for a rigid bus), front first; everything above is in the
     /// unfolded frame of the front section.
     parts: Vec<CabinPart>,
+    /// How many groups of sections people walk between (one but where a trailer hangs on
+    /// that nobody walks into from the bus, #718), and each path point's group: a passenger
+    /// gets in, rides and gets out within one.
+    groups: usize,
+    point_group: Vec<usize>,
     /// Each link's room height (`[next_roomheight]`; 2 m before any).
     link_room: Vec<f32>,
     /// The routing tables of the path network (sub_72410c).
     routes: Vec<Vec<RouteLink>>,
-    /// The validator and the cash desk as Omsi.exe keeps them - one each, the last of the
-    /// file (cabin +0x14/+0x18, +0x28/+0x2c): (path point, device).
-    stamper: Option<(Option<usize>, Vec3)>,
+    /// The validators and the cash desk: (path point, device). Omsi.exe keeps one of each,
+    /// the last of the file (cabin +0x14/+0x18, +0x28/+0x2c); every `[stamper]` of every
+    /// section is kept here, and a passenger stamps at the one nearest the door they came
+    /// in by (`Cabin::nearest_stamper`, #722) - with one, that one.
+    stampers: Vec<(Option<usize>, Vec3)>,
     sale: Option<(Option<usize>, Vec3)>,
     /// Where the money goes (+0x38) and where the change is taken from (+0x58), with the
     /// money point's spread.
@@ -220,6 +268,55 @@ fn seat_numbers(seats: &[Seat], sitting: impl Iterator<Item = usize>) -> Vec<u32
         }
     }
     out
+}
+
+/// The places of a bus its scripts have switched off: a `[passpos]` naming a variable of
+/// its own that is 0 now (#721), by index into the cabin's.
+/// (A place in a section of its own without an entry or without an exit is off too: nobody
+/// could get there, or out of it again, #718.)
+fn places_off(v: &VehicleInstance, cabin: &Cabin) -> Vec<bool> {
+    let unreached = |g: usize| cabin.groups > 1 && (!cabin.entries.iter().any(|e| e.group == g) || !cabin.exits.iter().any(|e| e.group == g));
+    cabin
+        .seats
+        .iter()
+        .map(|s| s.switch_var.as_deref().and_then(|n| v.var(n)).is_some_and(|x| x == 0.0) || unreached(s.group))
+        .collect()
+}
+
+/// The occupancy variables of the places of bus `bn` that name one (#721), and whether
+/// somebody is on each: a rider at that place (`sitting`: the places of its riders there).
+fn places_taken(bn: &BusNow, sitting: &[(BusId, usize)]) -> Vec<(String, bool)> {
+    bn.cabin
+        .seats
+        .iter()
+        .enumerate()
+        .filter_map(|(k, s)| s.taken_var.as_ref().map(|n| (n.clone(), sitting.contains(&(bn.id, k)))))
+        .collect()
+}
+
+/// Which doorways of bus `bn` somebody stands in (entries, exits; see `Door::in_doorway`):
+/// of the people `at` (inside a bus and where in its frame, or where in the world), its
+/// riders and those outside close enough to it.
+fn doorways_taken(bn: &BusNow, at: &[(Option<BusId>, DVec3)]) -> (Vec<bool>, Vec<bool>) {
+    let mut entries = vec![false; bn.cabin.entries.len()];
+    let mut exits = vec![false; bn.cabin.exits.len()];
+    // (beyond the bus's own length round its origin nobody outside can be in a doorway)
+    let reach = bn.half.length() + bn.centre.length() + bn.trailers.iter().map(|t| t.offset.length() as f64).fold(0.0, f64::max) + 2.0;
+    for (inside, pos) in at {
+        let local = match inside {
+            Some(b) if *b == bn.id => pos.as_vec3(),
+            Some(_) => continue,
+            None if (*pos - bn.pos).truncate().length() < reach => bn.to_local(*pos),
+            None => continue,
+        };
+        for (k, d) in bn.cabin.entries.iter().enumerate() {
+            entries[k] |= d.in_doorway(local);
+        }
+        for (k, d) in bn.cabin.exits.iter().enumerate() {
+            exits[k] |= d.in_doorway(local);
+        }
+    }
+    (entries, exits)
 }
 
 /// A section of an articulated bus in its cabin's unfolded frame.
@@ -277,15 +374,21 @@ impl Cabin {
         let mut link_pack: Vec<Option<usize>> = Vec::new();
         let mut link_room: Vec<f32> = Vec::new();
         let mut step_packs: Vec<Arc<[String]>> = Vec::new();
-        // (merged path point or -1, sells tickets, {withbutton}, half width of the section)
-        let mut entry_points: Vec<(i32, bool, bool, f32)> = Vec::new();
-        let mut exit_points: Vec<(i32, f32)> = Vec::new();
-        let mut places: Vec<(omsi_vehicle::cabin::PassPos, Vec3, usize)> = Vec::new();
+        // (merged path point or -1, sells tickets, {withbutton}, half width of the section,
+        // group)
+        let mut entry_points: Vec<(i32, bool, bool, f32, usize)> = Vec::new();
+        let mut exit_points: Vec<(i32, f32, usize)> = Vec::new();
+        let mut places: Vec<(omsi_vehicle::cabin::PassPos, Vec3, usize, usize)> = Vec::new();
+        let mut group = 0usize;
+        let mut point_group: Vec<usize> = Vec::new();
         // (the script seat numbers of the sections in front)
         let mut seat_base = 0usize;
         let mut cabin_parts: Vec<CabinPart> = Vec::new();
-        // the point of the section in front that leads on to the next one
+        let mut stampers: Vec<(Option<usize>, Vec3)> = Vec::new();
+        // the point of the section in front that leads on to the next one, and that one as
+        // its cabin gives it (`[linkToPrevVeh]`)
         let mut rear_link: Option<usize> = None;
+        let mut rear_declared: Option<usize> = None;
         for (k, (def, offset, joint_y)) in parts.iter().enumerate() {
             let cab = if k == 0 {
                 Some(data.clone())
@@ -322,19 +425,28 @@ impl Cabin {
             };
             if k > 0 {
                 // through the joint: from the front section's [linkToPrevVeh] point to this
-                // one's [linkToNextVeh] point (the frontmost aisle point when it has none)
-                let front = cab.link_to_next_veh.and_then(valid).or_else(|| end(true));
-                match (rear_link, front) {
+                // one's [linkToNextVeh] point (the frontmost aisle point when it has none). A
+                // trailer's hitch (`[coupling_front_character]` type 0, a lorry's coupling) is
+                // no bellows: walked through only where both cabins give those points, as
+                // Omsi.exe joins coupled cabins (0x7d172c) - joined at the aisle's ends, the
+                // passengers of a bus walked through its back wall into the trailer behind
+                let hitch = def.coupling_front_character.is_some_and(|c| c[3] == 0.0);
+                let front = cab.link_to_next_veh.and_then(valid).or_else(|| if hitch { None } else { end(true) });
+                match (if hitch { rear_declared } else { rear_link }, front) {
                     (Some(a), Some(b)) => {
                         links.push((a as i32, b as i32, false));
                         link_pack.push(None);
                         link_room.push(2.0);
                     }
-                    // no way through: the section stays empty
+                    // no way through: a section of its own, which people get into and out
+                    // of by its own doors and ride in (#718; it stayed empty)
+                    _ if !own.is_empty() => group += 1,
+                    // nowhere to walk in it
                     _ => break,
                 }
             }
             points.extend(own.iter().copied());
+            point_group.extend(std::iter::repeat_n(group, own.len()));
             links.extend(
                 own_links
                     .iter()
@@ -347,7 +459,8 @@ impl Cabin {
             }));
             step_packs.extend(own_packs.into_iter().map(Arc::from));
             link_room.extend((0..own_links.len()).map(|i| own_rooms.get(i).copied().unwrap_or(2.0)));
-            rear_link = cab.link_to_prev_veh.and_then(valid).or_else(|| end(false));
+            rear_declared = cab.link_to_prev_veh.and_then(valid);
+            rear_link = rear_declared.or_else(|| end(false));
             let half = def
                 .bounding_box
                 .map(|b| b[0] * 0.5)
@@ -356,10 +469,11 @@ impl Cabin {
             entry_points.extend(
                 cab.entries
                     .iter()
-                    .map(|e| (shift(e.path_point), !e.no_ticket_sale, e.with_button, half)),
+                    .map(|e| (shift(e.path_point), !e.no_ticket_sale, e.with_button, half, group)),
             );
-            exit_points.extend(cab.exits.iter().map(|e| (shift(*e), half)));
-            places.extend(cab.pass_positions.iter().map(|p| (p.clone(), *offset, seat_base + p.file_index)));
+            exit_points.extend(cab.exits.iter().map(|e| (shift(*e), half, group)));
+            places.extend(cab.pass_positions.iter().map(|p| (p.clone(), *offset, seat_base + p.file_index, group)));
+            stampers.extend(cab.stampers.iter().map(|st| (valid(st.path_point), Vec3::from(st.pos) + *offset)));
             seat_base += cab.pass_positions.len() + cab.driver_positions.len();
             cabin_parts.push(CabinPart {
                 offset: *offset,
@@ -369,7 +483,7 @@ impl Cabin {
         let graph = PathGraph::new(points.clone(), &links);
         // (the side of the road the stops are on: where a door's own point does not tell)
         let kerb = if LEFT_HAND.load(std::sync::atomic::Ordering::Relaxed) { -1.0f32 } else { 1.0 };
-        let door = |pp: i32, sells: bool, button: bool, half_width: f32| -> Door {
+        let door = |pp: i32, sells: bool, button: bool, half_width: f32, group: usize| -> Door {
             let point = (pp >= 0 && (pp as usize) < points.len()).then_some(pp as usize);
             let inside = point
                 .map(|i| points[i])
@@ -408,15 +522,16 @@ impl Cabin {
                 sells,
                 button,
                 wait,
+                group,
             }
         };
         let mut entries: Vec<Door> = entry_points
             .iter()
-            .map(|(pp, sells, button, half)| door(*pp, *sells, *button, *half))
+            .map(|(pp, sells, button, half, g)| door(*pp, *sells, *button, *half, *g))
             .collect();
         let exits: Vec<Door> = exit_points
             .iter()
-            .map(|(pp, half)| door(*pp, false, false, *half))
+            .map(|(pp, half, g)| door(*pp, false, false, *half, *g))
             .collect();
         // two leaves of one door: the queue of the front leaf runs forwards, the other's back,
         // so that the two lines do not stand in each other
@@ -471,7 +586,7 @@ impl Cabin {
         });
         let seats = places
             .iter()
-            .map(|(p, offset, omsi_seat)| {
+            .map(|(p, offset, omsi_seat, group)| {
                 let pos = Vec3::from(p.pos) + *offset;
                 let seated = p.height > 0.01;
                 let floor = if seated {
@@ -491,12 +606,14 @@ impl Cabin {
                     seated,
                     height: p.height,
                     omsi_seat: *omsi_seat,
+                    switch_var: p.switch_var.clone(),
+                    taken_var: p.taken_var.clone(),
+                    group: *group,
                 }
             })
             .collect();
         let routes = build_routes(graph.points.len(), &links);
         let point_of = |i: i32| usize::try_from(i).ok().filter(|i| *i < graph.points.len());
-        let stamper = data.stampers.last().map(|st| (point_of(st.path_point), Vec3::from(st.pos)));
         let sale = data.ticket_sales.last().map(|st| (point_of(st.path_point), Vec3::from(st.pos)));
         let money_point = data.money_points.last().map(|m| Vec3::from(m.pos));
         let money_var = data.money_points.last().map(|m| (Vec3::from(m.pos), m.var));
@@ -512,9 +629,11 @@ impl Cabin {
             desk,
             seats,
             parts: cabin_parts,
+            groups: group + 1,
+            point_group,
             link_room,
             routes,
-            stamper,
+            stampers,
             sale,
             money_point,
             money_var,
@@ -585,6 +704,7 @@ fn segments_cross(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> bool {
 #[derive(Clone)]
 struct BusNow {
     id: BusId,
+    next_stop: Option<RequestStop>,
     cabin: Arc<Cabin>,
     pos: DVec3,
     rot: Mat4,
@@ -610,6 +730,10 @@ struct BusNow {
     /// scripts' `target_index_int` names a hof terminus added with `[addterminus_allexit]`
     /// ("Nicht einsteigen", a works trip) - or none; no timetable target has it.
     terminus: Option<String>,
+    /// Whom it takes on at the stops.
+    takes: Takes,
+    /// The places its scripts have switched off (see `places_off`; empty: none).
+    places_off: Vec<bool>,
 }
 
 /// What passengers feel stepping into a bus (OMSI reads the same fields: the vehicle's
@@ -1371,6 +1495,7 @@ pub struct Humans {
     /// Passenger cabins by vehicle files (the front vehicle and its coupled parts).
     cabins: HashMap<Vec<PathBuf>, Option<Arc<Cabin>>>,
     player_cabin: Option<Arc<Cabin>>,
+    player_next_stop: Option<RequestStop>,
     /// Which places of each bus are taken.
     seats: HashMap<BusId, Vec<bool>>,
     /// The bus stops as Omsi.exe keeps them for the people (see `humans_pax`).
@@ -1379,6 +1504,10 @@ pub struct Humans {
     odometer: HashMap<BusId, f64>,
     /// The `PAX_Entry<n>_Req` / `PAX_Exit<n>_Req` of each bus this frame.
     pax_req: HashMap<BusId, (Vec<bool>, Vec<bool>)>,
+    /// Its `PAX_Entry<n>_Busy` / `PAX_Exit<n>_Busy`: somebody in that doorway.
+    pax_busy: HashMap<BusId, (Vec<bool>, Vec<bool>)>,
+    /// The occupancy variables its places name, and whether somebody is on each (#721).
+    pax_places: HashMap<BusId, Vec<(String, bool)>>,
     /// Who is at the player's cash desk (+0x7a8), how often the driver has been asked
     /// again (0x859bc4) and the most of that in this sale (0x859df4).
     desk_busy: Option<u32>,
@@ -1407,8 +1536,8 @@ pub struct Humans {
     /// Timetable buses to keep at their stop for a few seconds more (for the traffic): the
     /// bus, the stop it must be serving for it (none: any), the seconds.
     holds: Vec<(u64, Option<i64>, f32)>,
-    /// Door requests for the timetable buses' scripts: (bus, entries, exits).
-    ai_requests: Vec<(u64, Vec<bool>, Vec<bool>)>,
+    /// Door requests for the timetable buses' scripts.
+    ai_requests: Vec<(u64, DoorWants)>,
     pub tickets: Option<Arc<omsi_content::tickets::TicketPack>>,
     /// Current ticket request at the player's cash desk: (ticket name, value).
     pub request: Option<(String, f32)>,
@@ -1436,6 +1565,9 @@ pub struct Humans {
     pub entry_req: Vec<bool>,
     /// `PAX_Exit<i>_Req`: somebody inside wants out through exit `i`.
     pub exit_req: Vec<bool>,
+    /// `PAX_Entry<i>_Busy` / `PAX_Exit<i>_Busy`: somebody stands in that doorway.
+    pub entry_busy: Vec<bool>,
+    pub exit_busy: Vec<bool>,
     sync_frame: u32,
     /// Feet put down since the app last collected them (see [`Humans::take_footfalls`]).
     footfalls: Vec<ambience::Footfall>,
@@ -1481,6 +1613,10 @@ pub struct Humans {
     /// The timetable's name of each stop object (`Schedule::stop_names`), the names the
     /// targets above are made of.
     pub stop_names: Option<HashMap<i64, String>>,
+    /// The player's duty (`set_duty`): its trip, the stop of it the duty is due at, and
+    /// whether the trip has reached its last stop. None: free drive, and nobody waiting
+    /// boards the player's bus.
+    duty: Option<(Arc<DutyTrip>, usize, bool)>,
     /// Buses whose validator somebody used since the app last looked (`take_stamped`).
     stamped: Vec<BusId>,
     /// Pedestrians to keep strolling near the player (scaled by `density`).
@@ -1660,10 +1796,13 @@ impl Humans {
             wall_key: (0, 0, 0, 0.0),
             cabins: HashMap::new(),
             player_cabin: None,
+            player_next_stop: None,
             seats: HashMap::new(),
             stops: HashMap::new(),
             odometer: HashMap::new(),
             pax_req: HashMap::new(),
+            pax_busy: HashMap::new(),
+            pax_places: HashMap::new(),
             desk_busy: None,
             pardons: 0,
             pardon_max: 0,
@@ -1694,6 +1833,8 @@ impl Humans {
             ticket_points: 0,
             entry_req: Vec::new(),
             exit_req: Vec::new(),
+            entry_busy: Vec::new(),
+            exit_busy: Vec::new(),
             sync_frame: 0,
             footfalls: Vec::new(),
             density: 1.0,
@@ -1712,6 +1853,7 @@ impl Humans {
             driver_away: false,
             stop_targets: None,
             stop_names: None,
+            duty: None,
             stamped: Vec::new(),
             pedestrians: 14,
             max_people: crate::settings::Settings::load().ai_max_humans.max(1) as usize,
@@ -1943,6 +2085,19 @@ impl Humans {
         std::mem::take(&mut self.footfalls)
     }
 
+    /// Everybody: (walking, waiting at a stop, in a bus).
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let (mut walking, mut waiting, mut aboard) = (0, 0, 0);
+        for p in &self.people {
+            match (&p.place, &p.state) {
+                (Place::Bus(..), _) => aboard += 1,
+                (Place::Ground, State::Pax(x)) if x.inside.is_none() => waiting += 1,
+                (Place::Ground, _) => walking += 1,
+            }
+        }
+        (walking, waiting, aboard)
+    }
+
     /// People currently in the player's bus.
     pub fn riding(&self) -> usize {
         self.people
@@ -2003,17 +2158,21 @@ impl Humans {
                     }
                     for (i, s) in c.seats.iter().enumerate() {
                         log::info!(
-                            "  seat {i}: pos {:?} floor {:?} rot {:.0} seated {}",
+                            "  seat {i}: pos {:?} floor {:?} rot {:.0} seated {}{}{}",
                             s.pos,
                             s.floor,
                             s.rot,
-                            s.seated
+                            s.seated,
+                            s.switch_var.as_ref().map(|n| format!(" switched by {n} ({:?})", vehicle.var(n))).unwrap_or_default(),
+                            s.taken_var.as_ref().map(|n| format!(" occupancy into {n}")).unwrap_or_default()
                         );
                     }
                 }
                 self.seats.insert(BusId::Player, vec![false; c.seats.len()]);
                 self.entry_req = vec![false; c.entries.len().max(1)];
                 self.exit_req = vec![false; c.exits.len().max(1)];
+                self.entry_busy = vec![false; c.entries.len()];
+                self.exit_busy = vec![false; c.exits.len()];
                 self.player_cabin = Some(c);
             }
             None => log::info!("{}: no passenger cabin", vehicle.ty.def.path.display()),
@@ -2538,7 +2697,7 @@ impl Humans {
         let sp = self.stops[&id].spots[k].clone();
         let (dest, line) = self.draw_dest(id);
         let walk = 1.1 + (self.rand_f() as f32 * 2.0 - 1.0) * 0.2;
-        let mut pax = Pax::new(walk);
+        let mut pax = Pax::new(walk, self.rand_f());
         pax.stop = Some(id);
         pax.spot = Some(k);
         pax.pos = sp.pos;
@@ -2720,9 +2879,46 @@ impl Humans {
         v.has_script_var(name) || v.ty.program.var(name).is_some_and(|id| v.ty.program.stores(id))
     }
 
+    /// Whether entry or exit `i` (`kind` "Entry" or "Exit") has variables of its own: one of
+    /// Omsi.exe's eight, or one past them whose `PAX_<kind><i>_Open` the script reports (#719).
+    /// The others open with the eighth, as in Omsi.exe (0x62d31e reads the open state of door
+    /// min(i, 7)), and ask through its `_Req` ([`Humans::write_door_requests`]).
+    fn own_pax_door(v: &VehicleInstance, kind: &str, i: usize) -> bool {
+        i < OMSI_PAX_DOORS || (i < omsi_sim::vehicle::PAX_DOORS && Self::script_reports(v, &format!("PAX_{kind}{i}_Open")))
+    }
+
+    /// The passengers' requests into the bus's `PAX_Entry<n>_Req` / `PAX_Exit<n>_Req`, and
+    /// who stands in its doorways into their `_Busy` (#720): an entry or exit without
+    /// variables of its own asks through the eighth's ([`Humans::own_pax_door`]), where
+    /// Omsi.exe drops them (its request arrays have eight slots). Past the eighth they were
+    /// written to no variable at all.
+    pub(crate) fn write_door_requests(v: &mut VehicleInstance, doors: &DoorWants) {
+        for (kind, flags, what) in [
+            ("Entry", &doors.entry_req, "Req"),
+            ("Exit", &doors.exit_req, "Req"),
+            ("Entry", &doors.entry_busy, "Busy"),
+            ("Exit", &doors.exit_busy, "Busy"),
+        ] {
+            let mut slots = vec![false; flags.len().min(omsi_sim::vehicle::PAX_DOORS)];
+            for (i, r) in flags.iter().enumerate() {
+                let slot = if Self::own_pax_door(v, kind, i) { i } else { OMSI_PAX_DOORS - 1 };
+                if let Some(s) = slots.get_mut(slot) {
+                    *s |= *r;
+                }
+            }
+            for (i, r) in slots.iter().enumerate() {
+                v.set_var(&format!("PAX_{kind}{i}_{what}"), if *r { 1.0 } else { 0.0 });
+            }
+        }
+        for (name, on) in &doors.places {
+            v.set_var(name, if *on { 1.0 } else { 0.0 });
+        }
+    }
+
     /// `PAX_Entry<i>_Open` / `PAX_Exit<i>_Open` as the bus script reports them. A bus whose
     /// script never sets them (or only sets some of them) falls back to its physical `door_<i>`
-    /// or `door<i>` animations.
+    /// or `door<i>` animations; an entry or exit past the eighth without variables of its own
+    /// is open with the eighth ([`Humans::own_pax_door`]).
     fn doors_open(v: &VehicleInstance, n_entry: usize, n_exit: usize) -> (Vec<bool>, Vec<bool>) {
         let door_val = |k: usize| -> bool {
             v.var(&format!("door_{k}"))
@@ -2735,29 +2931,95 @@ impl Humans {
         // n_entry, because buses with all doors configured as entries (e.g. 3-door buses with 6 entries)
         // still place middle-door exits at door_2/3 and rear-door exits at door_4/5.
         let exit_door_base = if n_entry <= 1 { 1 } else { 2 };
-        let entry: Vec<bool> = (0..n_entry)
-            .map(|i| {
-                let name = format!("PAX_Entry{i}_Open");
-                if Self::script_reports(v, &name) {
+        let states = |kind: &str, n: usize, door: &dyn Fn(usize) -> bool| -> Vec<bool> {
+            let mut out: Vec<bool> = Vec::with_capacity(n);
+            for i in 0..n {
+                let name = format!("PAX_{kind}{i}_Open");
+                let open = if !Self::own_pax_door(v, kind, i) {
+                    out[OMSI_PAX_DOORS - 1]
+                } else if Self::script_reports(v, &name) {
                     v.var(&name).unwrap_or(0.0) > 0.5
                 } else {
-                    door_val(i.min(7))
-                }
-            })
-            .collect();
-        let exit: Vec<bool> = (0..n_exit)
-            .map(|i| {
-                let name = format!("PAX_Exit{i}_Open");
-                if Self::script_reports(v, &name) {
-                    v.var(&name).unwrap_or(0.0) > 0.5
-                } else {
-                    door_val((exit_door_base + i).min(7))
-                }
-            })
-            .collect();
+                    door(i)
+                };
+                out.push(open);
+            }
+            out
+        };
+        let entry = states("Entry", n_entry, &door_val);
+        let exit = states("Exit", n_exit, &|i| door_val((exit_door_base + i).min(7)));
         (entry, exit)
     }
 
+
+    pub fn set_player_next_stop(&mut self, stop: Option<&crate::schedule::PlannedStop>) {
+        // (called once a frame: worked out again only when the duty moves on to another stop)
+        if let (Some(s), Some(cur)) = (stop, self.player_next_stop.as_ref()) {
+            if cur.id == s.object_id {
+                return;
+            }
+        }
+        self.player_next_stop = stop
+            .and_then(|stop| self.request_stop(stop.object_id, Some(&stop.name), stop.position));
+    }
+
+    fn request_stop(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        position: Option<DVec3>,
+    ) -> Option<RequestStop> {
+        let loaded = self.stops.get(&id);
+        let name = name
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| loaded.map(|stop| stop.name.clone()))
+            .unwrap_or_else(|| id.to_string());
+        let alias = loaded
+            .map(|stop| {
+                if name.trim() == stop.name.trim() {
+                    stop.alias.clone()
+                } else {
+                    stop.name.clone()
+                }
+            })
+            .unwrap_or_default();
+        Some(RequestStop {
+            id,
+            name,
+            alias,
+            pos: position.or_else(|| loaded.map(|stop| stop.pos))?,
+        })
+    }
+
+    fn vehicle_next_stop(&self, vehicle: &VehicleInstance) -> Option<RequestStop> {
+        if let Ok(index) = usize::try_from(vehicle.host.tt_busstop_index) {
+            if let Some(id) = vehicle.host.tt_stop_ids.get(index) {
+                let name = vehicle.host.tt_stops.get(index).map(|stop| stop.0.as_str());
+                if let Some(stop) = self.request_stop(*id, name, None) {
+                    return Some(stop);
+                }
+            }
+        }
+        let name = vehicle.str_var("act_busstop");
+        if name.trim().is_empty() {
+            return None;
+        }
+        let (id, _) = self
+            .stops
+            .iter()
+            .filter(|(_, stop)| stop.is_named(&name))
+            .min_by(|(_, a), (_, b)| {
+                let back =
+                    |stop: &PaxStop| crowd::angle_diff(vehicle.heading, stop.heading).abs() > 100.0;
+                back(a).cmp(&back(b)).then_with(|| {
+                    (a.pos - vehicle.position)
+                        .length_squared()
+                        .total_cmp(&(b.pos - vehicle.position).length_squared())
+                })
+            })?;
+        self.request_stop(*id, Some(&name), None)
+    }
 
     /// The buses passengers deal with this frame.
     fn gather_buses(
@@ -2809,10 +3071,22 @@ impl Humans {
                     .map(|t| t.texture_id.trim().to_string()),
                 _ => None,
             };
+            // (on a duty the people its trip takes where they are going get on, however the
+            // depot file names the terminus; in free drive nobody)
+            let takes = match &self.duty {
+                Some((trip, next, done)) => Takes::Duty { trip: trip.clone(), next: *next, done: *done },
+                None => Takes::Nobody,
+            };
             out.push(BusNow {
                 terminus,
+                takes,
                 id: BusId::Player,
+                next_stop: self
+                    .player_next_stop
+                    .clone()
+                    .or_else(|| self.vehicle_next_stop(b)),
                 walk_open: None,
+                places_off: places_off(b, &cabin),
                 cabin,
                 pos: b.position,
                 rot: b.body_rotation(),
@@ -2890,8 +3164,23 @@ impl Humans {
                 let trailers = part_frames(&c.vehicle, &cabin);
                 out.push(BusNow {
                     terminus: c.bus.as_ref().map(|b| b.terminus.trim().to_string()).filter(|t| !t.is_empty()),
+                    takes: Takes::Terminus,
                     id: BusId::Ai(c.id),
+                    next_stop: c
+                        .bus
+                        .as_ref()
+                        .and_then(|bus| bus.stops.front())
+                        .and_then(|stop| {
+                            let position = c
+                                .state
+                                .route
+                                .get(stop.ri)
+                                .and_then(|lane| t.net.lanes.get(*lane))
+                                .map(|lane| lane.at(stop.s).0);
+                            self.request_stop(stop.id, None, position)
+                        }),
                     walk_open: None,
+                    places_off: places_off(&c.vehicle, &cabin),
                     cabin,
                     pos: c.vehicle.position,
                     rot: c.vehicle.body_rotation(),
@@ -2946,7 +3235,10 @@ impl Humans {
         let walk_open = Self::doors_open(v, cabin.entries.len(), cabin.exits.len());
         Some(BusNow {
             terminus: None,
+            takes: Takes::Nobody,
+            places_off: Vec::new(),
             id,
+            next_stop: None,
             entry_open: vec![false; cabin.entries.len()],
             exit_open: vec![false; cabin.exits.len()],
             walk_open: Some(walk_open),
@@ -3050,7 +3342,10 @@ impl Humans {
             let walk_open = Self::doors_open(v, cabin.entries.len(), cabin.exits.len());
             out.push(BusNow {
                 terminus: None,
+                takes: Takes::Nobody,
+                places_off: Vec::new(),
                 id: BusId::Ai(remote_bus_id(player)),
+                next_stop: None,
                 entry_open: vec![false; cabin.entries.len()],
                 exit_open: vec![false; cabin.exits.len()],
                 walk_open: Some(walk_open),
@@ -3068,6 +3363,23 @@ impl Humans {
             });
         }
         self.remote_now = out;
+    }
+
+    /// The player's duty this frame; None in free drive, where the people waiting leave the
+    /// player's bus alone. (Set after `stop_names`: the trip's stops are named by it.)
+    pub fn set_duty(&mut self, duty: Option<&crate::schedule::PlayerDuty>) {
+        let Some(d) = duty else {
+            self.duty = None;
+            return;
+        };
+        // the trip the IBIS is given: on a works trip from the depot the next one with a line
+        let (t, next) = d.trip_for_ibis();
+        let done = std::ptr::eq(t, d.trip()) && d.trip_done();
+        let trip = match self.duty.take() {
+            Some((trip, ..)) if trip.name == t.name && trip.departure == t.departure => trip,
+            _ => Arc::new(DutyTrip::of(t, self.stop_names.as_ref())),
+        };
+        self.duty = Some((trip, next, done));
     }
 
     /// Is `bus` among the buses people can be in this frame (an AI bus, or another player's)?
@@ -3320,11 +3632,12 @@ impl Humans {
         let Some(cabin) = self.cabin_for(bus) else { return };
         let trailers = part_frames(bus, &cabin);
         let rot = bus.body_rotation();
+        let off = places_off(bus, &cabin);
         for _ in 0..n {
-            let Some(k) = self.reserve_place(BusId::Player, cabin.seats.len()) else { break };
+            let Some(k) = self.reserve_place(BusId::Player, cabin.seats.len(), &off) else { break };
             let walk = 1.1 + (self.rand_f() as f32 * 2.0 - 1.0) * 0.2;
             let r = self.rand_f() as f32;
-            let mut pax = Pax::new(walk);
+            let mut pax = Pax::new(walk, self.rand_f());
             pax.bus = Some(BusId::Player);
             pax.inside = Some(BusId::Player);
             pax.seat = Some(k);
@@ -3397,12 +3710,14 @@ impl Humans {
 
     /// Report the waiting and alighting passengers to the bus script, the way OMSI does.
     pub fn write_pax_vars(&self, b: &mut VehicleInstance) {
-        for (i, r) in self.entry_req.iter().enumerate() {
-            b.set_var(&format!("PAX_Entry{i}_Req"), if *r { 1.0 } else { 0.0 });
-        }
-        for (i, r) in self.exit_req.iter().enumerate() {
-            b.set_var(&format!("PAX_Exit{i}_Req"), if *r { 1.0 } else { 0.0 });
-        }
+        let doors = DoorWants {
+            entry_req: self.entry_req.clone(),
+            exit_req: self.exit_req.clone(),
+            entry_busy: self.entry_busy.clone(),
+            exit_busy: self.exit_busy.clone(),
+            places: self.pax_places.get(&BusId::Player).cloned().unwrap_or_default(),
+        };
+        Self::write_door_requests(b, &doors);
     }
 
     /// Who wants a timetable bus to stop, as Omsi.exe asks before it lets one pull in
@@ -3436,7 +3751,7 @@ impl Humans {
     }
 
     /// Door requests for the timetable buses, for the traffic to hand to their scripts.
-    pub fn take_ai_requests(&mut self) -> Vec<(u64, Vec<bool>, Vec<bool>)> {
+    pub fn take_ai_requests(&mut self) -> Vec<(u64, DoorWants)> {
         std::mem::take(&mut self.ai_requests)
     }
 
@@ -5308,7 +5623,7 @@ impl Humans {
         let sp = self.stops[&stop].spots.get(spot).cloned();
         let seatheight = self.people[i].ty.def.seat_height;
         let walk = 1.1 + (self.rand_f() as f32 * 2.0 - 1.0) * 0.2;
-        let mut pax = Pax::new(walk);
+        let mut pax = Pax::new(walk, self.rand_f());
         pax.task = Task::WaitingForBus;
         pax.stop = Some(stop);
         // what a waiting person of ours has (sub_626044 and task 6): a destination drawn
@@ -5460,7 +5775,7 @@ mod tests {
 
     #[test]
     fn seats_counted_by_the_scripts_numbers() {
-        let seat = |omsi_seat: usize| Seat { pos: Vec3::ZERO, floor: Vec3::ZERO, rot: 0.0, seated: true, height: 0.45, omsi_seat };
+        let seat = |omsi_seat: usize| Seat { pos: Vec3::ZERO, floor: Vec3::ZERO, rot: 0.0, seated: true, height: 0.45, omsi_seat, switch_var: None, taken_var: None, group: 0 };
         // the driver's place is seat 0, a second section's numbers follow the first's
         let seats = [seat(1), seat(2), seat(4), seat(6)];
         assert_eq!(seat_numbers(&seats, [0, 2, 2, 3].into_iter()), [0, 1, 0, 0, 2, 0, 1]);
@@ -5868,6 +6183,300 @@ mod tests {
         assert_eq!(x, vec![true, true, true, true]);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #718: a trailer on a lorry's hitch (`[coupling_front_character]` type 0) whose cabin
+    /// gives no `[linkToNextVeh]` is not walked into from the bus: it is a section of its
+    /// own, boarded, ridden in and left by its own doors. A bus joint (type 1) without the
+    /// points is still walked through at the aisle's ends.
+    #[test]
+    fn a_trailer_nobody_walks_into_is_boarded_by_its_own_doors() {
+        let dir = std::env::temp_dir().join(format!("omsi-trailer-cabin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
+        // the bus: door at the front right, an aisle, a seat; the trailer: a door, an aisle,
+        // a seat and an exit, nothing that names the bus
+        write("paths_bus.cfg", "[pathpnt]\n1.1\n4\n0.4\n[pathpnt]\n0\n4\n0.5\n[pathpnt]\n0\n-4\n0.5\n[pathlink]\n0\n1\n[pathlink]\n1\n2\n");
+        write("cabin_bus.cfg", "[entry]\n0\n[exit]\n0\n[stamper]\n1\n0.5\n4\n1.5\n[passpos]\n-0.5\n2\n1.0\n0.45\n0\n");
+        write("paths_trail.cfg", "[pathpnt]\n1.1\n2\n0.4\n[pathpnt]\n0\n2\n0.5\n[pathpnt]\n0\n-2\n0.5\n[pathlink]\n0\n1\n[pathlink]\n1\n2\n");
+        write("cabin_trail.cfg", "[entry]\n0\n[exit]\n0\n[passpos]\n-0.5\n-1\n1.0\n0.45\n0\n");
+        // trailers with a way in and none out, and the other way round
+        write("cabin_trail_in.cfg", "[entry]\n0\n[passpos]\n-0.5\n-1\n1.0\n0.45\n0\n");
+        write("cabin_trail_out.cfg", "[exit]\n0\n[passpos]\n-0.5\n-1\n1.0\n0.45\n0\n");
+        // (a bus for its script's variables)
+        write("vars.bus", "[model]\nmodel.cfg\n[varnamelist]\n1\nvars.txt\n[script]\n1\nmain.osc\n");
+        write("model.cfg", "");
+        write("vars.txt", "door_0\n");
+        write("main.osc", "{init}\n{end}\n");
+        let def = |cabin: &str, paths: &str, coupling: Option<f32>| omsi_vehicle::Vehicle {
+            path: dir.join("bus.bus"),
+            passenger_cabin: Some(cabin.into()),
+            paths: Some(paths.into()),
+            bounding_box: Some([2.5, 9.0, 3.0, 0.0, 0.0, 1.5]),
+            coupling_front_character: coupling.map(|kind| [30.0, -10.0, 10.0, kind]),
+            ..Default::default()
+        };
+        let bus = def("cabin_bus.cfg", "paths_bus.cfg", None);
+        let offset = Vec3::new(0.0, -10.0, 0.0);
+        let cabin_of = |cabin: &str, kind: Option<f32>| {
+            let trail = def(cabin, "paths_trail.cfg", kind);
+            Cabin::load_train(&[(&bus, Vec3::ZERO, f32::INFINITY), (&trail, offset, -5.0)]).expect("cabin")
+        };
+        let hitched = cabin_of("cabin_trail.cfg", Some(0.0));
+        let jointed = cabin_of("cabin_trail.cfg", Some(1.0));
+        let plain = cabin_of("cabin_trail.cfg", None);
+        let no_exit = cabin_of("cabin_trail_in.cfg", Some(0.0));
+        let no_entry = cabin_of("cabin_trail_out.cfg", Some(0.0));
+        let jointed_no_exit = cabin_of("cabin_trail_in.cfg", Some(1.0));
+        let ty = std::sync::Arc::new(omsi_sim::VehicleType::load(&dir, &dir.join("vars.bus")).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+        let v = VehicleInstance::new(ty, omsi_sim::VehicleHost::new(Default::default()));
+        assert_eq!((jointed.groups, plain.groups), (1, 1), "a bus joint is walked through");
+        assert_eq!(jointed.links.len(), 5);
+        assert_eq!(hitched.groups, 2);
+        assert_eq!(hitched.links.len(), 4, "nothing joins the bus to its trailer");
+        assert_eq!(hitched.parts.len(), 2);
+        // its doors and its seat are the trailer's, behind the bus
+        assert_eq!((hitched.entries.len(), hitched.exits.len(), hitched.seats.len()), (2, 2, 2));
+        assert_eq!((hitched.entries[1].group, hitched.exits[1].group, hitched.seats[1].group), (1, 1, 1));
+        assert!((hitched.entries[1].inside - Vec3::new(1.1, -8.0, 0.4)).length() < 1e-4);
+        // somebody for the trailer's seat walks to the trailer's door, a rider in it to its exit
+        let entries = hitched.in_group(hitched.entry_points(), Some(1));
+        assert_eq!(entries, [None, Some(3)]);
+        let near_bus_door = Vec3::new(1.6, 4.0, 0.0);
+        assert_eq!(hitched.omsi_nearest(near_bus_door, &entries, false, false, None, None), Some(3));
+        assert_eq!(hitched.in_group(hitched.exit_points(), hitched.group_at(Some(5))), [None, Some(3)]);
+        assert_eq!(hitched.in_group(hitched.exit_points(), Some(0)), [Some(0), None]);
+        // with the trailer's doors shut (and no button) they wait at those, not at nothing:
+        // the bus's door, the first of the list, is left out of it
+        let here = Vec3::new(0.0, -8.0, 0.5);
+        let exits = hitched.in_group(hitched.exit_points(), Some(1));
+        assert_eq!(hitched.omsi_nearest(here, &exits, false, false, None, Some(&[false, false])), Some(3));
+        let flags = hitched.entry_flags();
+        for avoid in [false, true] {
+            assert_eq!(hitched.omsi_nearest(near_bus_door, &entries, avoid, false, Some(&flags), Some(&[false, false])), Some(3));
+        }
+        // (one group: the list's first, as Omsi.exe)
+        assert_eq!(jointed.omsi_nearest(here, &[None, Some(3)], false, false, None, Some(&[false, false])), None);
+        // a trailer of its own nobody can get into, or out of again, has its places off
+        assert_eq!(places_off(&v, &hitched), [false, false]);
+        assert_eq!(places_off(&v, &no_exit), [false, true], "nobody could get out of it");
+        assert_eq!(places_off(&v, &no_entry), [false, true], "nobody could get into it");
+        assert_eq!(places_off(&v, &jointed_no_exit), [false, false], "out through the bus");
+        // the bus's validator is out of a trailer passenger's reach
+        assert_eq!(hitched.nearest_stamper(Vec3::new(1.1, -8.0, 0.4)), None);
+        assert_eq!(hitched.nearest_stamper(Vec3::new(1.1, 4.0, 0.4)), Some(0));
+        assert_eq!(jointed.nearest_stamper(Vec3::new(1.1, -8.0, 0.4)), Some(0));
+    }
+
+    /// #722: a validator by each door - every `[stamper]` is kept, and a passenger stamps at
+    /// the one nearest where they came in (Omsi.exe kept the file's last one only).
+    #[test]
+    fn passengers_stamp_at_the_validator_nearest_their_door() {
+        let dir = std::env::temp_dir().join(format!("omsi-stampers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("test.bus"), "[passengercabin]\ncabin.cfg\n\n[paths]\npaths.cfg\n").unwrap();
+        // an aisle from the front door (y 5) to the rear one (y -4)
+        let pts: String = [5.0, 4.0, -3.0, -4.0].iter().map(|y| format!("[pathpnt]\n0\n{y}\n0.5\n\n")).collect();
+        std::fs::write(dir.join("paths.cfg"), format!("{pts}[pathlink]\n0\n1\n\n[pathlink]\n1\n2\n\n[pathlink]\n2\n3\n")).unwrap();
+        std::fs::write(
+            dir.join("cabin.cfg"),
+            "[entry]\n0\n\n[entry]\n3\n\n[stamper]\n1\n0.5\n4\n1.5\n\n[stamper]\n2\n0.5\n-3\n1.5\n\n[passpos]\n0\n0\n0.5\n0\n0\n",
+        )
+        .unwrap();
+        let def = omsi_vehicle::Vehicle::load(&dir.join("test.bus")).unwrap();
+        let cabin = Cabin::load_train(&[(&def, Vec3::ZERO, f32::INFINITY)]).expect("cabin");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(cabin.stampers.len(), 2);
+        assert_eq!(cabin.stampers[1], (Some(2), Vec3::new(0.5, -3.0, 1.5)));
+        assert_eq!(cabin.nearest_stamper(Vec3::new(0.0, 5.0, 0.5)), Some(0), "in by the front door");
+        assert_eq!(cabin.nearest_stamper(Vec3::new(0.0, -4.0, 0.5)), Some(1), "in by the rear door");
+    }
+
+    /// #719: a five-door bus with two paths a door has ten entries. Past Omsi.exe's eight,
+    /// an entry whose `PAX_Entry<n>_Open` the script gives is a door of its own, and its
+    /// people ask through its `PAX_Entry<n>_Req`; one the script does not know opens with
+    /// the eighth, as in Omsi.exe, and asks through it (Omsi.exe drops that request).
+    #[test]
+    fn doors_past_the_eighth_have_variables_of_their_own_or_go_with_the_eighth() {
+        let bus = |name: &str, vars: &str| {
+            let dir = std::env::temp_dir().join(format!("omsi-doors-past-eight-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("test.bus"), "[model]\nmodel.cfg\n[varnamelist]\n1\nvars.txt\n[script]\n1\nmain.osc\n").unwrap();
+            std::fs::write(dir.join("model.cfg"), "").unwrap();
+            std::fs::write(dir.join("vars.txt"), vars).unwrap();
+            std::fs::write(dir.join("main.osc"), "{init}\n{end}\n").unwrap();
+            let ty = std::sync::Arc::new(omsi_sim::VehicleType::load(&dir, &dir.join("test.bus")).unwrap());
+            std::fs::remove_dir_all(&dir).ok();
+            VehicleInstance::new(ty, omsi_sim::VehicleHost::new(Default::default()))
+        };
+        let mut req = vec![false; 10];
+        req[9] = true;
+
+        // the script has the ten doors' variables
+        let all: String = (0..10).map(|i| format!("PAX_Entry{i}_Open\n")).collect();
+        let mut v = bus("own", &all);
+        v.set_var("PAX_Entry9_Open", 1.0);
+        let (e, _) = Humans::doors_open(&v, 10, 0);
+        assert_eq!(e, [false, false, false, false, false, false, false, false, false, true]);
+        Humans::write_door_requests(&mut v, &DoorWants { entry_req: req.clone(), ..Default::default() });
+        assert_eq!((v.var("PAX_Entry9_Req"), v.var("PAX_Entry7_Req")), (Some(1.0), Some(0.0)));
+
+        // an older bus knows eight: the ninth and tenth go with the eighth
+        let eight: String = (0..8).map(|i| format!("PAX_Entry{i}_Open\n")).collect();
+        let mut v = bus("eight", &eight);
+        v.set_var("PAX_Entry7_Open", 1.0);
+        let (e, _) = Humans::doors_open(&v, 10, 0);
+        assert_eq!(e, [false, false, false, false, false, false, false, true, true, true]);
+        Humans::write_door_requests(&mut v, &DoorWants { entry_req: req.clone(), ..Default::default() });
+        assert_eq!((v.var("PAX_Entry9_Req"), v.var("PAX_Entry7_Req")), (Some(0.0), Some(1.0)));
+    }
+
+    /// #721: a `[passpos]` that names a variable of its own is offered to passengers only
+    /// while the script holds that variable off 0, and one that names an occupancy variable
+    /// has it set while a rider is on it - a tip-up seat follows the person on it, a second
+    /// seating layout comes and goes with a setvar.
+    #[test]
+    fn places_follow_their_own_variables() {
+        let dir = std::env::temp_dir().join(format!("omsi-place-vars-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("test.bus"),
+            "[model]\nmodel.cfg\n[varnamelist]\n1\nvars.txt\n[script]\n1\nmain.osc\n\n[passengercabin]\ncabin.cfg\n\n[paths]\npaths.cfg\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("model.cfg"), "").unwrap();
+        std::fs::write(dir.join("vars.txt"), "layout_long\nfold_seat_down\n").unwrap();
+        std::fs::write(dir.join("main.osc"), "{init}\n{end}\n").unwrap();
+        std::fs::write(dir.join("paths.cfg"), "[pathpnt]\n0\n4\n0.5\n\n[pathpnt]\n0\n-3\n0.5\n\n[pathlink]\n0\n1\n").unwrap();
+        // a seat of the long layout, a tip-up seat, a plain standing place, and a place whose
+        // variable the script does not have
+        std::fs::write(
+            dir.join("cabin.cfg"),
+            "[entry]\n0\n\n[passpos]\n-0.5\n2\n0.9\n0.45\n0\nlayout_long\n\n[passpos]\n0.5\n1\n0.9\n0.45\n0\nlayout_any\nfold_seat_down\n\n\
+             [passpos]\n0\n0\n0.5\n0\n0\n\n[passpos]\n0\n-1\n0.5\n0\n0\nno_such_var\n",
+        )
+        .unwrap();
+        let ty = std::sync::Arc::new(omsi_sim::VehicleType::load(&dir, &dir.join("test.bus")).unwrap());
+        let def = omsi_vehicle::Vehicle::load(&dir.join("test.bus")).unwrap();
+        let cabin = Cabin::load_train(&[(&def, Vec3::ZERO, f32::INFINITY)]).expect("cabin");
+        std::fs::remove_dir_all(&dir).ok();
+        let mut v = VehicleInstance::new(ty, omsi_sim::VehicleHost::new(Default::default()));
+        v.set_var("layout_long", 0.0);
+        let off = places_off(&v, &cabin);
+        assert_eq!(off, [true, false, false, false], "only the place whose variable is 0 is off");
+        let mut h = Humans::new(Path::new("/nonexistent"));
+        for _ in 0..40 {
+            let k = h.reserve_place(BusId::Player, 4, &off).expect("a free place");
+            assert_ne!(k, 0, "nobody takes a place that is switched off");
+            h.free_seat(BusId::Player, k);
+        }
+        assert_eq!(h.reserve_place(BusId::Player, 4, &[true; 4]), None, "all off: nobody gets on");
+        v.set_var("layout_long", 1.0);
+        assert_eq!(places_off(&v, &cabin), [false; 4]);
+        // somebody sits on the tip-up seat (place 1) of this bus, somebody on place 1 of another
+        let bn = BusNow {
+            id: BusId::Player,
+            cabin: Arc::new(cabin),
+            pos: DVec3::ZERO,
+            rot: Mat4::IDENTITY,
+            heading: 0.0,
+            speed: 0.0,
+            entry_open: vec![false],
+            exit_open: Vec::new(),
+            walk_open: None,
+            interior: 0.0,
+            air: CabinAir::default(),
+            half: DVec2::new(1.25, 6.0),
+            centre: DVec2::ZERO,
+            accel: DVec2::ZERO,
+            trailers: Vec::new(),
+            terminus: None,
+            takes: Takes::Terminus,
+            next_stop: None,
+            places_off: Vec::new(),
+        };
+        let taken = places_taken(&bn, &[(BusId::Player, 1), (BusId::Ai(2), 2)]);
+        assert_eq!(taken, [("fold_seat_down".to_string(), true)]);
+        Humans::write_door_requests(&mut v, &DoorWants { places: taken, ..Default::default() });
+        assert_eq!(v.var("fold_seat_down"), Some(1.0));
+        Humans::write_door_requests(&mut v, &DoorWants { places: places_taken(&bn, &[]), ..Default::default() });
+        assert_eq!(v.var("fold_seat_down"), Some(0.0), "up again once they have got up");
+    }
+
+    /// #720: `PAX_Entry<n>_Busy` / `PAX_Exit<n>_Busy` tell a door script that somebody stands
+    /// in that doorway - on the threshold or in the opening, not in the queue outside a shut
+    /// door, the aisle or the deck above - and go with the frame like the requests.
+    #[test]
+    fn a_doorway_is_busy_while_somebody_stands_in_it() {
+        let dir = std::env::temp_dir().join(format!("omsi-doorway-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("test.bus"), "[boundingbox]\n2.5\n12\n3\n0\n0\n1.5\n\n[passengercabin]\ncabin.cfg\n\n[paths]\npaths.cfg\n").unwrap();
+        // the front door's threshold on the right (x 1.1), an aisle point beside it, the
+        // rear door's threshold at y -3
+        std::fs::write(dir.join("paths.cfg"), "[pathpnt]\n1.1\n4\n0.4\n\n[pathpnt]\n0\n4\n0.5\n\n[pathpnt]\n0\n-3\n0.5\n\n[pathpnt]\n1.1\n-3\n0.4\n\n[pathlink]\n0\n1\n\n[pathlink]\n1\n2\n\n[pathlink]\n2\n3\n").unwrap();
+        std::fs::write(dir.join("cabin.cfg"), "[entry]\n0\n\n[exit]\n3\n\n[passpos]\n-0.5\n0\n0.9\n0.45\n0\n").unwrap();
+        let def = omsi_vehicle::Vehicle::load(&dir.join("test.bus")).unwrap();
+        let cabin = Cabin::load_train(&[(&def, Vec3::ZERO, f32::INFINITY)]).expect("cabin");
+        let door = &cabin.entries[0];
+        assert!(door.in_doorway(Vec3::new(1.1, 4.0, 0.4)), "on the threshold");
+        assert!(door.in_doorway(Vec3::new(1.35, 4.1, 0.0)), "in the opening");
+        assert!(!door.in_doorway(Vec3::new(1.8, 4.0, 0.0)), "waiting outside the shut door");
+        // (the bus is 2.5 m wide: walking past along the line 0.5 m out from its side)
+        assert!(!door.in_doorway(Vec3::new(1.25 + 0.5, 4.0, 0.0)), "walking past the door");
+        assert!(!door.in_doorway(Vec3::new(1.25 + 0.5, 4.0, 0.4)), "walking past the door");
+        assert!(!door.in_doorway(Vec3::new(0.0, 4.0, 0.5)), "in the aisle");
+        assert!(!door.in_doorway(Vec3::new(1.1, 4.0, 2.4)), "on the deck above");
+        assert!(!door.in_doorway(Vec3::new(1.1, 2.5, 0.4)), "beside the door");
+        assert!(cabin.exits[0].in_doorway(Vec3::new(1.2, -3.0, 0.4)));
+        assert!(!cabin.exits[0].in_doorway(Vec3::new(1.2, 4.0, 0.4)));
+        // a bus standing at (100, 200) heading east: somebody stepping in from the kerb (in
+        // the world) and a rider at the rear door (in its frame)
+        let rot = Mat4::from_rotation_z(-90f32.to_radians());
+        let bn = BusNow {
+            id: BusId::Ai(3),
+            cabin: Arc::new(cabin),
+            pos: DVec3::new(100.0, 200.0, 0.0),
+            rot,
+            heading: 90.0,
+            speed: 0.0,
+            entry_open: vec![true],
+            exit_open: vec![true],
+            walk_open: None,
+            interior: 0.0,
+            air: CabinAir::default(),
+            half: DVec2::new(1.25, 6.0),
+            centre: DVec2::ZERO,
+            accel: DVec2::ZERO,
+            trailers: Vec::new(),
+            terminus: None,
+            takes: Takes::Terminus,
+            next_stop: None,
+            places_off: Vec::new(),
+        };
+        let step_in = bn.world(Vec3::new(1.35, 4.0, 0.0));
+        assert_eq!(doorways_taken(&bn, &[(None, step_in)]), (vec![true], vec![false]));
+        let rear = DVec3::new(1.1, -3.0, 0.4);
+        assert_eq!(doorways_taken(&bn, &[(Some(BusId::Ai(3)), rear)]), (vec![false], vec![true]));
+        // a rider of another bus, somebody waiting further out on the pavement: nobody here
+        let waiting = bn.world(Vec3::new(2.6, 4.0, 0.0));
+        assert_eq!(doorways_taken(&bn, &[(Some(BusId::Player), rear), (None, waiting)]), (vec![false], vec![false]));
+        // into the script's variables, a door past the eighth with the eighth's
+        std::fs::write(dir.join("vars.bus"), "[model]\nmodel.cfg\n[varnamelist]\n1\nvars.txt\n[script]\n1\nmain.osc\n").unwrap();
+        std::fs::write(dir.join("model.cfg"), "").unwrap();
+        std::fs::write(dir.join("vars.txt"), "door_0\n").unwrap();
+        std::fs::write(dir.join("main.osc"), "{init}\n{end}\n").unwrap();
+        let ty = std::sync::Arc::new(omsi_sim::VehicleType::load(&dir, &dir.join("vars.bus")).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+        let mut v = VehicleInstance::new(ty, omsi_sim::VehicleHost::new(Default::default()));
+        let mut entry_busy = vec![false; 10];
+        entry_busy[9] = true;
+        Humans::write_door_requests(&mut v, &DoorWants { entry_busy, exit_busy: vec![false, true], ..Default::default() });
+        assert_eq!((v.var("PAX_Entry7_Busy"), v.var("PAX_Entry0_Busy")), (Some(1.0), Some(0.0)));
+        assert_eq!((v.var("PAX_Exit1_Busy"), v.var("PAX_Exit0_Busy")), (Some(1.0), Some(0.0)));
+        // nobody there in the next frame: gone after the scripts' frame, as the requests
+        v.update(0.02);
+        assert_eq!((v.var("PAX_Entry7_Busy"), v.var("PAX_Exit1_Busy")), (Some(0.0), Some(0.0)));
     }
 }
 

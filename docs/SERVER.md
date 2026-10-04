@@ -30,8 +30,12 @@ Players reach it two ways:
   That is what a free Cloudflare quick tunnel carries (`tunnel = 1` starts `cloudflared
   tunnel --url http://127.0.0.1:<web_port>` and prints the `https://….trycloudflare.com`
   address). The same port answers `GET /status` (JSON: name, motd, map, players,
-  max_players, time, weather, version, protocol) and `GET /icon.png`, which the launcher's
-  Multiplayer → Servers list shows. With an `admin_password` it also takes `POST /admin`
+  max_players, time, weather, version, protocol, vehicles, and on a dedicated server `world`:
+  its AI cars, buses, cars asleep, parked cars, people walking, waiting and aboard, the
+  traffic density) and `GET /icon.png`, which the launcher's Multiplayer → Servers list
+  shows. `vehicles` is the server's `vehicles` list (else every bus it has): a joining
+  player's launcher offers only those, and so do the game menu's *Place a vehicle* and *Swap*
+  once the game has joined. With an `admin_password` it also takes `POST /admin`
   from the machine itself: one admin command a line (`clock 30600`, `weather set
   Weather/#CAVOK.owt`, `say …`, `kick 3`, as the Administration menu sends them), the
   password in `X-Admin-Password`; five wrong ones in two minutes close it for a while. A

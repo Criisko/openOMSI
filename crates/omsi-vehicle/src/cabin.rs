@@ -17,6 +17,13 @@ pub struct PassPos {
     /// the seat number scripts ask `GetHumanCountOnSeat` about (0x7d39a4) - with the
     /// driver's place first, as most cabins have it, the first `[passpos]` is seat 1.
     pub file_index: usize,
+    /// openOMSI's (#721): a script variable that switches the `[passpos]` on and off - while
+    /// it is 0 no passenger takes the place - named on the line straight after its five
+    /// values. None (or a name the scripts do not have): always on.
+    pub switch_var: Option<String>,
+    /// openOMSI's: a script variable the engine sets to 1 while somebody is on the place and
+    /// to 0 while nobody is, named on the line after that.
+    pub taken_var: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -65,24 +72,27 @@ impl PassengerCabin {
         // the seat written last (driver's or not, and which): Omsi.exe keeps both kinds in
         // one list, in the order of the file
         let mut last: Option<(bool, usize)> = None;
-        while let Some(k) = r.next_keyword() {
-            match k.as_str() {
-                "entry" => {
-                    let mut e = Entry { path_point: r.i32(), ..Default::default() };
-                    loop {
-                        let save = r.pos();
-                        let w = r.word().to_ascii_lowercase();
-                        match w.as_str() {
-                            "{noticketsale}" => e.no_ticket_sale = true,
-                            "{withbutton}" => e.with_button = true,
-                            _ => {
-                                r.seek(save);
-                                break;
-                            }
+        while let Some(e) = r.next_entry(&["{noticketsale}", "{withbutton}"]) {
+            let k = match e {
+                // a line of its own anywhere between the blocks, as Omsi.exe reads them
+                // (0x5ce952 - 0x5ce9bc): it marks the entry read last. Every stock cabin has
+                // a blank line between the second entry's path point and its
+                // `{noticketsale}`, and read only straight after the path point, the flag
+                // was lost there - and so was a `{withbutton}` written the same way (#1156)
+                omsi_cfg::Entry::Token(t) => {
+                    if let Some(e) = c.entries.last_mut() {
+                        if t == "{noticketsale}" {
+                            e.no_ticket_sale = true;
+                        } else {
+                            e.with_button = true;
                         }
                     }
-                    c.entries.push(e);
+                    continue;
                 }
+                omsi_cfg::Entry::Keyword(k) => k,
+            };
+            match k.as_str() {
+                "entry" => c.entries.push(Entry { path_point: r.i32(), ..Default::default() }),
                 "exit" => c.exits.push(r.i32()),
                 "linktonextveh" => c.link_to_next_veh = Some(r.i32()),
                 "linktoprevveh" => c.link_to_prev_veh = Some(r.i32()),
@@ -109,7 +119,20 @@ impl PassengerCabin {
                         None => [0, 1, 2, 3],
                     };
                     let file_index = c.pass_positions.len() + c.driver_positions.len();
-                    let p = PassPos { pos, height, rot, illumination, file_index };
+                    // (openOMSI's two variables of a `[passpos]`, #721: lines that follow at
+                    // once - a blank line, the next block or a `{...}` flag ends them, so every
+                    // OMSI 2 file reads as before, and Omsi.exe passes over the lines)
+                    let mut more = || {
+                        let l = r.lines().get(r.pos())?.trim();
+                        if k != "passpos" || l.is_empty() || l.starts_with('[') || l.starts_with('{') {
+                            return None;
+                        }
+                        r.line();
+                        Some(l.to_string())
+                    };
+                    let switch_var = more();
+                    let taken_var = switch_var.as_ref().and_then(|_| more());
+                    let p = PassPos { pos, height, rot, illumination, file_index, switch_var, taken_var };
                     if k == "passpos" {
                         c.pass_positions.push(p);
                         last = Some((false, c.pass_positions.len() - 1));
@@ -153,6 +176,40 @@ mod tests {
         assert_eq!(c.pass_positions[2].illumination, [6, 7, 8, 9]);
         let c = PassengerCabin::parse(&CfgFile::from_str("passengercabin.cfg", "[passpos]\n0\n0\n1\n0.5\n0\n"));
         assert_eq!(c.pass_positions[0].illumination, [0, 1, 2, 3]);
+    }
+
+    /// #1156: `{noticketsale}` and `{withbutton}` are lines of their own that mark the entry
+    /// read last, wherever they stand before the next one - the stock cabins write a blank
+    /// line before them.
+    #[test]
+    fn entry_flags_mark_the_entry_read_last() {
+        let text = "[entry]\r\n0\r\n\r\n[entry]\r\n4\r\n\r\n{noticketsale}\r\n\r\n[exit]\r\n7\r\n\r\n\
+                    [entry]\r\n9\r\n{withbutton}\r\n{noticketsale}\r\n\r\n[entry]\r\n11\r\n\r\n[exit]\r\n12\r\n\r\n{withbutton}\r\n";
+        let c = PassengerCabin::parse(&CfgFile::from_str("passengercabin.cfg", text));
+        let flags: Vec<(i32, bool, bool)> = c.entries.iter().map(|e| (e.path_point, e.no_ticket_sale, e.with_button)).collect();
+        assert_eq!(flags, [(0, false, false), (4, true, false), (9, true, true), (11, false, true)]);
+        assert_eq!(c.exits, [7, 12]);
+        // the stock SD200: its second entry (path point 4) sells no tickets
+        let root = std::path::PathBuf::from("../../../OMSI 2 Original");
+        if let Ok(c) = PassengerCabin::load(&root.join("Vehicles/MAN_SD200/Model/passengercabin.cfg")) {
+            assert_eq!(c.entries.iter().map(|e| (e.path_point, e.no_ticket_sale)).collect::<Vec<_>>(), [(0, false), (4, true)]);
+        }
+    }
+
+    /// #721: a `[passpos]` may name a variable that switches it on and off and one the
+    /// engine writes its occupancy into, on the lines straight after its values.
+    #[test]
+    fn a_place_may_name_its_switch_and_occupancy_variables() {
+        let text = "[passpos]\n0.94\n0.04\n0.92\n0.43\n0\nseat_folded_down\nseat_taken\n\n\
+                    [passpos]\n0.5\n2\n1\n0.5\n0\nlayout_long\n\n[passpos]\n0.5\n1\n1\n0.5\n0\n\n\
+                    [passpos]\n0.5\n0\n1\n0.5\n0\n[entry]\n0\n{noticketsale}\n[drivpos]\n-0.8\n4.5\n1.0\n0.5\n0\nnot_a_place_var\n";
+        let c = PassengerCabin::parse(&CfgFile::from_str("passengercabin.cfg", text));
+        let vars: Vec<(Option<&str>, Option<&str>)> = c.pass_positions.iter().map(|p| (p.switch_var.as_deref(), p.taken_var.as_deref())).collect();
+        assert_eq!(vars, [(Some("seat_folded_down"), Some("seat_taken")), (Some("layout_long"), None), (None, None), (None, None)]);
+        assert_eq!(c.pass_positions[0].pos, [0.94, 0.04, 0.92]);
+        assert_eq!(c.entries[0].path_point, 0);
+        assert!(c.entries[0].no_ticket_sale);
+        assert_eq!(c.driver_positions[0].switch_var, None);
     }
 
     #[test]

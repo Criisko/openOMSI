@@ -208,6 +208,13 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool)
                 let axis = max(-l.dir.z, 0.05);
                 let gain = clamp(axis * axis / max(drop * drop, 1e-6), 1.0, l.extra.z);
                 e = e * mix(1.0, gain, smoothstep(-0.04, 0.0, drop));
+            } else if (l.extra.z < 0.0) {
+                // a full beam (the gain as a negative number): as much stronger towards the
+                // horizon, where it reaches far down the road, above it as well as below - it
+                // has no cut-off
+                let drop = abs(ld.z);
+                let axis = max(-l.dir.z, 0.05);
+                e = e * clamp(axis * axis / max(drop * drop, 1e-6), 1.0, -l.extra.z);
             }
         }
         if (e <= 0.0) {

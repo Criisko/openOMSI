@@ -42,6 +42,9 @@ struct CoronaOut {
     @location(4) beam: f32,
     // the cone's inner and outer half angles (radians)
     @location(5) cone: vec2<f32>,
+    // a smoke puff's: how high this point is over the ground it fades into (m), and how
+    // high the fade reaches (0: not faded)
+    @location(6) ground: vec2<f32>,
 };
 
 @vertex
@@ -49,6 +52,47 @@ fn vs_main(in: CoronaIn) -> CoronaOut {
     var out: CoronaOut;
     let corners = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0));
     let c = corners[in.vid % 6u];
+    if (in.extra.w > 2.5) {
+        // a [smoke] puff (`smoke_sprite`): rauch.tga facing the viewer as Omsi.exe lays it
+        // out (0x5a2b5c), turned about the line of sight by its own angle (dir: its cosine
+        // and sine) and moved up.z towards the eye in depth only - its size on the screen
+        // stays (Omsi.exe's 0.1 m: the view depth less 0.1 put through the projection's
+        // depth terms)
+        let to_cam = camera.cam_pos.xyz - in.pos;
+        let dist = length(to_cam);
+        let view_dir = to_cam / max(dist, 0.001);
+        var side = cross(vec3<f32>(0.0, 0.0, 1.0), view_dir);
+        if (length(side) < 0.0001) {
+            // (seen from straight above or below)
+            side = camera.cam_right.xyz;
+        }
+        let right0 = normalize(side);
+        let up0 = cross(view_dir, right0);
+        let right = right0 * in.dir.x + up0 * in.dir.y;
+        let up = up0 * in.dir.x - right0 * in.dir.y;
+        let size = max(in.size, dist * 0.002) * 0.9;
+        let wp = in.pos + (right * c.x + up * c.y) * size;
+        var sout: CoronaOut;
+        sout.clip = camera.view_proj * vec4<f32>(wp, 1.0);
+        if (in.up.z > 0.0) {
+            let nearer = camera.view_proj * vec4<f32>(wp + view_dir * min(in.up.z, dist * 0.9), 1.0);
+            sout.clip.z = nearer.z / nearer.w * sout.clip.w;
+        }
+        sout.uv = c * 0.5 + 0.5;
+        let a = min(in.color.a, 1.0);
+        sout.color = vec4<f32>(in.color.rgb, a);
+        // Omsi.exe lets a puff sink on into the road, which cuts it off in a straight line
+        // (under a wheel's spray: bright bands across the road); here it fades out over
+        // its lowest part into the ground it was thrown up from (up.x, when up.y is 1),
+        // from up.w above it (`smoke_ground_fade`) down to nothing
+        if (in.up.y > 0.5) {
+            sout.ground = vec2<f32>(wp.z - in.up.x, in.up.w);
+        }
+        if (!(a > 0.001) || (bitcast<u32>(a) & 0x7f800000u) == 0x7f800000u) {
+            sout.clip = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+        }
+        return sout;
+    }
     if (in.extra.w > 1.5) {
         // the halo round a light in fog: licht.bmp turned to the
         // viewer, pulled towards them by its size, seen from in front of the light (for a
@@ -250,12 +294,14 @@ fn fs_enhanced(in: CoronaOut) -> @location(0) vec4<f32> {
 }
 
 // Smoke ([smoke] particles): the smoke texture tinted with the particle's colour, lit by the
-// scene's ambient and sun light, blended with its alpha (the particle's times the texture's).
+// scene's ambient and sun light, blended with its alpha (the particle's times the texture's),
+// faded out into the ground under it (see `vs_main`).
 fn smoke_color(in: CoronaOut) -> vec4<f32> {
     // upside up, as the sprite's own picture above
     let t = textureSample(t_corona, s_corona, vec2<f32>(in.uv.x, 1.0 - in.uv.y));
     let light = min(camera.ambient.rgb + camera.sun_color.rgb * 0.6, vec3<f32>(1.2));
-    return vec4<f32>(in.color.rgb * t.rgb * light, clamp(t.a * in.color.a, 0.0, 1.0));
+    let over_ground = select(1.0, smoothstep(0.0, in.ground.y, in.ground.x), in.ground.y > 0.0);
+    return vec4<f32>(in.color.rgb * t.rgb * light, clamp(t.a * in.color.a * over_ground, 0.0, 1.0));
 }
 
 @fragment

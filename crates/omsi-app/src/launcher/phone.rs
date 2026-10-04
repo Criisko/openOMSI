@@ -422,9 +422,7 @@ fn bus_sheet(l: &mut Launcher, r: Rect) -> bool {
         .filter(|v| allowed.as_ref().map(|a| a.contains(&norm(&v.file))).unwrap_or(true))
         .map(|v| {
             let mut sub = v.manufacturer.clone();
-            if !v.paints.is_empty() {
-                sub = format!("{sub}{}{} liveries", if sub.is_empty() { "" } else { " · " }, v.paints.len());
-            }
+            sub = format!("{sub}{}{}", if sub.is_empty() { "" } else { " · " }, super::drive::liveries_text(v.paints.len()));
             if !v.missing_packs.is_empty() {
                 sub = format!("{sub} · parts missing");
             }
@@ -1143,7 +1141,7 @@ fn online(l: &mut Launcher, body: Rect) {
 
 fn join(l: &mut Launcher, address: &str) {
     l.state.ask_server(address, 5.0);
-    l.state.join_server(address);
+    l.state.join_server(address, super::state::JoinProto::Auto);
     if l.state.joined_server.as_deref() == Some(address) {
         l.phone.tab = Tab::Play;
         l.go(Page::Drive);

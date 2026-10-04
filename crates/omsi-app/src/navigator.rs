@@ -51,6 +51,8 @@ const TROLLEY: Color = Color::rgba(46, 184, 92, 1.0);
 const BUS: Color = Color::rgba(226, 58, 52, 1.0);
 const TRAM: Color = Color::rgba(240, 190, 30, 1.0);
 const LINE_TEXT: Color = Color::rgba(15, 15, 15, 1.0);
+/// The other players of a LAN session or server: an arrow the way they face, with their name.
+const PLAYER: Color = Color::rgba(190, 96, 255, 1.0);
 
 /// What a traffic vehicle is on the map: a trolleybus (its model has trolley poles to
 /// raise, `cp_SHTANGALEV` or `shtanga_lev_rot`), a tram, a bus (one on a timetable or
@@ -76,6 +78,25 @@ fn traffic_kind(c: &crate::traffic::AiCar) -> (Color, Option<String>) {
     };
     (color, line)
 }
+/// A bus, trolleybus or tram on the map as a pictogram, not a dot: a body with a cut front and
+/// a windscreen, turned to the way it heads (`heading`: degrees clockwise from north), a dark
+/// edge round it. `min_px` keeps it readable from far away; the line number is drawn beside it.
+fn vehicle_icon(p: &mut Painter, at: Vec3, heading: f64, color: Color, long: bool, min_px: f32) {
+    let h = heading.to_radians() as f32;
+    let (sn, cs) = h.sin_cos();
+    // local: x to the right, y forward; turned onto the world (x east, y north)
+    let turn = |v: Vec2| Vec2::new(v.x * cs + v.y * sn, -v.x * sn + v.y * cs);
+    let l = if long { 1.5 } else { 1.0 };
+    let body = |k: f32| -> Vec<Vec2> {
+        [(-0.34, -1.0), (0.34, -1.0), (0.34, 0.55), (0.2, 1.0), (-0.2, 1.0), (-0.34, 0.55)].iter().map(|&(x, y)| turn(Vec2::new(x * k, y * l * k))).collect()
+    };
+    let (m, px) = (6.0, min_px);
+    p.world_shape(at, &body(1.28), m, px * 1.28, Color::rgba(8, 8, 8, 0.92));
+    p.world_shape(at, &body(1.0), m, px, color);
+    let glass: Vec<Vec2> = [(-0.24, 0.5), (0.24, 0.5), (0.15, 0.8), (-0.15, 0.8)].iter().map(|&(x, y)| turn(Vec2::new(x, y * l))).collect();
+    p.world_shape(at, &glass, m, px, Color::rgba(240, 244, 248, 0.9));
+}
+
 /// The route by how busy its roads are: empty, light, busy, heavy, jammed.
 const LEVEL: [Color; 5] = [
     Color::rgba(46, 116, 240, 1.0),
@@ -149,9 +170,21 @@ pub struct NavStop {
     pub arrival: f64,
 }
 
+/// Another player of the session as the maps show them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NavPlayer {
+    /// Where they are: their bus, or on foot where they walk (riding in someone's bus: that bus).
+    pub position: DVec3,
+    /// Compass heading (degrees, 0 = +y, clockwise).
+    pub heading: f64,
+    pub name: String,
+}
+
 /// What the navigator is told each frame.
 pub struct NavFrame<'a> {
     pub traffic: Option<&'a Traffic>,
+    /// The other players of a LAN session or server, on both maps (#1011, #1080).
+    pub players: Vec<NavPlayer>,
     pub bus: DVec3,
     /// Compass heading (degrees, 0 = +y, clockwise).
     pub heading: f64,
@@ -181,6 +214,9 @@ pub struct NavFrame<'a> {
     /// is held to 480 px, as before.
     pub follow_window: bool,
     pub dt: f32,
+    /// Where the information bar is (`ui::Ui::info_rect`): a navigator along the top keeps
+    /// below it.
+    pub info_rect: Option<[f32; 4]>,
 }
 
 /// The texts, per language.
@@ -939,21 +975,7 @@ impl Navigator {
         let sched = if self.schedule { (f.stops.len().clamp(1, 5) as f32 * 22.0 + 12.0) * s } else { 0.0 };
         let ph = (map_h + bars + sched).round();
         let (w, h) = (pw as u32, ph as u32);
-        let margin = (sh * 0.018).max(10.0).round();
-        // (with the on-screen controls the corners are theirs: the top middle)
-        let touch = crate::platform::touch_controls();
-        let right = self.corner.contains("right");
-        let top = self.corner.contains("top") || touch;
-        // ("top-center": a phone's, between its on-screen buttons)
-        let x0 = if self.corner.contains("center") || touch { ((sw - pw) * 0.5).round() } else if right { sw - margin - pw } else { margin };
-        let y0 = if top { margin } else { sh - margin - ph };
-        // (dragged by the mouse somewhere else: there, kept inside the window)
-        let room = [(sw - pw).max(0.0), (sh - ph).max(0.0)];
-        self.panel_room = room;
-        let (x0, y0) = match self.at.filter(|_| !touch) {
-            Some(a) => ((a[0].clamp(0.0, 1.0) * room[0]).round(), (a[1].clamp(0.0, 1.0) * room[1]).round()),
-            None => (x0, y0),
-        };
+        let (x0, y0) = self.panel_origin((sw, sh), (pw, ph), crate::platform::touch_controls(), f.info_rect);
 
         if self.gpu.is_none() {
             self.gpu = Some(Gpu::new(&renderer.device, renderer.format(), map_samples(renderer.format()), self.atlas.size));
@@ -1084,9 +1106,12 @@ impl Navigator {
                     continue;
                 }
                 let (color, line) = traffic_kind(c);
-                let k = if color == DOT { 1.0 } else { 1.35 };
-                dy.world_disc(rel(c.vehicle.position), 1.7 * k, 3.6 * k, Color::rgba(8, 8, 8, 0.9));
-                dy.world_disc(rel(c.vehicle.position), 1.2 * k, 2.6 * k, color);
+                if color == DOT {
+                    dy.world_disc(rel(c.vehicle.position), 1.7, 3.6, Color::rgba(8, 8, 8, 0.9));
+                    dy.world_disc(rel(c.vehicle.position), 1.2, 2.6, color);
+                } else {
+                    vehicle_icon(&mut dy, rel(c.vehicle.position), c.vehicle.heading, color, c.is_rail(), 7.0);
+                }
                 if let Some(l) = line {
                     lines.push((c.vehicle.position, color, l));
                 }
@@ -1146,6 +1171,23 @@ impl Navigator {
         // none on top of another)
         lines.sort_by(|a, b| (a.0 - f.bus).length().total_cmp(&(b.0 - f.bus).length()));
         let mut taken: Vec<Rect> = Vec::new();
+        // the other players: an arrow each, their name above it (before the lines' tags)
+        for pl in &f.players {
+            let Some(p) = project(vpm, vp, rel(pl.position)).filter(|p| map.contains(*p)) else { continue };
+            let a = (angle_diff(self.cam_heading, pl.heading) as f32).to_radians();
+            arrow(&mut ui, p, a, 7.5 * s, 1.25, Color::rgba(10, 10, 10, 0.8), PLAYER);
+            let px = 9.5 * s;
+            let name = self.fonts.fit(&pl.name, px, Weight::Bold, 90.0 * s);
+            let w = self.fonts.width(&name, px, Weight::Bold) + 8.0 * s;
+            let r = Rect::new(p.x - w * 0.5, p.y - 23.0 * s, w, 13.0 * s);
+            if taken.iter().any(|o| rects_overlap(o, &r)) {
+                continue;
+            }
+            taken.push(r);
+            ui.rounded(Rect::new(r.x - 1.0 * s, r.y - 1.0 * s, r.w + 2.0 * s, r.h + 2.0 * s), 4.0 * s, Color::rgba(10, 10, 10, 0.9));
+            ui.rounded(r, 3.5 * s, PLAYER);
+            ui.text_in(&mut self.atlas, &self.fonts, &name, px, Weight::Bold, r, Align::Center, LINE_TEXT);
+        }
         for (pos, color, l) in &lines {
             let Some(p) = project(vpm, vp, rel(*pos)).filter(|p| map.contains(*p)) else { continue };
             let px = 9.5 * s;
@@ -1163,18 +1205,7 @@ impl Navigator {
         // the bus: a plain white arrow
         if let Some(bp) = project(vpm, vp, rel(f.bus)) {
             let a = (angle_diff(self.cam_heading, f.heading) as f32).to_radians();
-            let rot = |v: Vec2| Vec2::new(v.x * a.cos() - v.y * a.sin(), v.x * a.sin() + v.y * a.cos());
-            let k = 9.0 * s;
-            let tip = bp + rot(Vec2::new(0.0, -1.0) * k);
-            let l = bp + rot(Vec2::new(-0.7, 0.8) * k);
-            let m = bp + rot(Vec2::new(0.0, 0.4) * k);
-            let r = bp + rot(Vec2::new(0.7, 0.8) * k);
-            let dark = Color::rgba(10, 10, 10, 0.8);
-            let grow = |p: Vec2| bp + (p - bp) * 1.25;
-            ui.tri(grow(tip), grow(l), grow(m), dark, dark, dark);
-            ui.tri(grow(tip), grow(m), grow(r), dark, dark, dark);
-            ui.tri(tip, l, m, TEXT, TEXT, TEXT);
-            ui.tri(tip, m, r, TEXT, TEXT, TEXT);
+            arrow(&mut ui, bp, a, 9.0 * s, 1.25, Color::rgba(10, 10, 10, 0.8), TEXT);
         }
 
         // top bar: speed (and the limit) · line ……… game time
@@ -1367,7 +1398,7 @@ fn congestion_on(net: &Network, traffic: &Network, c: &HashMap<usize, f32>) -> H
 
 impl<'a> NavFrame<'a> {
     fn clone_ref(&self) -> NavFrame<'a> {
-        NavFrame { traffic: self.traffic, bus: self.bus, heading: self.heading, speed_kmh: self.speed_kmh, outside_temp: self.outside_temp, inside_temp: self.inside_temp, line: self.line.clone(), terminus: self.terminus.clone(), stops: self.stops.clone(), delay: self.delay, passengers: self.passengers, time: self.time, weekday: self.weekday, language: self.language, screen: self.screen, ui_scale: self.ui_scale, follow_window: self.follow_window, dt: self.dt, stop_requested: self.stop_requested }
+        NavFrame { traffic: self.traffic, players: self.players.clone(), bus: self.bus, heading: self.heading, speed_kmh: self.speed_kmh, outside_temp: self.outside_temp, inside_temp: self.inside_temp, line: self.line.clone(), terminus: self.terminus.clone(), stops: self.stops.clone(), delay: self.delay, passengers: self.passengers, time: self.time, weekday: self.weekday, language: self.language, screen: self.screen, ui_scale: self.ui_scale, follow_window: self.follow_window, dt: self.dt, stop_requested: self.stop_requested, info_rect: self.info_rect }
     }
 }
 
@@ -1530,6 +1561,21 @@ fn road_geometry(net: &Network) -> Vec<MapRoad> {
         }
     }
     roads
+}
+
+/// An arrow at `at` pointing `angle` (radians, clockwise from up on the screen), `k` px from
+/// its middle to its tip, on a dark outline `grow` times its size: the bus and the players.
+fn arrow(ui: &mut Painter, at: Vec2, angle: f32, k: f32, grow: f32, dark: Color, fill: Color) {
+    let rot = |v: Vec2| Vec2::new(v.x * angle.cos() - v.y * angle.sin(), v.x * angle.sin() + v.y * angle.cos());
+    let tip = at + rot(Vec2::new(0.0, -1.0) * k);
+    let l = at + rot(Vec2::new(-0.7, 0.8) * k);
+    let m = at + rot(Vec2::new(0.0, 0.4) * k);
+    let r = at + rot(Vec2::new(0.7, 0.8) * k);
+    let g = |p: Vec2| at + (p - at) * grow;
+    ui.tri(g(tip), g(l), g(m), dark, dark, dark);
+    ui.tri(g(tip), g(m), g(r), dark, dark, dark);
+    ui.tri(tip, l, m, fill, fill, fill);
+    ui.tri(tip, m, r, fill, fill, fill);
 }
 
 fn rects_overlap(a: &Rect, b: &Rect) -> bool {
@@ -2185,6 +2231,35 @@ impl Navigator {
         self.enabled && x >= r[0] && y >= r[1] && x < r[2] && y < r[3]
     }
 
+    /// Where the small navigator (`size`) goes on a screen of `screen`: its corner, the top
+    /// middle with the on-screen controls (`touch`), below the information bar (`info`) where
+    /// they would lie over each other - unless it was dragged somewhere, which it keeps
+    /// (kept inside the window), by the mouse or a finger.
+    fn panel_origin(&mut self, screen: (f32, f32), size: (f32, f32), touch: bool, info: Option<[f32; 4]>) -> (f32, f32) {
+        let ((sw, sh), (pw, ph)) = (screen, size);
+        let margin = (sh * 0.018).max(10.0).round();
+        // (with the on-screen controls the corners are theirs: the top middle)
+        let right = self.corner.contains("right");
+        let top = self.corner.contains("top") || touch;
+        // ("top-center": a phone's, between its on-screen buttons)
+        let x0 = if self.corner.contains("center") || touch { ((sw - pw) * 0.5).round() } else if right { sw - margin - pw } else { margin };
+        let y0 = if top { margin } else { sh - margin - ph };
+        // (below the information bar where they would lie over each other: in its rows on a
+        // phone it took the navigator's place in the top middle, #1164)
+        let y0 = match info {
+            Some(i) if top && x0 < i[2] && x0 + pw > i[0] => y0.max((i[3] + margin * 0.5).round()),
+            _ => y0,
+        };
+        // (dragged somewhere else: there - on a phone too, where it had to stay in the
+        // middle it covered, #1138)
+        let room = [(sw - pw).max(0.0), (sh - ph).max(0.0)];
+        self.panel_room = room;
+        match self.at {
+            Some(a) => ((a[0].clamp(0.0, 1.0) * room[0]).round(), (a[1].clamp(0.0, 1.0) * room[1]).round()),
+            None => (x0, y0),
+        }
+    }
+
     /// The mouse button went down on the small navigator: a click opens the city map, a
     /// drag moves the navigator (see [`Navigator::panel_move`]).
     pub fn panel_press(&mut self, x: f32, y: f32) {
@@ -2403,9 +2478,12 @@ impl Navigator {
         if let Some(t) = f.traffic.filter(|_| self.show_ai) {
             for car in t.cars.iter().filter(|c| !c.gone) {
                 let (color, line) = traffic_kind(car);
-                let k = if color == DOT { 1.0 } else { 1.4 };
-                dots.world_disc(rel(car.vehicle.position), 2.2 * k, 3.4 * k, Color::rgba(8, 8, 8, 0.9));
-                dots.world_disc(rel(car.vehicle.position), 1.5 * k, 2.3 * k, color);
+                if color == DOT {
+                    dots.world_disc(rel(car.vehicle.position), 2.2, 3.4, Color::rgba(8, 8, 8, 0.9));
+                    dots.world_disc(rel(car.vehicle.position), 1.5, 2.3, color);
+                } else {
+                    vehicle_icon(&mut dots, rel(car.vehicle.position), car.vehicle.heading, color, car.is_rail(), 7.5);
+                }
                 if let Some(l) = line {
                     lines.push((car.vehicle.position, color, l));
                 }
@@ -2499,22 +2577,26 @@ impl Navigator {
             ui.rounded(r, 4.0 * s, Color::rgba(12, 12, 12, 0.85));
             ui.text_in(&mut self.atlas, &self.fonts, &name, 12.5 * s, if k == 0 { Weight::Bold } else { Weight::Medium }, r.pad(6.0 * s, 0.0), Align::Left, if k == 0 { TEXT } else { TEXT_DIM });
         }
-        {
-            let bp = to_screen(f.bus);
-            let a = (f.heading as f32).to_radians();
-            let rot = |v: Vec2| Vec2::new(v.x * a.cos() - v.y * a.sin(), v.x * a.sin() + v.y * a.cos());
-            let k = 10.0 * s;
-            let tip = bp + rot(Vec2::new(0.0, -1.0) * k);
-            let l = bp + rot(Vec2::new(-0.7, 0.8) * k);
-            let m = bp + rot(Vec2::new(0.0, 0.4) * k);
-            let r = bp + rot(Vec2::new(0.7, 0.8) * k);
-            let dark = Color::rgba(10, 10, 10, 0.9);
-            let grow = |p: Vec2| bp + (p - bp) * 1.3;
-            ui.tri(grow(tip), grow(l), grow(m), dark, dark, dark);
-            ui.tri(grow(tip), grow(m), grow(r), dark, dark, dark);
-            ui.tri(tip, l, m, TEXT, TEXT, TEXT);
-            ui.tri(tip, m, r, TEXT, TEXT, TEXT);
+        // the other players: an arrow the way they face and their name (as on the small map)
+        for pl in &f.players {
+            let p = to_screen(pl.position);
+            if !win.contains(p) || p.y < 44.0 * s {
+                continue;
+            }
+            arrow(&mut ui, p, (pl.heading as f32).to_radians(), 8.5 * s, 1.3, Color::rgba(10, 10, 10, 0.9), PLAYER);
+            let px = 11.0 * s;
+            let name = self.fonts.fit(&pl.name, px, Weight::Bold, 140.0 * s);
+            let tw = self.fonts.width(&name, px, Weight::Bold) + 9.0 * s;
+            let r = Rect::new(p.x - tw * 0.5, p.y - 27.0 * s, tw, 15.0 * s);
+            if taken.iter().any(|o| rects_overlap(o, &r)) {
+                continue;
+            }
+            taken.push(r);
+            ui.rounded(Rect::new(r.x - 1.0 * s, r.y - 1.0 * s, r.w + 2.0 * s, r.h + 2.0 * s), 4.5 * s, Color::rgba(10, 10, 10, 0.9));
+            ui.rounded(r, 4.0 * s, PLAYER);
+            ui.text_in(&mut self.atlas, &self.fonts, &name, px, Weight::Bold, r, Align::Center, LINE_TEXT);
         }
+        arrow(&mut ui, to_screen(f.bus), (f.heading as f32).to_radians(), 10.0 * s, 1.3, Color::rgba(10, 10, 10, 0.9), TEXT);
         // header: the line and where it goes, the next stop; buttons on the right
         // (opaque: the route and the stops showed through behind its text)
         let head = Rect::new(0.0, 0.0, w, 44.0 * s);
@@ -2627,6 +2709,29 @@ mod tests {
         n.panel_move(5000.0, -5000.0);
         assert_eq!(n.at, Some([1.0, 0.0]));
         assert_eq!(placed_at("bottom-right"), None);
+    }
+
+    /// With the on-screen controls the navigator stands in the top middle, under the
+    /// information bar when that is on - and where a finger dragged it, once it has been
+    /// (#1138), as the mouse places it on a computer; the bar does not move a navigator in a
+    /// corner it does not reach (#1164).
+    #[test]
+    fn the_navigator_keeps_where_it_was_dragged_on_a_phone_and_clear_of_the_information_bar() {
+        let mut n = Navigator::new(true, 0.85, "bottom-left");
+        let (screen, size) = ((1280.0, 720.0), (300.0, 250.0));
+        assert_eq!(n.panel_origin(screen, size, true, None), (490.0, 13.0));
+        assert_eq!(n.panel_origin(screen, size, true, Some([311.0, 20.0, 898.0, 69.0])), (490.0, 76.0));
+        assert_eq!(n.panel_origin(screen, size, false, Some([311.0, 20.0, 898.0, 69.0])), (13.0, 457.0));
+        n.corner = "top-left".into();
+        assert_eq!(n.panel_origin(screen, size, false, Some([330.0, 20.0, 950.0, 69.0])), (13.0, 13.0));
+        assert_eq!(n.panel_origin(screen, size, false, Some([300.0, 20.0, 980.0, 69.0])), (13.0, 76.0));
+        // a finger's drag: there, on the phone as on the computer
+        n.panel_rect = [490.0, 13.0, 790.0, 263.0];
+        n.panel_press(600.0, 100.0);
+        assert!(n.panel_move(600.0 - 490.0, 100.0 + 457.0));
+        assert_eq!(n.panel_release(), Some(true));
+        assert_eq!(n.panel_origin(screen, size, true, None), (0.0, 470.0));
+        assert_eq!(n.panel_origin(screen, size, false, None), (0.0, 470.0));
     }
 
     use super::*;
@@ -2816,5 +2921,17 @@ mod tests {
         let edge = stop_label_rect(Vec2::new(590.0, 200.0), 150.0, 1.0, win, &[]).unwrap();
         assert!(edge.right() < 600.0);
         assert!(stop_label_rect(p, 150.0, 1.0, win, &[win]).is_none());
+    }
+
+    #[test]
+    fn a_vehicle_icon_is_whole_triangles_of_edge_body_and_windscreen() {
+        let mut bus = Painter::new();
+        vehicle_icon(&mut bus, Vec3::ZERO, 90.0, Color::WHITE, false, 7.0);
+        // an edge and a body of six corners (four triangles each), a windscreen of four (two)
+        assert_eq!(bus.verts.len(), (4 + 4 + 2) * 3);
+        // a tram is longer, not made of more
+        let mut tram = Painter::new();
+        vehicle_icon(&mut tram, Vec3::ZERO, 0.0, Color::WHITE, true, 7.0);
+        assert_eq!(tram.verts.len(), bus.verts.len());
     }
 }

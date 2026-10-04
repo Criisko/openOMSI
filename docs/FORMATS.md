@@ -422,6 +422,32 @@ useTextTexture alphascale matl_freetex matl_lightmap matl_nightmap matl_allcolor
 particle_emitter PS_attachTo; material manager: matl_alpha matl_noZwrite matl_noZcheck matl_Zbias
 matl_envmap matl_envmaprealtime matl_bumpmap matl_envmap_mask matl_transmap.
 
+**`[smoke]` particles (Omsi.exe, established Oct 2026).** Nineteen lines: position (3),
+direction (3), speed and its spread, frequency (a second), lifetime (s), brake factor,
+gravity, start size, growth (a second), initial alpha, a line Omsi.exe skips, red, green,
+blue; numbers or variable names (TRauch, read at 0x5f5e58; the final alpha stays 0, so a puff
+fades out over its life). Every frame (0x5a238c) a particle's velocity is multiplied by the
+brake factor raised to 20 x dt - 0x5a145c keeps 20 ln(max(brake, 0.1)) per emitter, so the
+factor is per twentieth of a second at any frame rate - its level speed is drawn towards the
+weather's wind (0x753428) by what that takes off (not yet in openOMSI, where it slows to a
+standstill), and 9.81 x gravity x dt is taken off its vertical speed (a negative gravity
+lifts it). Size and alpha go linearly with its age (0x5a183c).
+Nothing stops it at the ground: it falls on through the road until its life is over (the
+stock buses' and cars' wheel spray has gravity 1 and is under the road within a fifth of a
+second). It is drawn (0x5a47d4 -> 0x5a2b5c builds the quads per camera, 0x5a4180 draws them
+from the scene pass 0x6f1520 after the scenery and before the camera's own vehicle) as a
+square facing the screen, reaching `size / view depth` from its centre in projection space
+and turned by its own random angle (0x5a1d54), its depth moved 0.1 m towards the eye; with
+fog and lighting off, `ALPHABLENDENABLE` on, `ZWRITEENABLE` off but the depth test on,
+`SRCALPHA`/`INVSRCALPHA`, the colour the vertex colour alone (`COLOROP SELECTARG2`: the
+particle's colour lit by the weather's light and the one lamp of 0x858efc on the CPU, white
+for `--PS_emissive--`) and the alpha rauch.tga's times the vertex's (a `[particle_emitter]`
+whose `--PS_bitmap--` is not marked as alpha: `ONE`/`INVSRCCOLOR`, texture times vertex
+colour). So the road cuts every
+puff that sinks into it off in a straight line; openOMSI fades a puff out over the lowest
+6-25 cm above the ground it was set off over instead (the plane its vehicle's wheels stand on,
+an object's own z = 0), and leaves out one wholly under it (`omsi_render::SmokeParticle`).
+
 **Object visibility (OMSI 0x5fdc7c, established Sept 2026).** OMSI decides per *object*
 (scenery object, vehicle), never per mesh, with the model's radius R, `[detail_factor]` D
 (default 1; parsed into the model at +0xa8) and `[noDistanceCheck]` (+0xad, a flag of the whole
@@ -490,7 +516,10 @@ Animations of one mesh compose in file order, the first one innermost.
 `[matl_envmap] tex factor`: reflectivity = diffuse alpha × factor, the factor saturating at 1
 like a D3D texture factor (SD202 bodies write `10`, their paint alpha is 0.12-0.19 → a
 gloss, not a mirror; windows have alpha 0.5 with factor 1). The sphere map has the sky at
-the bottom.
+the bottom. It is read as Direct3D's `D3DTSS_TCI_SPHEREMAP` reads it, at the vertex, from the
+reflection R in camera space (x right, y up, z ahead): u = Rx/m + 0.5, v = Ry/m + 0.5 with
+m = 2|R - (0, 0, 1)|. The map's middle is what a face turned to the camera mirrors, and its
+rim the reflection running on away from the camera.
 
 ### Mirrors, shadows, parked cars, cabin paths, announcements
 
@@ -498,6 +527,8 @@ the bottom.
   .bus: rear-view mirror cameras (yaw clockwise from forward: 201 = back, turned towards
   the bus flank). Camera N draws into the texture named `reflexionN.bmp` on the model's
   mirror mesh; the mesh UVs are already mirrored, so the camera image is used as is.
+  `[add_camera_reflexion_static]` (openOMSI, see MODDING.md) is a camera that looks along
+  its own yaw and pitch; a rear section's cameras are numbered on after the front's.
 * `[isshadow]` mesh (`D_schatten.o3d` with `Shadow.tga`, alpha blend, no z check/write):
   the vehicle's shadow blob lying at model z = 0; OMSI draws it on the ground under the
   vehicle. Scenery objects use it the same way. A vehicle's z = 0 is the plane its tyres
@@ -525,8 +556,13 @@ the bottom.
   listening to that trigger plays it. `$msg` shows the top string without popping it.
 
 * global.cfg `[addseason] kind start_day end_day` (day of year): 1 spring, 2 autumn, 3 winter,
-  4 winter with snow; the season's textures live in `texture\spring|fall|Winter|WinterSnow\`
-  subfolders next to the normal textures (same file names) and take precedence.
+  4 winter with snow, 5 dry summer; the season's textures live in
+  `texture\Spring|Fall|Winter|WinterSnow|SummerDry\` subfolders next to the normal textures
+  (same file names) and take precedence. A texture without a winter picture takes its autumn
+  one. A weather with `[snow]` takes the `WinterSnow` pictures whatever the season, and with
+  `[snowOnRoad]` as well the `WinterSnowfall` ones before them (the stock roads keep their
+  snowy asphalt there); a texture with no snow picture takes its winter one, else its autumn
+  one (Omsi.exe 0x7f910c).
   `[trafficdensity_road]` / `[trafficdensity_passenger] hour factor` lines form a curve
   over the day that scales AI traffic and waiting passengers.
 * Scenery `.sco` `[sound] sound\x.cfg` uses the vehicle sound.cfg format, driven by the
@@ -537,6 +573,13 @@ the bottom.
   It covers the tile **and its eight neighbours**: the tile itself is the middle third
   (texels 85⅓..170⅔ each way). Neighbouring light maps are the same picture shifted by a
   third - 85 texels between two tiles, 171 between every other one, on all stock maps.
+  A tile with `[variable_terrainlightmap]` (296 of Spandau's 329) has its light map baked
+  from the `[maplight]`s of the objects of the nine tiles when they are loaded (Omsi.exe
+  writes it over the file, unless options.cfg has `[no_generateTerrLightMaps]`), so the file
+  is only what the last OMSI run left: openOMSI bakes it the same way. A texel, on the ground
+  at its south-west corner, takes each lamp's colour × min(1, (radius / distance)²), the
+  distance from the lamp's own height over its object, added up, held at 1 and truncated;
+  a lamp more than 15.96 radii away along x or y adds nothing.
 * Spline profiles (`[profilepnt] x z u v`) are extruded as-is: a road's outer points sit at
   the kerb height (0.25 m on the Marcel street splines) with no skirt down to the terrain,
   so the roadway is a slab standing on the ground. The terrain is only cut away under
@@ -573,7 +616,8 @@ the bottom.
   180° were `.x` meshes read with transposed frames); text is centred and squeezed to fit.
   A `[texttexture]` whose variable is one of the object's script string variables (the stock
   stop departure displays) is drawn from the script whenever it calls `Refresh_Strings`.
-  `[helparrow]` objects (route arrows) are editor helpers and not drawn.
+  `[helparrow]` objects (route arrows a map's author puts up) are drawn only while OMSI 2's
+  route arrows are on (`nav_arrows`, the game menu's "Route arrows"), as in Omsi.exe.
 * `[matl_envmap]`: the reflectivity mask is the diffuse alpha; textures without an alpha
   channel (DXT1 paint schemes such as the GN92 HVL livery) do not reflect at all.
 
@@ -589,7 +633,9 @@ registration_free kmcounter_init + model/script/sound/paths/passengercabin.
 Built-in vehicle variables are listed in `program/varlist_roadvehicle.txt`; generated per axle:
 `Wheel_Rotation_ Wheel_RotationSpeed_ Axle_Steering_ Axle_Suspension_ Axle_Springfactor_
 Axle_Brakeforce_ Axle_SurfaceID_` × `{n}_{L|R}`, `PAX_Entry{n}_Open/_Req`, `PAX_Exit{n}_…`,
-`Debug_0..5`. Callbacks: `program/callbacklist_*.txt`.
+`Debug_0..5`; `PAX_Entry8..15` and `PAX_Exit8..15` besides Omsi.exe's eight, and
+`PAX_Entry{n}_Busy` / `PAX_Exit{n}_Busy` (somebody in that doorway; see MODDING.md).
+Callbacks: `program/callbacklist_*.txt`.
 
 Passenger cabin: entry ({noticketsale} {withbutton}) exit linkToNextVeh linkToPrevVeh stamper
 ticket_sale ticket_sale_money_point(_2) ticket_sale_change_point(_2) passpos drivpos
@@ -742,14 +788,17 @@ Regional = https://example.org/regional.mp3 | 97.9
 * `envir.cfg`: `[sky_textures]` day/twilight/night, `[twilight_start_end]` sun altitudes,
   `[lightcolor_A/B/C]` = 5 RGB stops (nadir, twilight start, sunrise, twilight end, zenith)
   for direct sun, light from above and ambient.
-* `[light_enh]` (mesh): pos, rgb 0-255, size (m), fading variable (name or constant), 4
-  numbers, optional texture. `[light_enh_2]`: pos, dir, up, omni, rotating, rgb, size, cone
+* `[light_enh]` (mesh): pos, rgb 0-255, size (m), fading variable (name or constant),
+  brightness factor, z offset, effect bits, fade time, optional texture - Omsi.exe reads it
+  into the same lamp as a `[light_enh_2]` (omnidirectional, turned to the viewer) and draws
+  it alike. `[light_enh_2]`: pos, dir, up, omni, rotating, rgb, size, cone
   inner/outer, variable, factor, z-offset, parameters, cone, timeconst, bitmap. The lights
   count whatever detail level their mesh belongs to: 40 stock models (the Spandau neon,
   sodium and gas street lamps, the Sv signals, the ICE and RE160 coaches) declare theirs
   after the far `[LOD] 0` mesh, and no stock model repeats a light in two levels.
 * `[spotlight]` (vehicle): pos, dir, rgb, range, inner, outer; the active one is chosen by the
-  `Spot_Select` variable (negative = none). `[interiorlight] variable range r g b x y z`.
+  `Spot_Select` variable (negative = none). `[spotlight_2]` (openOMSI, see MODDING.md): the same twelve
+  numbers, a switching variable and a no-mirror flag; any number lit at once. `[interiorlight] variable range r g b x y z`.
 * `[maplight] x y z r g b radius` (scenery): point light at night, full within `radius`,
   inverse-square beyond, out of range at six times it. The colour is the brightness: a petrol
   station's red sign declares 0.1 red over a 20 m core and is meant to glow by its pumps, not
@@ -780,6 +829,12 @@ weights it never shipped and lost its line number). `TextLength(font, "text")` =
 channels with alpha 0 (the Krüger matrix draws `STSetColor(0, 0, 255, 0, 0)`), the LED
 textures in alpha only (`[matl_transmap] \S:n`, one texture per LED colour).
 Glyph pixels of an .oft `[char] c x0 x1 y` sit in columns x0..x1 (x1 exclusive as drawn).
+In colour mode a glyph pixel takes the colour bitmap's pixel at the same row and column as
+its alpha pixel (0x5d67bc), whatever size the colour bitmap has: often a small swatch of one
+colour (stock `EFADfont.bmp`, 128×128 under a 128×200 alpha). For a row past the colour
+bitmap's height Omsi.exe's `TBitmap.ScanLine` raises a range error (0x4763b0) and the text
+stops being drawn there; a column past its width reads into the neighbouring scanline's
+bytes. openOMSI repeats the colour bitmap in both cases instead.
 `NrSpecRandom(seed)` = stable pseudo random in [0, 1).
 
 Depot (.hof) callbacks: `GetRouteIndex(code)` (code = line×100 + route → `[infosystem_trip]`
@@ -821,7 +876,12 @@ they follow the joint's dummy meshes; the modelled pose is the straight one.
 The passenger cabins of the sections are joined by `[linkToNextVeh]` / `[linkToPrevVeh]`
 path points: the rear section's seats and exits are numbered after the front's, which is
 how the stock door scripts count them, and a person walking from one section to the other
-crosses the joint on those links.
+crosses the joint on those links. Omsi.exe joins two coupled cabins only where both give
+these points. openOMSI also crosses a bus joint whose cabins give none, between the ends of
+the two aisles, but not a trailer on a lorry's hitch (`[coupling_front_character]` type 0):
+without the points that is a cabin of its own in openOMSI, and passengers whose place is in
+it get in and out by its own `[entry]` and `[exit]` doors (a place there is not offered when
+the trailer has no entry or no exit).
 
 ## Humans (.hum)
 
@@ -846,8 +906,11 @@ texture of man02 and the women's hair carry `[matl_alpha] 1` (alpha test).
 The `[passengercabin]` file gives `[passpos] x y z seat-height rot` seats - x, y, z is the
 **hip** ("Attachpunkt Arsch") when the seat height above the floor is greater than zero and
 the **foot** when it is zero, which marks a standing place - plus `[entry]`/`[exit]`
-path points, `[ticket_sale]`, `[stamper]`. `[entry]` may carry `{noticketsale}`: passengers
-who use that door walk straight to a seat instead of past the cash desk.
+path points, `[ticket_sale]`, `[stamper]`. In openOMSI a `[passpos]` may go on with one or
+two script variable names on the lines straight after its five values (see MODDING.md). `[entry]` may carry `{noticketsale}`: passengers
+who use that door walk straight to a seat instead of past the cash desk. It and `{withbutton}`
+are lines of their own that mark the entry read last, wherever they stand between the blocks
+(the stock cabins write a blank line before them), as Omsi.exe reads them.
 
 The entries and exits are numbered in file order, and that number is how the engine and the
 bus script talk about the doors. The engine writes `PAX_Entry<i>_Req` while somebody at the

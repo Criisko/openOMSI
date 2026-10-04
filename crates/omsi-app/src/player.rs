@@ -32,12 +32,68 @@ pub(crate) fn steering_view_yaw(current: f32, steering: f32, dt: f32, enabled: b
     current + (target - current) * (1.0 - (-dt.max(0.0) / response.clamp(0.05, 1.0)).exp())
 }
 
+pub(crate) fn driver_head_look(look: (f32, f32), view: &str, pitch_deg: f32) -> (f32, f32) {
+    if view == "driver" {
+        (look.0, look.1 + pitch_deg)
+    } else {
+        look
+    }
+}
+
+#[cfg(test)]
+mod driver_head_look_tests {
+    use super::driver_head_look;
+
+    #[test]
+    fn head_pitch_adjusts_driver_view_in_any_display_mode_only() {
+        assert_eq!(driver_head_look((4.0, 2.0), "driver", 10.0), (4.0, 12.0));
+        assert_eq!(driver_head_look((4.0, 2.0), "pax", 10.0), (4.0, 2.0));
+        assert_eq!(driver_head_look((4.0, 2.0), "outside", 10.0), (4.0, 2.0));
+    }
+}
+
 fn is_manual_gate_action(name: &str) -> bool {
     let Some(gate) = name.get(..5).filter(|p| p.eq_ignore_ascii_case("kw_s_")).and_then(|_| name.get(5..)) else {
         return false;
     };
     let gate = gate.strip_suffix("_fest").unwrap_or(gate);
     gate.eq_ignore_ascii_case("r") || gate.eq_ignore_ascii_case("n") || gate.parse::<u32>().is_ok()
+}
+
+/// The vehicle actions of the keys held whose `Inputs/keyboard.cfg` entry has the "held"
+/// flag ([`omsi_content::input::KEY_HOLD`], the key list's " *"), by scan code: Omsi.exe
+/// (0x6466b8) gives the vehicle their action again every frame the key stays down, not
+/// only when it goes down. The stock roller blind turns while Page Up / Page Down are held
+/// (`bus_rollband_up`, `_dn`: its line or destination moves by the frame's time on each
+/// call); fired once, it moved by a frame's worth and no more (#1098, #1145).
+#[derive(Default)]
+pub(crate) struct HeldRepeat(hashbrown::HashMap<i32, (Vec<String>, bool)>);
+
+impl HeldRepeat {
+    /// The key went down with these actions (its press fires them itself).
+    fn press(&mut self, scan: i32, names: Vec<String>) {
+        if names.is_empty() {
+            self.0.remove(&scan);
+        } else {
+            self.0.insert(scan, (names, true));
+        }
+    }
+
+    fn release(&mut self, scan: i32) {
+        self.0.remove(&scan);
+    }
+
+    /// The actions to fire again this frame: those of every key still held, but not of one
+    /// that went down since the last frame - its press was this frame's call.
+    fn due(&mut self) -> Vec<String> {
+        let mut due = Vec::new();
+        for (names, fresh) in self.0.values_mut() {
+            if !std::mem::take(fresh) {
+                due.extend(names.iter().cloned());
+            }
+        }
+        due
+    }
 }
 
 /// Everything about the spawned player vehicle.
@@ -97,6 +153,8 @@ pub(crate) struct Player {
     /// whatever modifier is held by then (L pressed, Ctrl held, L let go: the release went
     /// to Ctrl+L and the L action stayed held).
     pub(crate) held_keys: hashbrown::HashMap<i32, Vec<String>>,
+    /// The held ones of them that are told every frame (see [`HeldRepeat`]).
+    pub(crate) held_repeat: HeldRepeat,
     /// Where the driver's head is thrown by the bus's accelerations (vehicle frame, m):
     /// OMSI's `[driverview_moving]`.
     pub(crate) head: Vec3,
@@ -138,6 +196,9 @@ pub(crate) struct Player {
     /// The duty's trip to type into the IBIS once the auto-start has the electrics on:
     /// (line, terminus, the trip's stops, the stop the bus is at: its index and name).
     pub(crate) ibis_duty: Option<(String, String, Vec<String>, (usize, String))>,
+    /// A destination picked by hand for the bus's roller blind, kept until the electrics are
+    /// on and the auto-start is done (`schedule::turn_roller_blind`).
+    pub(crate) blind_pick: Option<schedule::BlindPick>,
     /// The IBIS being typed, with the line and terminus it is typed for.
     pub(crate) ibis_typist: Option<(omsi_sim::ibis::Typist, String, String, Vec<String>)>,
     /// The duty is typed into the IBIS by itself (after Shift+U or `--autostart`): a new
@@ -966,8 +1027,17 @@ impl Player {
                 .map(|b| b.action.clone())
                 .collect();
             self.held_keys.insert(scan, n.clone());
+            let repeat = self
+                .bindings
+                .iter()
+                .filter(|b| b.scan_code == scan && b.matches(modifiers) && b.modifier & omsi_content::input::KEY_HOLD != 0)
+                .filter(|b| omsi_sim::engine_action(&b.action).is_none())
+                .map(|b| b.action.clone())
+                .collect();
+            self.held_repeat.press(scan, repeat);
             n
         } else {
+            self.held_repeat.release(scan);
             match self.held_keys.remove(&scan) {
                 Some(n) => n,
                 None => self
@@ -1026,6 +1096,7 @@ impl Player {
     pub(crate) fn tick_startup(&mut self, dt: f32) -> bool {
         self.apply_html_requests();
         self.tick_ibis(dt);
+        schedule::turn_roller_blind(&mut self.vehicle, &mut self.blind_pick, self.startup.is_some());
         let Some(mut s) = self.startup.take() else {
             return false;
         };
@@ -1160,6 +1231,8 @@ impl Player {
         if let Some((mut old, ..)) = self.ibis_typist.take() {
             old.abandon(&mut self.vehicle);
         }
+        // (the trip's destination, not one picked by hand before)
+        self.blind_pick = None;
         let hof = self.vehicle.host.hof.clone();
         // the keys a driver reaches: the cockpit's clickable switches and the keyboard's
         let mut keys: hashbrown::HashSet<String> = self
@@ -1276,9 +1349,20 @@ impl Player {
                     if let Some((mut old, ..)) = self.ibis_typist.take() {
                         old.abandon(&mut self.vehicle);
                     }
-                    schedule::set_player_destination_directly(&mut self.vehicle, Some(&hof), &line, &wanted, &[]);
+                    self.set_destination_by_hand(&hof, &line, ti);
                 }
             }
+        }
+    }
+
+    /// Row `ti` of the depot file on the destination display, set by hand (the destination
+    /// list, a bus page): on the IBIS now, on a roller blind once it can be turned
+    /// (`schedule::turn_roller_blind`).
+    pub(crate) fn set_destination_by_hand(&mut self, hof: &omsi_vehicle::hof::Hof, line: &str, ti: usize) {
+        self.blind_pick = schedule::set_player_destination_at(&mut self.vehicle, hof, line, ti, &[]);
+        schedule::turn_roller_blind(&mut self.vehicle, &mut self.blind_pick, self.startup.is_some());
+        if let Some(p) = &self.blind_pick {
+            log::info!("roller blind: destination {} kept until the bus is switched on", p.row);
         }
     }
 
@@ -1466,6 +1550,12 @@ impl Player {
     pub(crate) fn tick(&mut self, dt: f32, audio: Option<&omsi_audio::AudioEngine>, inside: bool, listener_follows_bus: bool) {
         self.tick_startup(dt);
         self.tick_auto_drag(dt);
+        // (the script's trigger only, as Omsi.exe calls it: no alias, no log line a frame)
+        for name in self.held_repeat.due() {
+            if self.vehicle.ty.program.trigger(&name).is_some() {
+                self.vehicle.trigger(&name);
+            }
+        }
         self.axes.speed_kmh = self.vehicle.physics.velocity_kmh();
         self.axes.lock_curvature = self.vehicle.ty.def.inv_min_turn_radius;
         self.axes.update(dt);
@@ -2013,7 +2103,8 @@ impl Player {
     /// (the same as `camera_look` makes of the driver's camera).
     pub(crate) fn driver_world(&self, turned: &omsi_vehicle::Camera) -> Camera {
         let (eye, yaw, pitch, roll) = self.vehicle.camera_world_full(turned);
-        let eye = eye + self.vehicle.body_rotation().transform_vector3(self.head_offset() + self.seat).as_dvec3();
+        // the driver's eye sits a touch forward of the authored seat point.
+        let eye = eye + self.vehicle.body_rotation().transform_vector3(self.head_offset() + self.seat + EYE_NUDGE).as_dvec3();
         Camera { position: eye, yaw, pitch: pitch.clamp(-89.0, 89.0), roll, fov_deg: turned.fov, near: 0.1, far: 6000.0 }
     }
 
@@ -2048,7 +2139,7 @@ impl Player {
     ) -> Camera {
         let def = &self.vehicle.ty.def;
         let c = def.camera_outside_center;
-        let centre = orbit_pivot(self.vehicle.position, self.vehicle.heading, c);
+        let centre = camera_arm::lift_pivot(world, orbit_pivot(self.vehicle.position, self.vehicle.heading, c));
         let want = dist.clamp(ORBIT_MIN, ORBIT_MAX);
         let back = -cam.forward().as_dvec3().normalize_or_zero();
         if back.length_squared() < 0.5 {
@@ -2167,7 +2258,7 @@ impl Player {
                 // cab rocked about it - the "boat" (the body's own motion matches Omsi's).
                 let turned = omsi_vehicle::Camera { yaw: c.yaw + look.0 + if view == "driver" { self.steer_look } else { 0.0 }, pitch: (c.pitch + look.1).clamp(-89.0, 89.0), ..c.clone() };
                 let (eye, yaw, pitch, roll) = self.vehicle.camera_world_full(&turned);
-                let eye = if view == "driver" { eye + self.vehicle.body_rotation().transform_vector3(self.head_offset() + self.seat).as_dvec3() } else { eye };
+                let eye = if view == "driver" { eye + self.vehicle.body_rotation().transform_vector3(self.head_offset() + self.seat + EYE_NUDGE).as_dvec3() } else { eye };
                 // near 0.1 as in Omsi.exe (every view, 0x6f6aa7); with the reversed float
                 // depth buffer it costs no precision out at 6 km
                 Camera {
@@ -2210,6 +2301,11 @@ pub(crate) fn orbit_pivot(position: DVec3, heading_deg: f64, center: [f32; 3]) -
             .transform_point3(Vec3::new(center[0], center[1], center[2]))
             .as_dvec3()
 }
+
+/// The driver's eye sits a touch forward of the authored seat point (bus frame:
+/// x right, y forward, z up): without it, turning the head shows the inside
+/// of the driver's seat mesh (stock and mod buses alike; OMSI 2 never shows it).
+pub(crate) const EYE_NUDGE: Vec3 = Vec3::new(0.0, 0.12, 0.0);
 
 /// Put a vehicle's meshes where its state says (animations, visibility, lights, the
 /// matrix textures) - the player's bus, and the launcher's showroom bus.
@@ -2471,6 +2567,21 @@ pub(crate) fn mouse_steering(cursor_x: f32, width: f32, kmh: f32) -> f32 {
     x / (kmh / 10.0).max(1.0)
 }
 
+/// How much of the way to the cursor the mouse's wheel and pedals leave behind this frame:
+/// for `fade` seconds after the mouse steering was switched on they ease towards it (half
+/// the way every `fade`), then within ~60 ms - the cursor comes in bursts, and taken as it
+/// came the wheel moved in steps. Without `smooth` (#1092) they are where the cursor says at
+/// once, as Omsi.exe sets the curvature and the pedals from it every frame.
+pub(crate) fn mouse_follow(fade: f32, dt: f32, smooth: bool) -> f32 {
+    if fade > 0.0 {
+        (-std::f32::consts::LN_2 / fade * dt).exp()
+    } else if smooth {
+        (-dt / 0.06).exp()
+    } else {
+        0.0
+    }
+}
+
 /// A mouse pedal following the cursor, `k` of the way left behind each frame. The last bit
 /// is snapped: in f32 the easing stops one step short of the target (1 - 6e-8 at 60 fps), and
 /// the stock gearbox scripts kick down only at a throttle of exactly 1 - the cursor at the top
@@ -2518,7 +2629,25 @@ mod orbit_pivot_tests {
 
 #[cfg(test)]
 mod mouse_tests {
-    use super::{mouse_pedal, mouse_steering};
+    use super::{mouse_follow, mouse_pedal, mouse_steering};
+
+    /// The mouse's wheel eases after the cursor by default; with the smoothing off it is where
+    /// the cursor says the same frame, as in OMSI (#1092) - only the first second after
+    /// switching the mouse steering on still eases, whichever it is.
+    #[test]
+    fn the_wheel_follows_the_cursor_at_once_without_smoothing() {
+        let dt = 1.0 / 60.0;
+        let k = mouse_follow(0.0, dt, true);
+        assert!(k > 0.7 && k < 0.8, "{k}");
+        assert_eq!(mouse_follow(0.0, dt, false), 0.0);
+        assert_eq!(mouse_pedal(0.3, 0.9, mouse_follow(0.0, dt, false)), 0.9);
+        let steer = 0.9 + (0.3 - 0.9) * mouse_follow(0.0, dt, false);
+        assert_eq!(steer, 0.9);
+        for smooth in [true, false] {
+            let k = mouse_follow(1.0, dt, smooth);
+            assert!((k - 0.5f32.powf(dt)).abs() < 1e-6, "{smooth}: {k}");
+        }
+    }
 
     #[test]
     fn the_mouse_pedal_reaches_the_floor() {
@@ -2619,6 +2748,29 @@ mod indicator_tests {
         assert_eq!(state, 3);
         assert_eq!(indicator_toggle_action(&mut state, Some(3), 3), "blinker_warn_toggle");
         assert_eq!(state, 0);
+    }
+}
+
+#[cfg(test)]
+mod held_repeat_tests {
+    use super::HeldRepeat;
+
+    /// Page Up held three frames turns the roller blind on each of them: once by the press,
+    /// twice from the list; let go, no more (#1098, #1145).
+    #[test]
+    fn a_held_key_is_told_every_frame_after_its_press_until_let_go() {
+        let mut r = HeldRepeat::default();
+        assert!(r.due().is_empty());
+        r.press(201, vec!["bus_rollband_up".into()]);
+        assert!(r.due().is_empty(), "the press itself was this frame's call");
+        assert_eq!(r.due(), vec!["bus_rollband_up".to_string()]);
+        assert_eq!(r.due(), vec!["bus_rollband_up".to_string()]);
+        r.release(201);
+        assert!(r.due().is_empty());
+        // a key without a held action is none of it
+        r.press(63, Vec::new());
+        r.due();
+        assert!(r.due().is_empty());
     }
 }
 

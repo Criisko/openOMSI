@@ -54,6 +54,53 @@ Normal, roughness, metalness and occlusion maps beside a texture, up to 4096 × 
 - Each 25 m square of the world draws up to 32 point and spot lights at once (the nearest
   first), so depots, stations and lit interiors keep their lamps.
 - Interior lamps of vehicles are drawn per pixel, with no count limit per vehicle.
+- `[spotlight_2]` in the `model.cfg` is a spotlight of its own: low beam, main beam, fog
+  lamps or a lamp over a door can light the road at the same time, each switched by its
+  variable, beside the one `[spotlight]` that `Spot_Select` picks. It takes the twelve
+  numbers of a `[spotlight]` (position, direction, red, green, blue, range, inner and
+  outer cone angle), then the variable (0 off, 1 full, in between dimmed; a number is a
+  constant) and a flag:
+
+  ```
+  [spotlight_2]
+  0.95
+  5.95
+  0.652
+  0
+  1
+  -0.3
+  255
+  255
+  233
+  200
+  30
+  80
+  lights_fern
+  0
+  ```
+
+  With the flag 0 (or left out) the lamp is where it says and a twin of it stands on the
+  other side of the vehicle, mirrored across its axis (x and the x of the direction turned
+  round): put the position on one headlamp. With 1 there is just the one lamp, for a
+  light over a door or a cornering lamp. A pair is as bright as a `[spotlight]` of the same
+  colour, shared between its two lamps. The position is used as written: unlike a
+  `[spotlight]`'s, it is not moved onto the vehicle's front. A rear section's model may have
+  its own; their variables are the bus's.
+
+## Screens: static cameras
+
+`[add_camera_reflexion_static]` in the `.bus` adds a camera for a screen - a CCTV monitor
+of the doors, a reversing camera - to the mirrors. It takes the numbers of an
+`[add_camera_reflexion]` (x, y, z, distance, field of view, yaw, pitch) and counts with the
+mirrors: camera N draws into the texture `reflexionN.bmp`. Unlike a mirror's, its picture
+does not move with the driver's head: it looks along its yaw (degrees clockwise from the
+vehicle's forward) and pitch (up), as a driver camera does. Its picture is what it sees,
+not a mirror image, so map the screen's texture the right way round.
+
+The reflection cameras of an articulated bus's rear sections count on from those of the
+section in front: with mirrors 0 to 3 in the front section's `.bus`, a camera in the rear
+section's `.bus` is number 4, and a screen in the cab showing `reflexion4.bmp` shows what
+that camera sees from the rear section.
 
 ## Models
 
@@ -61,6 +108,57 @@ Normal, roughness, metalness and occlusion maps beside a texture, up to 4096 × 
   and face count; everything is drawn with 32-bit indices.
 - There is no limit on the number of meshes, materials, `[matl_change]` items, `[CTC]`
   entries, cameras, doors, passenger places, wheels or axles.
+
+## Passenger doors: sixteen entries and sixteen exits
+
+OMSI 2 has the door variables of eight `[entry]` and eight `[exit]` paths a vehicle
+(`PAX_Entry0_Open` to `PAX_Entry7_Open`, the same with `_Req` and for `PAX_Exit`). openOMSI
+has them for sixteen of each: `PAX_Entry8_Open` ... `PAX_Entry15_Open`, `PAX_Entry8_Req` ...
+and the same for the exits. An entry or exit past the eighth is a door of its own once the
+script sets its `_Open` variable (or lists it in a varlist); then its passengers wait for that
+variable and ask for the door through its own `_Req`. Without it, it opens with the eighth, as
+in OMSI 2. Its passengers' requests then go through the eighth's `_Req` in openOMSI, while
+OMSI 2 loses them (its request arrays have eight slots).
+
+openOMSI also tells the script who stands in a doorway: `PAX_Entry<n>_Busy` and
+`PAX_Exit<n>_Busy` (n 0 to 15) are 1 while somebody is on the door's threshold or in the
+opening between it and the step outside - what a door's light barrier sees - and 0 otherwise;
+the people queueing outside a shut door, in the aisle or on the deck above do not count. A
+door script can keep a door open or open it again while its `_Busy` is set. Like the `_Req`,
+they are written before the scripts run every frame and cleared after them; a door past the
+eighth without variables of its own reports through the eighth's. OMSI 2 does not have them.
+
+## Passenger places switched by the script
+
+OMSI 2's `[passpos]` places are all there all the time. In openOMSI a `[passpos]` may name a
+script variable on the line straight after its five values: while that variable is 0 no
+passenger takes the place (whoever sits there already stays until they get off), so a bus
+can have two seating layouts and switch between them with a setvar. A second name on the
+line after that is a variable the engine sets to 1 while somebody is on the place and to 0
+while nobody is - a tip-up seat can fold down for the person on it - without the seat
+numbers `GetHumanCountOnSeat` needs:
+
+```
+[passpos]
+0.94
+0.04
+0.92
+0.43
+0
+layout_transverse
+seat_12_taken
+```
+
+Both are ordinary variables of the bus's varlists. A place without the lines, or with a
+name the scripts do not have, is always there; a blank line or the next block ends the
+list, and OMSI 2 passes over the lines.
+
+## Ticket validators: one by every door
+
+OMSI 2 uses one `[stamper]` of a `passengercabin.cfg`, the last one written. openOMSI keeps
+every `[stamper]` of every section, and a passenger with a ticket to stamp uses the one
+nearest the door they came in by. Write one `[stamper]` block per validator (path point,
+then x, y, z of the device, as usual); OMSI 2 still takes the last of them.
 
 ## Scripts and plugins
 
@@ -113,7 +211,8 @@ place in its first line and the station and song in its second.
 The following behave as in OMSI 2 so that existing content works unchanged:
 
 - the script stack (8 values) and registers (`l0`-`l9`, `s0`-`s9`);
-- one `[spotlight]` lit at a time per vehicle (the one `Spot_Select` picks);
+- one `[spotlight]` lit at a time per vehicle (the one `Spot_Select` picks; `[spotlight_2]`,
+  above, adds more);
 - 100 particles per emitter.
 
 In a LAN session, other players see up to 7 doors, 15 wheels and 127 lamps of a vehicle.

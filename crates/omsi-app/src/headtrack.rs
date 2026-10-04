@@ -9,11 +9,22 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The last pose received: x, y, z (cm; right, up, back) and yaw, pitch, roll (degrees).
+/// The last pose received, in opentrack's terms: x, y, z (cm; left, up, back) and yaw, pitch,
+/// roll (degrees; yaw to the right, pitch up). (opentrack's own outputs to simulators that
+/// count x to the right, FlightGear's and SimConnect's, send them `-x`.)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeadPose {
     pub pos: [f32; 3],
     pub rot: [f32; 3],
+}
+
+impl HeadPose {
+    /// How far the head moved the eye, in the bus's frame (m; right, forward, up). Omsi.exe
+    /// (0x829860) moves its camera across by `-x` of the TrackIR pose, which opentrack fills
+    /// with its own x: a head moved to the right took the camera to the left (#1157).
+    pub fn seat_offset(&self) -> glam::Vec3 {
+        glam::Vec3::new(-self.pos[0], -self.pos[2], self.pos[1]).clamp(glam::Vec3::splat(-60.0), glam::Vec3::splat(60.0)) / 100.0
+    }
 }
 
 pub struct HeadTracker {
@@ -192,5 +203,16 @@ mod tests {
         let p = freetrack_pose(-0.5f32.to_radians() * 60.0, 10f32.to_radians(), 5f32.to_radians(), 15.0, -20.0, 100.0);
         assert!((p.rot[0] - 30.0).abs() < 1e-3 && (p.rot[1] + 10.0).abs() < 1e-3 && (p.rot[2] - 5.0).abs() < 1e-3);
         assert_eq!(p.pos, [1.5, -2.0, 10.0]);
+    }
+
+    /// The head 10 cm to the right (opentrack's x -10), 5 cm up and 20 cm back: the eye goes
+    /// right, up and back with it (#1157).
+    #[test]
+    fn the_eye_follows_the_head_across() {
+        let p = HeadPose { pos: [-10.0, 5.0, 20.0], rot: [0.0; 3] };
+        let o = p.seat_offset();
+        assert!((o.x - 0.1).abs() < 1e-6 && (o.y + 0.2).abs() < 1e-6 && (o.z - 0.05).abs() < 1e-6, "{o}");
+        // (held within 60 cm)
+        assert!((HeadPose { pos: [-200.0, 0.0, 0.0], rot: [0.0; 3] }.seat_offset().x - 0.6).abs() < 1e-6);
     }
 }

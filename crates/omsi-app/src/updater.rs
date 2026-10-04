@@ -20,6 +20,17 @@
 //!   (`OmsiActivity.installApk`, a PackageInstaller session). The system asks the player;
 //!   Cancel comes back as an error here, Update replaces the app and starts it again.
 //!
+//! The network is not taken for granted: every request is tried again after a pause when it
+//! fails (a timeout, a dropped connection, a 5xx), a download that breaks off goes on where it
+//! stopped (an HTTP range) instead of starting over, and when the GitHub API does not answer
+//! - or answers 403 because the address has used its 60 requests an hour - the check asks
+//! github.com itself which release is the latest (`releases/latest` redirects to its tag) and
+//! takes the file by its name, as `release.yml` names it.
+//!
+//! The game looks for an update too, in the background (`crate::update_watch`): it downloads it
+//! during the session (`Updater::prefetch`) and says so over the navigator; the launcher then
+//! installs the file already downloaded when the session ends.
+//!
 //! `OMSI_UPDATE_URL=<url or file:///…json>` points the check at another release description
 //! (for testing: a file in the GitHub API's format whose asset URLs may be `file://` too),
 //! `OMSI_NO_UPDATE=1` switches the check off. A development build (run from a cargo `target`
@@ -63,6 +74,9 @@ pub enum Status {
     UpToDate,
     Available(Release),
     Downloading { release: Release, done: u64, total: u64 },
+    /// Downloaded and checked, not installed (`Updater::prefetch`, the game's background
+    /// download): `install` puts this file in place without fetching it again.
+    Downloaded(Release),
     Installing(Release),
     /// Android: the system's installer has the APK and asks the player.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -85,11 +99,18 @@ pub struct Updater {
     pub relaunched: bool,
     /// This start follows an update to this version (shown for a few seconds).
     pub updated: Option<(String, std::time::Instant)>,
+    /// The last look for an update (the launcher looks again every half hour).
+    pub last_check: Option<std::time::Instant>,
+    /// The version the player put aside with "Not now": offered again only when a newer one
+    /// comes, or when a session ends.
+    pub dismissed_version: Option<String>,
+    /// A game ran last frame (the launcher installs once it has ended).
+    pub game_was_running: bool,
 }
 
 impl Default for Updater {
     fn default() -> Self {
-        Updater { status: Arc::new(Mutex::new(Status::Idle)), dismissed: false, checked_once: false, auto_started: false, relaunched: false, updated: None }
+        Updater { status: Arc::new(Mutex::new(Status::Idle)), dismissed: false, checked_once: false, auto_started: false, relaunched: false, updated: None, last_check: None, dismissed_version: None, game_was_running: false }
     }
 }
 
@@ -109,7 +130,8 @@ impl Updater {
     /// Ask GitHub for the latest release (in the background).
     pub fn check(&mut self) {
         self.checked_once = true;
-        if matches!(self.status(), Status::Checking | Status::Downloading { .. } | Status::Installing(_) | Status::WaitingForInstaller(_) | Status::Restarting(_)) {
+        self.last_check = Some(std::time::Instant::now());
+        if matches!(self.status(), Status::Checking | Status::Downloading { .. } | Status::Downloaded(_) | Status::Installing(_) | Status::WaitingForInstaller(_) | Status::Restarting(_)) {
             return;
         }
         self.dismissed = false;
@@ -135,13 +157,36 @@ impl Updater {
             return;
         }
         self.dismissed = false;
-        self.set(Status::Downloading { release: r.clone(), done: 0, total: r.size });
+        self.set(if downloaded(&r) { Status::Installing(r.clone()) } else { Status::Downloading { release: r.clone(), done: 0, total: r.size } });
         let status = self.status.clone();
         std::thread::spawn(move || {
             let result = download_and_install(&r, &status);
             if let Err(e) = result {
                 log::warn!("update to {}: {e:#}", r.version);
                 *lock(&status) = Status::Failed(format!("openOMSI was not updated to {}: {e}", r.version));
+            }
+        });
+    }
+
+    /// Download `r` without installing it (in the background, the game's way): the file
+    /// waits in the data folder, checked, until `install` puts it in place.
+    pub fn prefetch(&mut self, r: Release) {
+        if matches!(self.status(), Status::Downloading { .. } | Status::Downloaded(_) | Status::Installing(_) | Status::WaitingForInstaller(_) | Status::Restarting(_)) {
+            return;
+        }
+        self.set(Status::Downloading { release: r.clone(), done: 0, total: r.size });
+        let status = self.status.clone();
+        std::thread::spawn(move || {
+            let file = download_dir().join(&r.asset_name);
+            match download(&r, &file, &status) {
+                Ok(()) => {
+                    log::info!("update {}: downloaded in the background ({})", r.version, file.display());
+                    *lock(&status) = Status::Downloaded(r);
+                }
+                Err(e) => {
+                    log::warn!("update {}: background download: {e:#}", r.version);
+                    *lock(&status) = Status::Failed(format!("openOMSI {} could not be downloaded: {e}", r.version));
+                }
             }
         });
     }
@@ -164,6 +209,9 @@ impl Updater {
     /// Forget a failure or an offer (the dialog's "Close" / "Not now").
     pub fn dismiss(&mut self) {
         self.dismissed = true;
+        if let Status::Available(r) | Status::Downloaded(r) = self.status() {
+            self.dismissed_version = Some(r.version);
+        }
         if matches!(self.status(), Status::Failed(_) | Status::UpToDate) {
             self.set(Status::Idle);
         }
@@ -221,11 +269,46 @@ pub fn asset_name(version: &str) -> Option<String> {
 // --- the release ----------------------------------------------------------------------------
 
 fn agent() -> ureq::Agent {
+    // (a read waits 30 s at most - a stalled download goes on with a range request, so a
+    // short wait costs nothing; the connection gets 20 s, enough for a slow line or a
+    // resolver that tries IPv6 first)
     ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(15))
-        .timeout_read(std::time::Duration::from_secs(60))
+        .timeout_connect(std::time::Duration::from_secs(20))
+        .timeout_read(std::time::Duration::from_secs(30))
         .user_agent(&format!("openOMSI/{} (updater)", current_version()))
         .build()
+}
+
+/// How often a request is tried before it counts as failed, and the pauses between.
+const TRIES: [u64; 3] = [0, 3, 10];
+
+/// Whether a failed request is worth another try: the network (a timeout, a dropped or
+/// refused connection, a name not resolved for now) or the server's own trouble (429, 5xx).
+fn transient(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Status(code, _) => *code == 429 || *code >= 500,
+        ureq::Error::Transport(_) => true,
+    }
+}
+
+/// `f` until it works, at most `TRIES` times with the pauses between (only for failures
+/// that may pass, see `transient`).
+fn with_retries<T>(what: &str, mut f: impl FnMut() -> Result<T, ureq::Error>) -> Result<T, ureq::Error> {
+    let mut last = None;
+    for (k, pause) in TRIES.iter().enumerate() {
+        if *pause > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(*pause));
+        }
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if transient(&e) && k + 1 < TRIES.len() => {
+                log::info!("update: {what}: {} - trying again", short_error(&e));
+                last = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("at least one try"))
 }
 
 /// A URL's body: `file://` read from the disk (tests), anything else over HTTP(S).
@@ -233,22 +316,61 @@ fn fetch_text(url: &str) -> anyhow::Result<String> {
     if let Some(p) = url.strip_prefix("file://") {
         return Ok(std::fs::read_to_string(p)?);
     }
-    let r = agent().get(url).set("Accept", "application/vnd.github+json").call().map_err(|e| anyhow::anyhow!("{}", short_error(&e)))?;
+    let r = with_retries("asking GitHub", || agent().get(url).set("Accept", "application/vnd.github+json").call()).map_err(|e| anyhow::anyhow!("{}", short_error(&e)))?;
     Ok(r.into_string()?)
 }
 
 fn short_error(e: &ureq::Error) -> String {
     match e {
+        ureq::Error::Status(403 | 429, _) => "GitHub refused for now (too many requests from this address); it is tried again later".to_string(),
         ureq::Error::Status(code, _) => format!("the server answered {code}"),
-        ureq::Error::Transport(t) => format!("no connection ({})", t.kind()),
+        ureq::Error::Transport(t) => match t.kind() {
+            ureq::ErrorKind::Dns => "the name github.com could not be looked up (no internet?)".to_string(),
+            ureq::ErrorKind::ConnectionFailed => "no connection to GitHub (a firewall or a proxy?)".to_string(),
+            ureq::ErrorKind::Io => format!("the connection to GitHub broke off or timed out ({})", t.message().unwrap_or("no answer")),
+            k => format!("no connection ({k})"),
+        },
     }
 }
 
 /// The latest release when it is newer than this build and has a file for this platform.
 pub fn latest() -> anyhow::Result<Option<Release>> {
     let url = omsi_cfg::env::var("OMSI_UPDATE_URL").unwrap_or_else(|_| LATEST_API.to_string());
-    let v: serde_json::Value = serde_json::from_str(&fetch_text(&url)?)?;
-    parse_release(&v, current_version())
+    match fetch_text(&url).and_then(|t| Ok(serde_json::from_str::<serde_json::Value>(&t)?)) {
+        Ok(v) => parse_release(&v, current_version()),
+        // (the API: an address over its limit gets 403 for an hour, and some networks reach
+        // github.com but not api.github.com - github.com says the latest tag as well)
+        Err(e) if url == LATEST_API => {
+            log::info!("update check: the GitHub API: {e:#} - asking github.com");
+            latest_from_site().map_err(|e2| anyhow::anyhow!("{e} (and github.com: {e2})"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The latest release as github.com's `releases/latest` redirect names it, with this
+/// platform's file at the address `release.yml` publishes it (no SHA-256: GitHub's TLS is
+/// all that vouches for it then, and the size is checked by the download itself).
+fn latest_from_site() -> anyhow::Result<Option<Release>> {
+    let page = format!("{REPO_URL}/releases/latest");
+    let r = with_retries("asking github.com", || agent().head(&page).call()).map_err(|e| anyhow::anyhow!("{}", short_error(&e)))?;
+    let tag = r.get_url().rsplit('/').next().unwrap_or("").to_string();
+    if !tag.starts_with(['v', 'V']) {
+        anyhow::bail!("github.com named no release ({})", r.get_url());
+    }
+    let version = tag.trim_start_matches(['v', 'V']).to_string();
+    if is_test_build(current_version()) || !newer(&version, current_version()) {
+        return Ok(None);
+    }
+    let Some(name) = asset_name(&version) else { return Ok(None) };
+    let url = format!("{REPO_URL}/releases/download/{tag}/{name}");
+    // (the files come a few minutes after the tag: not there yet, nothing to offer yet)
+    let size = match with_retries("looking for the file", || agent().head(&url).call()) {
+        Ok(r) => r.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0),
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(e) => anyhow::bail!("{}", short_error(&e)),
+    };
+    Ok(Some(Release { version, page: format!("{REPO_URL}/releases/tag/{tag}"), notes: String::new(), asset_name: name, asset_url: url, size, sha256: None }))
 }
 
 /// A release described as the GitHub API does, when newer than `current`.
@@ -287,32 +409,111 @@ fn download_dir() -> PathBuf {
     d
 }
 
-/// Download the release file to `to`, with the progress in `status`, and check it.
+/// The note beside a downloaded release file that says it is whole and checked (its size
+/// and SHA-256), so that `install` can take it without fetching it again.
+fn checked_note(file: &Path) -> PathBuf {
+    file.with_extension("checked")
+}
+
+/// Whether `r`'s file waits downloaded and checked in the data folder. A file fetched
+/// without a SHA-256 to check it by (by github.com's way, see `latest_from_site`) is hashed
+/// now when `r` brings one.
+pub fn downloaded(r: &Release) -> bool {
+    use sha2::Digest;
+    let file = download_dir().join(&r.asset_name);
+    let note = std::fs::read_to_string(checked_note(&file)).unwrap_or_default();
+    let len = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    let Some((n, sha)) = note.trim().split_once(' ') else { return false };
+    if len == 0 || n.parse::<u64>().ok() != Some(len) || (r.size > 0 && r.size != len) {
+        return false;
+    }
+    match (r.sha256.as_deref(), sha) {
+        (None, _) => true,
+        (Some(want), got) if got == want => true,
+        (Some(want), "-") => {
+            let Ok(mut f) = std::fs::File::open(&file) else { return false };
+            let mut h = sha2::Sha256::new();
+            if std::io::copy(&mut f, &mut h).is_err() {
+                return false;
+            }
+            let got: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+            got == want
+        }
+        _ => false,
+    }
+}
+
+/// Download the release file to `to`, with the progress in `status`, and check it. A break
+/// in the middle (a timeout, a dropped connection) goes on from where it stopped, a few
+/// times, before the download counts as failed.
 fn download(r: &Release, to: &Path, status: &Mutex<Status>) -> anyhow::Result<()> {
     use sha2::Digest;
+    if downloaded(r) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(checked_note(to));
     let part = to.with_extension("part");
     let mut hasher = sha2::Sha256::new();
     let mut out = std::fs::File::create(&part)?;
-    let (mut reader, total): (Box<dyn Read>, u64) = if let Some(p) = r.asset_url.strip_prefix("file://") {
-        let f = std::fs::File::open(p)?;
-        let n = f.metadata()?.len();
-        (Box::new(f), n)
-    } else {
-        let resp = agent().get(&r.asset_url).set("Accept", "application/octet-stream").call().map_err(|e| anyhow::anyhow!("{}", short_error(&e)))?;
-        let n = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(r.size);
-        (Box::new(resp.into_reader()), n)
-    };
     let mut buf = vec![0u8; 256 * 1024];
     let mut done = 0u64;
+    let mut total = r.size;
+    // (a break costs a try; one that brought data in between gives the tries back)
+    let mut breaks = 0;
     loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+        let mut reader: Box<dyn Read> = if let Some(p) = r.asset_url.strip_prefix("file://") {
+            let f = std::fs::File::open(p)?;
+            total = f.metadata()?.len();
+            Box::new(f)
+        } else {
+            let from = done;
+            let resp = with_retries("downloading", || {
+                let req = agent().get(&r.asset_url).set("Accept", "application/octet-stream");
+                if from > 0 { req.set("Range", &format!("bytes={from}-")).call() } else { req.call() }
+            })
+            .map_err(|e| anyhow::anyhow!("{}", short_error(&e)))?;
+            if done > 0 && resp.status() != 206 {
+                // (the server sends the whole file again: start over)
+                log::info!("update {}: the server does not continue a download; starting over", r.version);
+                hasher = sha2::Sha256::new();
+                out = std::fs::File::create(&part)?;
+                done = 0;
+            }
+            if done == 0 {
+                total = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(r.size);
+            }
+            Box::new(resp.into_reader())
+        };
+        let before = done;
+        let broke = loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break None,
+                Ok(n) => {
+                    out.write_all(&buf[..n])?;
+                    hasher.update(&buf[..n]);
+                    done += n as u64;
+                    *lock(status) = Status::Downloading { release: r.clone(), done, total: total.max(done) };
+                }
+                Err(e) => break Some(e),
+            }
+        };
+        match broke {
+            None if total == 0 || done >= total => break,
+            // (ended early: the connection was cut without an error)
+            None => {}
+            Some(e) => log::info!("update {}: the download broke off at {} of {} bytes ({e}) - going on", r.version, done, total),
         }
-        out.write_all(&buf[..n])?;
-        hasher.update(&buf[..n]);
-        done += n as u64;
-        *lock(status) = Status::Downloading { release: r.clone(), done, total: total.max(done) };
+        if done > before {
+            breaks = 0;
+        }
+        breaks += 1;
+        if breaks > 4 {
+            anyhow::bail!("the download kept breaking off at {} of {} bytes - the connection to GitHub is too unsteady; it is tried again later", done, total);
+        }
+        if r.asset_url.starts_with("file://") {
+            anyhow::bail!("the file ended at {} of {} bytes", done, total);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
     out.flush()?;
     drop(out);
@@ -327,6 +528,7 @@ fn download(r: &Release, to: &Path, status: &Mutex<Status>) -> anyhow::Result<()
         }
     }
     std::fs::rename(&part, to)?;
+    let _ = std::fs::write(checked_note(to), format!("{} {}", done, r.sha256.as_deref().unwrap_or("-")));
     Ok(())
 }
 
@@ -358,6 +560,7 @@ fn download_and_install(r: &Release, status: &Mutex<Status>) -> anyhow::Result<(
         install_archive(&file, &place)?;
         let _ = std::fs::write(download_dir().join("updating-to"), &r.version);
         let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(checked_note(&file));
         *lock(status) = Status::Restarting(r.clone());
         Ok(())
     }
@@ -695,6 +898,68 @@ mod tests {
         // a pull request's test build keeps itself, however new the release
         assert!(parse_release(&v, "0.1.7-pr12").unwrap().is_none());
         assert!(is_test_build("0.1.1313-pr1192") && !is_test_build("0.1.1313"));
+    }
+
+    /// A server on this computer that cuts the first answer off half way (as a connection
+    /// that times out does) and then answers range requests: the download goes on where it
+    /// stopped, the file comes out whole and its SHA-256 checks.
+    #[test]
+    fn a_broken_download_goes_on_where_it_stopped() {
+        use sha2::Digest;
+        use std::io::{BufRead, BufReader};
+        let data: Vec<u8> = (0..600_000u32).map(|i| (i * 7 + i / 13) as u8).collect();
+        let sha: String = sha2::Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = data.clone();
+        let ranges = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let seen = ranges.clone();
+        std::thread::spawn(move || {
+            for (n, conn) in listener.incoming().enumerate() {
+                let Ok(mut c) = conn else { continue };
+                let mut from = 0u64;
+                let mut reader = BufReader::new(c.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(r) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        from = r.trim().trim_end_matches('-').parse().unwrap();
+                    }
+                }
+                seen.lock().unwrap().push(from);
+                let rest = &served[from as usize..];
+                let head = if from > 0 {
+                    format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{}/{}\r\nConnection: close\r\n\r\n", rest.len(), served.len() - 1, served.len())
+                } else {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", rest.len())
+                };
+                let _ = c.write_all(head.as_bytes());
+                // (the first answer breaks off at 40 %)
+                let send = if n == 0 { &rest[..rest.len() * 2 / 5] } else { rest };
+                let _ = c.write_all(send);
+            }
+        });
+        let r = Release {
+            version: "9.9.9".into(),
+            page: String::new(),
+            notes: String::new(),
+            asset_name: format!("openOMSI-test-{}.zip", std::process::id()),
+            asset_url: format!("http://127.0.0.1:{port}/file.zip"),
+            size: data.len() as u64,
+            sha256: Some(sha),
+        };
+        let to = std::env::temp_dir().join(&r.asset_name);
+        let _ = std::fs::remove_file(&to);
+        let status = Mutex::new(Status::Idle);
+        download(&r, &to, &status).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), data);
+        let r1 = ranges.lock().unwrap().clone();
+        assert_eq!(r1.len(), 2, "one break, one range request: {r1:?}");
+        assert_eq!(r1[1], (data.len() * 2 / 5) as u64);
+        let _ = std::fs::remove_file(&to);
+        let _ = std::fs::remove_file(checked_note(&to));
     }
 
     #[test]

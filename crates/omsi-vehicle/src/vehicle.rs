@@ -21,6 +21,9 @@ pub struct Camera {
     pub pitch: f32,
     /// `[add_camera_reflexion_2]` extra parameter.
     pub extra: Option<f32>,
+    /// `[add_camera_reflexion_static]` (openOMSI): a camera for a screen (CCTV), not a mirror
+    /// - it looks where its yaw and pitch point, whoever looks at its picture.
+    pub fixed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -148,7 +151,7 @@ fn read_camera(r: &mut omsi_cfg::CfgReader, extra: bool) -> Camera {
     let yaw = r.f32();
     let pitch = r.f32();
     let extra = if extra { Some(r.f32()) } else { None };
-    Camera { pos, dist, fov, yaw, pitch, extra }
+    Camera { pos, dist, fov, yaw, pitch, extra, fixed: false }
 }
 
 pub fn parse_attachment(r: &mut omsi_cfg::CfgReader) -> Attachment {
@@ -334,6 +337,7 @@ impl Vehicle {
                 "add_camera_pax" => v.cameras_pax.push(read_camera(&mut r, false)),
                 "add_camera_reflexion" => v.cameras_reflexion.push(read_camera(&mut r, false)),
                 "add_camera_reflexion_2" => v.cameras_reflexion.push(read_camera(&mut r, true)),
+                "add_camera_reflexion_static" => v.cameras_reflexion.push(Camera { fixed: true, ..read_camera(&mut r, false) }),
                 "view_schedule" => v.view_schedule = Some(v.cameras_driver.len().saturating_sub(1)),
                 "view_ticketselling" => v.view_ticketselling = Some(v.cameras_driver.len().saturating_sub(1)),
                 "set_camera_std" => v.camera_std = r.usize(),
@@ -586,6 +590,19 @@ mod tests {
         assert_eq!((b.long, b.max_width, b.min_width, b.wheel_diameter, b.spring, b.max_force, b.damper, b.driven, b.inertia_inv), (-2.577, 2.4, 1.4, 1.023, 280.0, 116.0, 20.0, true, 0.015));
         assert_eq!(v.mass, 10.9);
         assert_eq!(v.cog, Some([0.0, 0.2, 0.8]));
+    }
+
+    /// `[add_camera_reflexion_static]` is one more reflection camera, numbered with the
+    /// mirrors, that keeps its direction.
+    #[test]
+    fn a_static_reflexion_camera_counts_with_the_mirrors() {
+        let text = "[add_camera_reflexion]\n-1.2\n5.5\n2\n0\n30\n201\n-2\n\n[add_camera_reflexion_static]\n0.9\n-1\n2.6\n0\n70\n90\n-40\n\n[add_camera_reflexion_2]\n1.2\n5.5\n2\n0\n30\n159\n-2\n0.2\n";
+        let v = Vehicle::parse(&CfgFile::from_str("x.bus", text));
+        let c = &v.cameras_reflexion;
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.iter().map(|c| c.fixed).collect::<Vec<_>>(), [false, true, false]);
+        assert_eq!((c[1].pos, c[1].fov, c[1].yaw, c[1].pitch, c[1].extra), ([0.9, -1.0, 2.6], 70.0, 90.0, -40.0, None));
+        assert_eq!(c[2].extra, Some(0.2));
     }
 
     #[test]

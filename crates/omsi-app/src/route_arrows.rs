@@ -64,4 +64,20 @@ impl RouteArrows {
         }
     }
 
+    /// Whether any arrow stands.
+    pub(crate) fn any(&self) -> bool {
+        !self.placed.is_empty()
+    }
+
+    /// Every arrow goes at once: the setting was switched off (`tick` is no longer called
+    /// then, so those standing would stay where they were for good).
+    pub(crate) fn clear(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene) {
+        if omsi_cfg::env::var_os("OMSI_DEBUG_NAV").is_some() {
+            log::info!("route arrows: the {} standing taken away", self.placed.len());
+        }
+        for (_, tg) in self.placed.drain(..) {
+            world.remove_helper_object(renderer, scene, tg);
+        }
+        self.wait = 0.0;
+    }
 }

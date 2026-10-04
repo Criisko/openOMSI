@@ -29,6 +29,13 @@ fn android_main(app: AndroidApp) {
     // openOMSI/crash.log (or Android/data/org.openomsi.game/files/crash.log)
     let crash_files: Vec<PathBuf> = [Some(PathBuf::from(SHARED)), app.external_data_path()].into_iter().flatten().map(|d| d.join("crash.log")).collect();
     std::panic::set_hook(Box::new(move |info| {
+        // (one the renderer catches - a graphics interface it cannot open, the next one is
+        // tried - is no end of the game, as on a computer: logged and written as one, it
+        // was reported as the crash of a game that went on, #1133, #1154, #1162, #1176)
+        if omsi_render::catching() {
+            log::warn!("caught by the renderer: {info}");
+            return;
+        }
         let text = format!("the game stopped on an error (build {BUILD}): {info}\n{}", std::backtrace::Backtrace::force_capture());
         log::error!("{text}");
         for f in &crash_files {
@@ -43,6 +50,16 @@ fn android_main(app: AndroidApp) {
     // the app's own folder is the home of settings.cfg, launcher.json, the profiles
     if let Some(home) = app.internal_data_path() {
         std::env::set_var("HOME", &home);
+        // Adreno 6xx-8xx Vulkan drivers corrupt the shader cache Android keeps in the app's
+        // `code_cache`, and then hand back broken pipelines without an error: a black game
+        // and grey previews (#1310). After a run on such a chip the cache is thrown away and
+        // the shaders are built again; every other chip keeps its cache.
+        if let Some(parent) = home.parent() {
+            let prev = std::fs::read_to_string(home.join("game-prev.log")).unwrap_or_default();
+            if prev.contains("Adreno (TM) 7") || prev.contains("Adreno (TM) 8") || prev.contains("Adreno (TM) 6") {
+                let _ = std::fs::remove_dir_all(parent.join("code_cache"));
+            }
+        }
     }
     init_log();
     // the content folder (mods, archives, screenshots): on the shared storage when the

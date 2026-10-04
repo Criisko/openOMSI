@@ -253,18 +253,28 @@ fn fnv(data: &[u8]) -> u64 {
 fn relative_file(path: &Path, root: &Path) -> String {
     let mut roots = omsi_cfg::content_roots();
     roots.push(root.to_path_buf());
-    for r in roots {
-        if let Ok(rel) = path.strip_prefix(&r) {
-            return rel.to_string_lossy().replace('\\', "/");
-        }
-    }
-    path.to_string_lossy().replace('\\', "/")
+    relative_to_roots(path, &roots).unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"))
+}
+
+/// `path` relative to the root of `roots` it lies in, the deepest one: an OMSI 2 folder
+/// inside the content folder (`openOMSI/OMSI 2`, as a server is often laid out) names its
+/// files `Vehicles/...` as the other games find them, not `OMSI 2/Vehicles/...`, which no
+/// other game has (a Linux server's AI cars were left out on every client, #1097).
+pub(crate) fn relative_to_roots(path: &Path, roots: &[PathBuf]) -> Option<String> {
+    let r = roots.iter().filter(|r| path.starts_with(r)).max_by_key(|r| r.components().count())?;
+    path.strip_prefix(r).ok().map(|rel| rel.to_string_lossy().replace('\\', "/"))
 }
 
 /// A content-relative file from the host as a file here, when it exists here.
 fn local_file(args: &Args, rel: &str) -> Option<PathBuf> {
     let path = omsi_cfg::resolve_path(&args.root, rel);
-    omsi_cfg::vfs::is_file(&path).then_some(path)
+    if omsi_cfg::vfs::is_file(&path) {
+        return Some(path);
+    }
+    // (a host that named it under a folder of its own, "OMSI 2/Vehicles/...": the same
+    // vehicle under any content root here, as a remote player's bus is looked for)
+    let k = rel.to_ascii_lowercase().replace('\\', "/").find("vehicles/")?;
+    omsi_cfg::find_in_roots(&rel.replace('\\', "/")[k..]).map(|(_, p)| p).filter(|p| omsi_cfg::vfs::is_file(p))
 }
 
 fn net_activity(a: Activity) -> NetActivity {
@@ -299,6 +309,18 @@ fn car_display(v: &omsi_sim::VehicleInstance) -> (String, String) {
         .map(|t| t as i32)
         .unwrap_or(-1);
     (line, format!("#{target}"))
+}
+
+/// A host's timetable bus on our copy of it: line `line` and destination `destination`,
+/// the row of the depot file [`car_display`] names (`#<row>`) - that row itself. Looked up
+/// again by the row's sign text, it was the first row with that text anywhere on its sign:
+/// Spandau's buses to U Ruhleben (282) showed Machandelweg (194), whose second line reads
+/// RUHLEBEN.
+fn show_car_destination(v: &mut omsi_sim::VehicleInstance, hof: Option<&omsi_vehicle::Hof>, line: &str, destination: &str) {
+    let row = destination.strip_prefix('#').and_then(|n| n.parse::<usize>().ok());
+    if let (Some(ti), Some(hof)) = (row, hof) {
+        crate::schedule::set_ai_destination_at(v, hof, line, ti, &[]);
+    }
 }
 
 impl LanWorld {
@@ -1222,16 +1244,10 @@ impl LanWorld {
                     .entry(path)
                     .or_insert_with(|| crate::find_hof(args, world, &car.vehicle.ty))
                     .clone();
-                let terminus = destination
-                    .strip_prefix('#')
-                    .and_then(|n| n.parse::<usize>().ok())
-                    .and_then(|ti| hof.as_ref().and_then(|h| h.termini.get(ti)))
-                    .and_then(|t| t.strings.first().cloned())
-                    .unwrap_or_else(|| destination.clone());
                 if let Some(k) = car.vehicle.ty.program.str_var("Linie") {
                     car.vehicle.state.str_vars[k as usize] = line.clone();
                 }
-                crate::schedule::set_ai_destination(&mut car.vehicle, hof.as_deref(), line, &terminus, &[]);
+                show_car_destination(&mut car.vehicle, hof.as_deref(), line, destination);
                 m.shown.insert(id, want);
             }
         }
@@ -1482,7 +1498,36 @@ fn describe(
 
 #[cfg(test)]
 mod tests {
-    use super::PlayClock;
+    use super::{relative_to_roots, PlayClock};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_file_is_named_relative_to_the_deepest_root_holding_it() {
+        // the content folder first, the OMSI 2 folder inside it after (a server's layout)
+        let roots = [PathBuf::from("/srv/openOMSI"), PathBuf::from("/srv/openOMSI/OMSI 2")];
+        let golf = Path::new("/srv/openOMSI/OMSI 2/Vehicles/VW_Golf_2/ai_vw_golf_2.bus");
+        assert_eq!(relative_to_roots(golf, &roots).as_deref(), Some("Vehicles/VW_Golf_2/ai_vw_golf_2.bus"));
+        // a mod in the content folder itself stays relative to that
+        let m = Path::new("/srv/openOMSI/Vehicles/Mod/mod.bus");
+        assert_eq!(relative_to_roots(m, &roots).as_deref(), Some("Vehicles/Mod/mod.bus"));
+        assert_eq!(relative_to_roots(Path::new("/elsewhere/x.bus"), &roots), None);
+    }
+
+    /// The host's bus to U Ruhleben (row 2) shows U Ruhleben on ours too, not Machandelweg
+    /// (row 1), whose sign has RUHLEBEN on its second line.
+    #[test]
+    fn a_hosts_timetable_bus_shows_the_row_it_was_given() {
+        let t = |code: i32, id: &str, s: &[&str]| omsi_vehicle::hof::Terminus { code, texture_id: id.into(), strings: s.iter().map(|x| x.to_string()).collect(), ..Default::default() };
+        let hof = omsi_vehicle::Hof { termini: vec![t(0, "Empty", &[""]), t(194, "Machandelweg", &["MACHANDELWEG", "RUHLEBEN"]), t(282, "U Ruhleben", &["RUHLEBEN", "U-BAHNHOF"])], ..Default::default() };
+        let mut v = crate::schedule::tests::script_test_vehicle("{frame}\n{end}\n", "AI_target_index\nIBIS_TerminusIndex\nIBIS_TerminusCode\n", "SetLineTo\n");
+        super::show_car_destination(&mut v, Some(&hof), "5", "#2");
+        assert_eq!((v.var("AI_target_index"), v.var("IBIS_TerminusCode")), (Some(2.0), Some(282.0)));
+        assert_eq!(v.str_var("SetLineTo"), "5");
+        // no such row, or no depot file: nothing changes
+        super::show_car_destination(&mut v, Some(&hof), "5", "#7");
+        super::show_car_destination(&mut v, None, "5", "#1");
+        assert_eq!(v.var("AI_target_index"), Some(2.0));
+    }
 
     #[test]
     fn the_moment_drawn_follows_a_changed_delay_smoothly() {

@@ -232,7 +232,7 @@ pub fn lut_row(el: f32) -> f32 {
     0.5 + 0.5 * el.signum() * (el.abs() / std::f32::consts::FRAC_PI_2).min(1.0).sqrt()
 }
 
-fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+pub(crate) fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }

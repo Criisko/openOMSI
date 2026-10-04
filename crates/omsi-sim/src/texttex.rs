@@ -158,8 +158,11 @@ impl FontLibrary {
             let alpha_path = omsi_cfg::resolve_path(&fonts_dir, &f.alpha);
             let color_path = omsi_cfg::resolve_path(&fonts_dir, &f.bitmap);
             let (aw, ah, alpha) = decode(&alpha_path)?;
-            let color = if color_path == alpha_path { alpha.clone() } else { decode(&color_path).map(|(_, _, c)| c).unwrap_or_else(|| alpha.clone()) };
-            let color = if color.len() == alpha.len() { color } else { alpha.clone() };
+            let color = match (color_path != alpha_path).then(|| decode(&color_path)).flatten() {
+                Some((cw, ch, c)) if (cw, ch) == (aw, ah) => c,
+                Some((cw, ch, c)) if cw > 0 && ch > 0 && c.len() == (cw * ch * 4) as usize => color_at_alpha_pixels(&c, cw, ch, aw, ah),
+                _ => alpha.clone(),
+            };
             Some(Arc::new(FontAtlas::new(f, aw, ah, color, alpha)))
         });
         if atlas.is_none() && !name.trim().is_empty() {
@@ -168,6 +171,25 @@ impl FontLibrary {
         self.atlases.insert(key, atlas.clone());
         atlas
     }
+}
+
+/// A font's colour bitmap laid over its alpha bitmap pixel for pixel. Omsi.exe reads a
+/// glyph's colour at the very pixel it reads its coverage at, in the colour bitmap's own
+/// rows (0x5d67bc: the same scanline row and byte column in both), whatever size either
+/// has - a colour bitmap need not be the alpha's size, and often is a small swatch of the
+/// one colour (the stock `EFADfont.bmp` is 128 x 128 under a 128 x 200 alpha). Past its
+/// edges, where Omsi.exe reads into other rows or fails, the swatch repeats. (Taken as no
+/// colour bitmap at all, a full-colour text came out in the alpha's white, #829.)
+fn color_at_alpha_pixels(color: &[u8], cw: u32, ch: u32, aw: u32, ah: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (aw * ah * 4) as usize];
+    for y in 0..ah {
+        for x in 0..aw {
+            let s = (((y % ch) * cw + x % cw) * 4) as usize;
+            let d = ((y * aw + x) * 4) as usize;
+            out[d..d + 4].copy_from_slice(&color[s..s + 4]);
+        }
+    }
+    out
 }
 
 /// Runtime state of one `[texttexture]`.
@@ -209,6 +231,32 @@ impl TextTextureState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full-colour font whose colour bitmap is not the alpha's size takes each glyph
+    /// pixel's colour from the same pixel of the colour bitmap, as Omsi.exe reads it, not
+    /// the alpha's white (#829).
+    #[test]
+    fn a_colour_bitmap_of_another_size_still_colours_the_glyphs() {
+        let dir = std::path::PathBuf::from("/fonts");
+        let font = Font { path: dir.join("colour.oft"), name: "Colour".into(), bitmap: "colour.bmp".into(), alpha: "colour_alpha.bmp".into(), height: 4, gap: 0, chars: Vec::new() };
+        let mut lib = FontLibrary::new(&dir);
+        lib.index = Some(vec![font]);
+        // a 4 x 4 white alpha under a 2 x 2 swatch: red, green / blue, yellow
+        let swatch = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]];
+        let decode = |p: &Path| -> Option<(u32, u32, Vec<u8>)> {
+            match p.file_name()?.to_str()? {
+                "colour_alpha.bmp" => Some((4, 4, vec![255; 64])),
+                "colour.bmp" => Some((2, 2, swatch.concat())),
+                _ => None,
+            }
+        };
+        let atlas = lib.get("Colour", &decode).expect("the font loads");
+        assert_eq!((atlas.width, atlas.height), (4, 4));
+        for (x, y) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1), (3, 2)] {
+            let i = (y * 4 + x) * 4;
+            assert_eq!(atlas.color[i..i + 4], swatch[(y % 2) * 2 + x % 2], "pixel ({x}, {y})");
+        }
+    }
 
     #[test]
     fn font_families() {

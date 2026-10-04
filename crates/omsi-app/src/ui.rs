@@ -267,6 +267,8 @@ pub enum NoticeKind {
     Info,
     Warn,
     Alert,
+    /// A new openOMSI version (`update_watch`).
+    Update,
 }
 
 /// How many notifications show at once (the newest; an older one makes room).
@@ -437,8 +439,11 @@ pub struct Frame<'a> {
     pub menu_disabled: &'a [&'a str],
     /// The timetable window: its title and per stop (name, time, 0 served / 1 next / 2 ahead).
     pub timetable: Option<(String, Vec<(String, String, u8)>)>,
-    /// The information bar along the top.
+    /// The information bar along the top: its parts between [`INFO_SEP`]s.
     pub info: Option<String>,
+    /// The room the information bar has along the top: from x to x, from y down (on a
+    /// touch screen the gap between its buttons); none: the window's width.
+    pub info_room: Option<[f32; 3]>,
     /// A tutorial page: title, text, picture, page number and count.
     pub tutorial: Option<(&'a str, &'a str, Option<&'a std::path::Path>, usize, usize)>,
     /// Name tags: a screen position (the point above a bus), the name and a second line.
@@ -521,6 +526,29 @@ pub struct Ui {
     pub dd_scroll: Option<([f32; 4], [f32; 4])>,
     /// Pictures shown in the interface (a tutorial page's), by file.
     images: hashbrown::HashMap<std::path::PathBuf, Option<(TextureId, u32, u32)>>,
+    /// Where the information bar was drawn (within the panel, before `origin_x`), for the
+    /// navigator to keep out of its way.
+    pub info_rect: Option<[f32; 4]>,
+}
+
+/// Between the information bar's parts.
+pub(crate) const INFO_SEP: &str = "   ·   ";
+
+/// The information bar's parts in rows no wider than `room` (as `width` measures a text),
+/// each as many parts as fit: in one line it ran off both sides of a narrow window, and on a
+/// phone it lay under the buttons along the top (#1164).
+pub(crate) fn info_rows(line: &str, room: f32, width: impl Fn(&str) -> f32) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    for part in line.split(INFO_SEP) {
+        match rows.last_mut() {
+            Some(row) if width(&format!("{row}{INFO_SEP}{part}")) <= room => {
+                row.push_str(INFO_SEP);
+                row.push_str(part);
+            }
+            _ => rows.push(part.to_string()),
+        }
+    }
+    rows
 }
 
 pub(crate) fn shift_overlays(scene: &mut Scene, start: usize, x: f32) {
@@ -580,7 +608,7 @@ impl Ui {
         self.chat.rect[2] += x;
     }
     pub fn new() -> Option<Ui> {
-        Some(Ui { origin_x: 0.0, text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, dd_scroll: None, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_pane_scroll: None, menu_time: Vec::new(), anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default() })
+        Some(Ui { origin_x: 0.0, text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, dd_scroll: None, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_pane_scroll: None, menu_time: Vec::new(), anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default(), info_rect: None })
     }
 
     /// Draw the frame's interface: its overlays go after the HUD's in `scene.overlays`.
@@ -727,6 +755,7 @@ impl Ui {
                     NoticeKind::Info => ([90, 160, 255], "Server"),
                     NoticeKind::Warn => ([240, 170, 50], "Warning"),
                     NoticeKind::Alert => ([235, 80, 70], "Alert"),
+                    NoticeKind::Update => ([46, 160, 67], "Update"),
                 };
                 let rows = {
                     let tc = &self.text;
@@ -773,16 +802,26 @@ impl Ui {
             scene.overlays.push((plate, [x - 5.0 * s, 10.0 * s, x + l.w as f32 + 5.0 * s, 10.0 * s + l.h as f32]));
             scene.overlays.push((l.tex, [x, 10.0 * s, x + l.w as f32, 10.0 * s + l.h as f32]));
         }
-        // --- the information bar, along the top in the middle
+        // --- the information bar, along the top in the middle: in as many rows as the room
+        // it has needs
+        self.info_rect = None;
         if let Some(info) = f.info.as_ref() {
-            let l = self.text.label(r, scene, info, (15.0 * s) as u32, [255, 255, 255, 0]);
+            let px = (15.0 * s) as u32;
             let pad = 10.0 * s;
-            let (w, h) = (l.w as f32 + pad * 2.0, l.h as f32 + pad * 0.8);
-            let x = (f.width - w) * 0.5;
-            let y = 8.0 * s;
+            let [x0, x1, y] = f.info_room.unwrap_or([12.0 * s, f.width - 12.0 * s, 8.0 * s]);
+            let rows = info_rows(info, (x1 - x0 - pad * 2.0).max(1.0), |t| self.text.width(t, px as f32));
+            let labels: Vec<Label> = rows.iter().map(|t| self.text.label(r, scene, t, px, [255, 255, 255, 0])).collect();
+            let lw = labels.iter().map(|l| l.w).max().unwrap_or(0) as f32;
+            let lh = labels.iter().map(|l| l.h).max().unwrap_or(0) as f32;
+            let (w, h) = (lw + pad * 2.0, lh * labels.len() as f32 + pad * 0.8);
+            let x = (x0 + x1 - w) * 0.5;
             let plate = self.text.plate(r, scene, 3);
             scene.overlays.push((plate, [x, y, x + w, y + h]));
-            scene.overlays.push((l.tex, [x + pad, y + pad * 0.4, x + pad + l.w as f32, y + pad * 0.4 + l.h as f32]));
+            for (k, l) in labels.iter().enumerate() {
+                let (lx, ly) = (x + (w - l.w as f32) * 0.5, y + pad * 0.4 + k as f32 * lh);
+                scene.overlays.push((l.tex, [lx, ly, lx + l.w as f32, ly + l.h as f32]));
+            }
+            self.info_rect = Some([x, y, x + w, y + h]);
         }
         let tutorial_w = (420.0 * s).min(f.width * 0.42);
         // --- the timetable window, on the right
@@ -2204,6 +2243,25 @@ fn vr_settings_sidebar_step(available: f32, pages: usize, scale: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The information bar is broken between its parts into rows that fit the room it has,
+    /// as many parts to a row as go in; a part wider than the room alone is a row of its own
+    /// (#1164).
+    #[test]
+    fn the_information_bar_breaks_into_rows_that_fit() {
+        let line = ["09:00:07", "0 km/h", "EXT 15 °C / INT 15 °C", "tank 80 %", "0 Passengers", "76 › Krankenhaus", "next: Bauernhof", "−6:52"].join(INFO_SEP);
+        let w = |t: &str| t.chars().count() as f32 * 10.0;
+        assert_eq!(info_rows(&line, 5000.0, w), vec![line.clone()]);
+        let rows = info_rows(&line, 500.0, w);
+        assert_eq!(rows, vec![
+            format!("09:00:07{INFO_SEP}0 km/h{INFO_SEP}EXT 15 °C / INT 15 °C"),
+            format!("tank 80 %{INFO_SEP}0 Passengers"),
+            format!("76 › Krankenhaus{INFO_SEP}next: Bauernhof{INFO_SEP}−6:52"),
+        ]);
+        assert!(rows.iter().all(|r| w(r) <= 500.0));
+        assert_eq!(rows.join(INFO_SEP), line);
+        assert_eq!(info_rows(&line, 50.0, w).len(), 8);
+    }
 
     #[test]
     fn a_server_notice_is_read_and_fades() {

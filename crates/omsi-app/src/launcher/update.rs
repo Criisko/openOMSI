@@ -19,17 +19,48 @@ impl Launcher {
     /// one when that is what the player chose, and on a computer hand over to the new
     /// launcher once it is in place.
     pub(super) fn update_tick(&mut self, event_loop: &ActiveEventLoop) {
+        let looking = self.setting("update_check", true) && omsi_cfg::env::var_os("OMSI_NO_UPDATE").is_none();
         if !self.update.checked_once && self.started.elapsed().as_secs_f32() > 1.0 {
-            if self.setting("update_check", true) && omsi_cfg::env::var_os("OMSI_NO_UPDATE").is_none() {
+            if looking {
                 self.update.check();
             } else {
                 self.update.checked_once = true;
             }
         }
+        // (a game started from here is a program of its own on a computer: nothing is put in
+        // its place while it runs - once it ends, the update the game downloaded in the
+        // background goes in, without a wait)
+        let game_running = !omsi_launcher_lib::IN_PROCESS_GAMES && self.state.instances.iter().any(|i| i.running);
+        if self.update.game_was_running && !game_running && looking {
+            log::info!("update: the game has ended - looking for an update");
+            self.update.dismissed_version = None;
+            self.update.auto_started = false;
+            if let Status::Failed(_) | Status::UpToDate = self.update.status() {
+                self.update.dismiss();
+            }
+            self.update.check();
+        }
+        self.update.game_was_running = game_running;
+        // and every half hour while the launcher stays open, not only when it starts
+        let idle = matches!(self.update.status(), Status::Idle | Status::UpToDate) || (matches!(self.update.status(), Status::Failed(_)) && self.update.dismissed);
+        if looking && idle && self.update.last_check.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(30 * 60)) {
+            if let Status::Failed(_) | Status::UpToDate = self.update.status() {
+                self.update.dismiss();
+            }
+            self.update.check();
+        }
         self.update.poll();
+        // (an offer put aside comes back for a newer version only)
+        if let Status::Available(r) = self.update.status() {
+            if self.update.dismissed && self.update.dismissed_version.as_deref() != Some(r.version.as_str()) {
+                self.update.dismissed = false;
+            } else if !self.update.dismissed && self.update.dismissed_version.as_deref() == Some(r.version.as_str()) {
+                self.update.dismissed = true;
+            }
+        }
         match self.update.status() {
-            // "install updates without asking"
-            Status::Available(r) if self.setting("update_auto", false) && !self.update.dismissed && !self.update.auto_started => {
+            // "install updates without asking" (not while a game runs)
+            Status::Available(r) if self.setting("update_auto", false) && !self.update.dismissed && !self.update.auto_started && !game_running => {
                 self.update.auto_started = true;
                 log::info!("update: installing {} by itself (update_auto)", r.version);
                 self.update.install(r);
@@ -52,6 +83,10 @@ impl Launcher {
 
     /// Whether the update dialog lies over the page this frame.
     pub(super) fn update_dialog_open(&self) -> bool {
+        // (the launcher rests while a game runs: the offer waits for the session's end)
+        if self.update.game_was_running {
+            return false;
+        }
         match self.update.status() {
             Status::Available(_) | Status::Failed(_) => !self.update.dismissed,
             Status::Downloading { .. } | Status::Installing(_) | Status::WaitingForInstaller(_) | Status::Restarting(_) => true,
@@ -248,16 +283,16 @@ impl Launcher {
             // the end of the log goes with it, as much as a link holds (a report of the
             // last line alone said where the game stopped, never what led there); the whole
             // report is on the clipboard as well
-            let lines: Vec<&str> = tail.lines().collect();
+            // (the computer and the map always, see `crash_of`)
+            let (machine, end) = tail.split_once(&format!("\n{}\n", super::state::CRASH_TAIL_GAP)).unwrap_or(("", &tail));
+            let machine = if machine.is_empty() { String::new() } else { format!("The computer:\n```\n{machine}\n```\n\n") };
+            let body_with = |end: &str| format!("openOMSI {} on {}\n\n```\n{what}\n```\n\n{machine}The end of the log:\n```\n{end}\n```\n", updater::current_version(), std::env::consts::OS);
+            let lines: Vec<&str> = end.lines().collect();
             let mut shown = 0;
             let body = loop {
-                let end = lines[lines.len() - shown..].join("\n");
-                let body = format!("openOMSI {} on {}\n\n```\n{what}\n```\n\nThe end of the log:\n```\n{end}\n```\n", updater::current_version(), std::env::consts::OS);
+                let body = body_with(&lines[lines.len() - shown..].join("\n"));
                 if shown >= lines.len() || enc(&body).len() > 6500 {
-                    break if shown == 0 { body } else {
-                        let end = lines[lines.len() - shown.saturating_sub(1)..].join("\n");
-                        format!("openOMSI {} on {}\n\n```\n{what}\n```\n\nThe end of the log:\n```\n{end}\n```\n", updater::current_version(), std::env::consts::OS)
-                    };
+                    break if shown == 0 { body } else { body_with(&lines[lines.len() - shown.saturating_sub(1)..].join("\n")) };
                 }
                 shown += 1;
             };

@@ -164,7 +164,6 @@ pub fn vehicle_lights(
                 let d = body
                     .transform_vector3(Vec3::new(vals[3], vals[4], vals[5]))
                     .normalize_or_zero();
-                let color = [vals[6] / 255.0, vals[7] / 255.0, vals[8] / 255.0];
                 // D3D's spot is only a direction: the stock NL202 puts it 3.8 m behind its
                 // nose, where the real one lit the dashboard and the windscreen from inside.
                 // It shines from the vehicle's front (or rear) face at its own height. The face
@@ -218,50 +217,102 @@ pub fn vehicle_lights(
                 let spread = (on_face.iter().sum::<f32>() / on_face.len().max(1) as f32).min(half_width);
                 let right = body.transform_vector3(Vec3::X).normalize_or_zero();
                 let apex = body.transform_point3(apex);
-                // inner and outer cone as full angles (values 10 and 11)
-                let (inner, outer) = (
-                    vals.get(10).copied().unwrap_or(30.0),
-                    vals.get(11).copied().unwrap_or(70.0),
-                );
-                let half = |deg: f32| (deg.clamp(1.0, 179.0) * 0.5).to_radians().cos();
-                let cone = [half(inner.min(outer)), half(outer)];
                 let sides: &[f32] = if spread > 0.1 { &[-1.0, 1.0] } else { &[0.0] };
                 for side in sides {
                     let at = v.position + (apex + right * spread * side).as_dvec3();
-                    // vanilla: the spot, lit as the classic picture lights a lamp, only inside
-                    // its cone (three point lights along its axis stood in for it before: they
-                    // shone every way, on the bus's own body and saloon)
-                    lights.push(PointLight {
-                        position: at,
-                        radius: spot_reach(vals[9], 45.0),
-                        color,
-                        intensity: VANILLA_HEADLIGHT_INTENSITY / sides.len() as f32 * (0.3 + 0.7 * night),
-                        direction: d,
-                        cone,
-                        mode: LightMode::Vanilla,
-                        ..Default::default()
-                    });
-                    // enhanced: falling off with the square of the distance from a one-metre core
-                    lights.push(PointLight {
-                        position: at,
-                        radius: spot_reach(vals[9], 60.0),
-                        color,
-                        intensity: HEADLIGHT_INTENSITY / sides.len() as f32,
-                        direction: d,
-                        cone,
-                        core: 1.0,
-                        // (a plain spot, as Direct3D lights OMSI's road: the low-beam profile's
-                        // bright band under a hard cut-off has nothing like it in the original)
-                        beam: 0.0,
-                        mode: LightMode::Enhanced,
-                    });
+                    push_spot(lights, at, d, &vals, 1.0 / sides.len() as f32, night);
                 }
+            }
+        }
+    }
+    // [spotlight_2] (openOMSI): every spot its variable switches on, the leading vehicle's
+    // and its sections', where it is declared - a pair mirrored across the vehicle's axis
+    // unless its flag keeps the one lamp - and as bright as a [spotlight] of its colour,
+    // shared between the pair, times the variable (0..1)
+    let parts = std::iter::once((&ty.model, v.position, body))
+        .chain(v.trailers.iter().map(|t| (&t.ty.model, t.position, t.body_rotation())));
+    for (model, origin, rot) in parts {
+        for sp in &model.spotlights_2 {
+            for (pos, dir, share) in spotlight_2_lamps(sp, value_of(sp.variable.as_str())) {
+                let at = origin + rot.transform_point3(pos).as_dvec3();
+                let d = rot.transform_vector3(dir).normalize_or_zero();
+                push_spot(lights, at, d, &sp.values, share, night);
             }
         }
     }
     // [interiorlight]s light only the meshes listing them and the passengers (per-instance
     // term, see MeshProps::interior); they do not shine on the outside world.
     let _ = &ty.model.interior_lights;
+}
+
+/// A `[spotlight_2]`'s lamps in its vehicle's frame - position, direction and share of a
+/// spot's light - with its variable at `k`: none when that is off, the lamp and its twin
+/// mirrored across the axis unless the flag keeps the one.
+fn spotlight_2_lamps(sp: &omsi_model::Spotlight2, k: f32) -> Vec<(Vec3, Vec3, f32)> {
+    let k = k.clamp(0.0, 1.0);
+    if k <= 0.0 {
+        return Vec::new();
+    }
+    let v = sp.values;
+    let sides: &[f32] = if sp.mirrored { &[1.0, -1.0] } else { &[1.0] };
+    sides
+        .iter()
+        .map(|s| (Vec3::new(v[0] * s, v[1], v[2]), Vec3::new(v[3] * s, v[4], v[5]), k / sides.len() as f32))
+        .collect()
+}
+
+/// The lights of one headlamp at `at` shining along `d`, with a `[spotlight]`'s numbers
+/// (`vals`: colour 6-8, range 9, inner and outer cone 10 and 11) and `share` of its light.
+fn push_spot(lights: &mut Vec<PointLight>, at: DVec3, d: Vec3, vals: &[f32; 12], share: f32, night: f32) {
+    let color = [vals[6] / 255.0, vals[7] / 255.0, vals[8] / 255.0];
+    // inner and outer cone as full angles (values 10 and 11)
+    let (inner, outer) = (vals[10], vals[11]);
+    let half = |deg: f32| (deg.clamp(1.0, 179.0) * 0.5).to_radians().cos();
+    let cone = [half(inner.min(outer)), half(outer)];
+    // vanilla: the spot, lit as the classic picture lights a lamp, only inside
+    // its cone (three point lights along its axis stood in for it before: they
+    // shone every way, on the bus's own body and saloon)
+    lights.push(PointLight {
+        position: at,
+        radius: spot_reach(vals[9], 45.0),
+        color,
+        intensity: VANILLA_HEADLIGHT_INTENSITY * share * (0.3 + 0.7 * night),
+        direction: d,
+        cone,
+        mode: LightMode::Vanilla,
+        ..Default::default()
+    });
+    // enhanced: falling off with the square of the distance from a one-metre core
+    lights.push(PointLight {
+        position: at,
+        radius: spot_reach(vals[9], 60.0),
+        color,
+        intensity: HEADLIGHT_INTENSITY * share,
+        direction: d,
+        cone,
+        core: 1.0,
+        // (a plain spot, as Direct3D lights OMSI's road: the low-beam profile's
+        // bright band under a hard cut-off has nothing like it in the original)
+        beam: full_beam_gain(vals[9]),
+        mode: LightMode::Enhanced,
+    });
+}
+
+/// How much more a `[spotlight]` of this range throws towards the horizon than along its
+/// axis in the enhanced picture (`PointLight::beam`, negative: a full beam): none up to the
+/// stock low beam's 100, beyond it the square of its reach over the low beam's, so it lights
+/// the road as far out as it reaches further - the stock full beam's 500, 25 times. Its
+/// longer reach alone showed nothing: lit inverse-square from a one-metre core, the road
+/// 60 m ahead had next to no light from either beam, and a full beam lit the road as the
+/// low beam did (#1068). (The classic picture's spot is full within an eighth of its reach,
+/// so its full beam's pool there is five times as long as the low beam's.)
+fn full_beam_gain(range: f32) -> f32 {
+    let k = spot_reach(range, 60.0) / 60.0;
+    if k > 1.0 {
+        -(k * k)
+    } else {
+        0.0
+    }
 }
 
 /// How far a `[spotlight]` reaches in the picture, from its declared range (value 9):
@@ -286,6 +337,42 @@ mod spot_tests {
         assert_eq!(super::spot_reach(30.0, 45.0), 30.0);
         assert_eq!(super::spot_reach(2.0, 45.0), 10.0);
         assert_eq!(super::spot_reach(5000.0, 45.0), 225.0);
+    }
+
+    /// The enhanced picture's full beam throws towards the horizon as many times further as
+    /// its range says; a low beam stays a plain spot (#1068).
+    #[test]
+    fn a_full_beam_throws_its_light_further_down_the_road() {
+        assert_eq!(super::full_beam_gain(100.0), 0.0);
+        assert_eq!(super::full_beam_gain(30.0), 0.0);
+        assert_eq!(super::full_beam_gain(500.0), -25.0);
+        assert_eq!(super::full_beam_gain(200.0), -4.0);
+        assert_eq!(super::full_beam_gain(5000.0), -25.0);
+    }
+
+    /// `[spotlight_2]`: a pair mirrored across the axis sharing the light, or one lamp, as
+    /// bright as its variable says, and nothing while that is off.
+    #[test]
+    fn a_spotlight_2_is_a_mirrored_pair_or_one_lamp() {
+        use glam::Vec3;
+        let mut sp = omsi_model::Spotlight2 {
+            values: [0.9, 5.9, 0.65, 0.2, 1.0, -0.3, 255.0, 255.0, 233.0, 200.0, 30.0, 80.0],
+            variable: "lights_fern".into(),
+            mirrored: true,
+        };
+        let pair = super::spotlight_2_lamps(&sp, 1.0);
+        assert_eq!(
+            pair,
+            [
+                (Vec3::new(0.9, 5.9, 0.65), Vec3::new(0.2, 1.0, -0.3), 0.5),
+                (Vec3::new(-0.9, 5.9, 0.65), Vec3::new(-0.2, 1.0, -0.3), 0.5),
+            ]
+        );
+        assert!(super::spotlight_2_lamps(&sp, 0.0).is_empty());
+        assert!(super::spotlight_2_lamps(&sp, -1.0).is_empty());
+        sp.mirrored = false;
+        assert_eq!(super::spotlight_2_lamps(&sp, 0.5), [(Vec3::new(0.9, 5.9, 0.65), Vec3::new(0.2, 1.0, -0.3), 0.5)]);
+        assert_eq!(super::spotlight_2_lamps(&sp, 3.0)[0].2, 1.0);
     }
 }
 
@@ -482,6 +569,11 @@ pub fn collect(
     scene.lights.sort_by(|a, b| (a.position - camera_pos).length_squared().total_cmp(&(b.position - camera_pos).length_squared()));
 }
 
+/// How far Omsi.exe moves every `[smoke]` and `[particle_emitter]` puff towards the eye in
+/// depth (m): 0x5a1d54 gives each particle 0.1, which 0x5a2b5c takes off the view depth it
+/// projects the puff's depth at.
+const SMOKE_Z_OFFSET: f32 = 0.1;
+
 /// The particles of a particle set as the renderer draws them: smoke blended over the scene,
 /// and the glowing ones (`--PS_emissive--`: sparks, rockets, a flame) as coronas.
 pub fn particle_sprites(set: &omsi_sim::particles::ParticleSet, smoke: &mut Vec<omsi_render::SmokeParticle>, coronas: &mut Vec<Corona>) {
@@ -502,7 +594,16 @@ pub fn particle_sprites(set: &omsi_sim::particles::ParticleSet, smoke: &mut Vec<
                 ..Default::default()
             });
         } else {
-            smoke.push(omsi_render::SmokeParticle { position: p.pos, size: p.size() * 0.5, color: p.color, alpha });
+            smoke.push(omsi_render::SmokeParticle {
+                position: p.pos,
+                size: p.size() * 0.5,
+                color: p.color,
+                alpha,
+                spin: p.spin,
+                z_offset: SMOKE_Z_OFFSET,
+                // (to fade into, where Omsi.exe lets the road cut it off)
+                ground: p.ground.is_finite().then_some(p.ground),
+            });
         }
     }
 }

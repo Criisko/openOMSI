@@ -1,6 +1,7 @@
 //! Getting up from the driver's seat (the `get_up` setting, Ctrl+Shift+G) and walking about
 //! as the passengers do: W A S D walk (relative to where the camera looks), Shift runs,
-//! Space jumps, the right mouse button looks round; the view is out of the walker's eyes
+//! Space jumps, C kneels (and stands up again), the right mouse button looks round; the view
+//! is out of the walker's eyes
 //! (F1), F4 lets the free camera go (the walker waits), F1 comes back. G by a bus's door takes a free
 //! passenger seat in it (the player's own bus, a timetable bus, another player's), G again
 //! gets up and out by the nearest door; G at the own bus's front door sits back at the
@@ -25,6 +26,10 @@ const WALK: f64 = 1.45;
 const RUN: f64 = 4.3;
 const ACCEL: f64 = 7.0;
 const JUMP: f64 = 4.0;
+/// How far the eyes go down kneeling (m: from a standing person's 1.6 to about a metre), and
+/// the shuffle on the knees (m/s).
+const KNEEL_DROP: f64 = 0.6;
+const KNEEL_WALK: f64 = 0.5;
 /// How near a door (m) G gets in.
 const DOOR_REACH: f64 = 3.2;
 /// The walker's radius against walls and vehicles (m).
@@ -75,6 +80,10 @@ pub(crate) struct OnFoot {
     pub transit: Option<Transit>,
     /// Arrived at the end of a walk that had somewhere to go (the wheel): done next frame.
     pub arrive: Option<Then>,
+    /// Down on the knees (C, #1148): the eyes low, for a picture from below.
+    pub kneel: bool,
+    /// How far down the eyes are on their way (0 standing .. 1 kneeling).
+    pub crouch: f32,
 }
 
 /// What a walk leads to once walked.
@@ -117,6 +126,40 @@ impl OnFoot {
     /// Whether the feet are on the ground.
     fn grounded(&self) -> bool {
         self.lift <= 1e-4 && self.vz <= 0.0
+    }
+
+    /// Down on the knees, or up again; not on a seat. True when it did.
+    fn toggle_kneel(&mut self) -> bool {
+        if self.seat.is_some() {
+            return false;
+        }
+        self.kneel = !self.kneel;
+        true
+    }
+
+    /// The eyes on their way down or up, over about a third of a second.
+    fn ease_crouch(&mut self, dt: f32) {
+        let want = if self.kneel && self.seat.is_none() { 1.0 } else { 0.0 };
+        self.crouch += (want - self.crouch) * (1.0 - (-dt * 9.0).exp());
+        if (want - self.crouch).abs() < 1e-3 {
+            self.crouch = want;
+        }
+    }
+
+    /// How much lower than a standing person's the eyes are.
+    fn eye_drop(&self) -> DVec3 {
+        DVec3::new(0.0, 0.0, -(self.crouch as f64) * KNEEL_DROP)
+    }
+
+    /// The pace W A S D ask for: a walk, a run (Shift), on the knees a shuffle.
+    fn pace(&self, run: bool) -> f64 {
+        if self.kneel {
+            KNEEL_WALK
+        } else if run {
+            RUN
+        } else {
+            WALK
+        }
     }
 }
 
@@ -321,9 +364,11 @@ impl App {
             face_seat: false,
             transit,
             arrive: None,
+            kneel: false,
+            crouch: 0.0,
         });
         self.view = "foot".into();
-        self.service_msg = Some(("On foot: W A S D walk, Shift runs, F4 free camera / F1 back, G sits down (by the driver's place: back at the wheel), Ctrl+Shift+G steps out of the bus".into(), 7.0));
+        self.service_msg = Some(("On foot: W A S D walk, Shift runs, C kneels, F4 free camera / F1 back, G sits down (by the driver's place: back at the wheel), Ctrl+Shift+G steps out of the bus".into(), 7.0));
     }
 
     /// Ctrl+Shift+G inside a bus: out by its nearest door, open or shut (getting up now
@@ -448,6 +493,8 @@ impl App {
             face_seat: false,
             transit: None,
             arrive: None,
+            kneel: false,
+            crouch: 0.0,
         });
         self.view = "foot".into();
     }
@@ -615,6 +662,7 @@ impl App {
                     f.inside = None;
                     f.face_seat = true;
                     f.vel = DVec2::ZERO;
+                    f.kneel = false;
                 }
                 None => self.service_msg = Some(("No free seat near: walk up to one".into(), 3.0)),
             }
@@ -748,15 +796,38 @@ impl App {
             }
             KeyCode::Space => {
                 if let (true, false, Some(f)) = (pressed, repeat, self.on_foot.as_mut()) {
-                    if f.seat.is_none() && f.grounded() {
+                    // (on the knees: up first)
+                    if f.kneel {
+                        f.kneel = false;
+                    } else if f.seat.is_none() && f.grounded() {
                         f.vz = JUMP;
                     }
+                }
+                true
+            }
+            KeyCode::KeyC => {
+                if pressed && !repeat {
+                    self.kneel();
                 }
                 true
             }
             // everything else is the walker's, not the bus's (no switch is worked from the
             // pavement)
             _ => true,
+        }
+    }
+
+    /// C on foot (or the screen's button): down on the knees for a picture from low down, or
+    /// up again (#1148).
+    pub(crate) fn kneel(&mut self) {
+        let Some(f) = self.on_foot.as_mut() else { return };
+        if f.toggle_kneel() {
+            let msg = match (f.kneel, crate::platform::touch_controls()) {
+                (true, false) => "Kneeling: C (or Space) stands up again",
+                (true, true) => "Kneeling: the button again stands up",
+                (false, _) => "Standing",
+            };
+            self.service_msg = Some((msg.into(), 2.5));
         }
     }
 
@@ -787,6 +858,7 @@ impl App {
         }
         let Some(mut f) = self.on_foot.take() else { return };
         let dt64 = dt as f64;
+        f.ease_crouch(dt);
         let key = |k: KeyCode| self.keys.contains(&k);
         if key(KeyCode::ArrowLeft) {
             f.yaw -= 90.0 * dt;
@@ -858,7 +930,7 @@ impl App {
                 dir -= right;
             }
             let run = key(KeyCode::ShiftLeft) || key(KeyCode::ShiftRight);
-            let want = dir.normalize_or_zero() * if run { RUN } else { WALK };
+            let want = dir.normalize_or_zero() * f.pace(run);
             // (in the air only a little steering)
             let k = 1.0 - (-dt64 * if f.grounded() { ACCEL } else { 1.0 }).exp();
             f.vel += (want - f.vel) * k;
@@ -999,7 +1071,7 @@ impl App {
         }
         // the camera, out of the eyes (the free camera moves by itself)
         if let (Some(cam), false) = (self.camera.as_mut(), free) {
-            let eye = body.map(|b| b.2).unwrap_or(f.pos + DVec3::new(0.0, 0.0, 1.62 + f.lift));
+            let eye = body.map(|b| b.2).unwrap_or(f.pos + DVec3::new(0.0, 0.0, 1.62 + f.lift)) + f.eye_drop();
             let y = (f.yaw as f64).to_radians();
             let (want, want_yaw, want_pitch) = (eye + DVec3::new(y.sin(), y.cos(), 0.0) * 0.08, f.yaw, f.pitch);
             // just got up: 4 per second at first (a glide out of the cab's camera), then up to
@@ -1056,7 +1128,7 @@ impl App {
                 f.pos = w;
             }
         }
-        let eye = h.avatar_body(AVATAR_KEY).map(|b| b.2).unwrap_or(f.pos + DVec3::new(0.0, 0.0, 1.62));
+        let eye = h.avatar_body(AVATAR_KEY).map(|b| b.2).unwrap_or(f.pos + DVec3::new(0.0, 0.0, 1.62)) + f.eye_drop();
         let y = (f.eye_yaw as f64).to_radians();
         let at = eye + DVec3::new(y.sin(), y.cos(), 0.0) * 0.08 + f.lag;
         f.eye = Some(at);
@@ -1147,5 +1219,63 @@ impl App {
             }
         }
         self.remote_walkers = now;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walker() -> OnFoot {
+        OnFoot {
+            pos: DVec3::ZERO,
+            heading: 0.0,
+            vel: DVec2::ZERO,
+            lift: 0.0,
+            vz: 0.0,
+            seat: None,
+            inside: None,
+            cam: FootCam::First,
+            yaw: 0.0,
+            pitch: 0.0,
+            eye: None,
+            eye_yaw: 0.0,
+            lag: DVec3::ZERO,
+            settle: 0.0,
+            view_before: "driver".into(),
+            kind: 0,
+            face_seat: false,
+            transit: None,
+            arrive: None,
+            kneel: false,
+            crouch: 0.0,
+        }
+    }
+
+    /// C kneels: the eyes go down to about a metre over a moment (a picture from below,
+    /// #1148), the walk becomes a shuffle, and C again stands up; not on a seat.
+    #[test]
+    fn kneeling_lowers_the_eyes_and_slows_the_walk() {
+        let mut f = walker();
+        assert_eq!(f.eye_drop(), DVec3::ZERO);
+        assert_eq!(f.pace(false), WALK);
+        assert!(f.toggle_kneel() && f.kneel);
+        f.ease_crouch(0.05);
+        assert!(f.crouch > 0.2 && f.crouch < 0.9, "{}", f.crouch);
+        for _ in 0..60 {
+            f.ease_crouch(1.0 / 60.0);
+        }
+        assert_eq!(f.crouch, 1.0);
+        assert_eq!(f.eye_drop().z, -KNEEL_DROP);
+        assert_eq!((f.pace(false), f.pace(true)), (KNEEL_WALK, KNEEL_WALK));
+        assert!(f.toggle_kneel() && !f.kneel);
+        for _ in 0..60 {
+            f.ease_crouch(1.0 / 60.0);
+        }
+        assert_eq!(f.eye_drop(), DVec3::ZERO);
+        assert_eq!(f.pace(true), RUN);
+        // (seated: nothing to kneel on)
+        f.seat = Some((BusId::Player, 3));
+        assert!(!f.toggle_kneel() && !f.kneel);
     }
 }

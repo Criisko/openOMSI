@@ -352,11 +352,23 @@ impl Host for VehicleHost {
     }
 
     fn callback(&mut self, name: &str, _id: NameId, stacks: &mut Stacks, state: &mut State) {
-        let lname = name.to_ascii_lowercase();
-        if lname.starts_with("st") && omsi_cfg::env::var_os("OMSI_DEBUG_TEXT").is_some() {
+        let mut buf = [0u8; 64];
+        let owned;
+        let lname: &str = match buf.get_mut(..name.len()) {
+            Some(b) => {
+                b.copy_from_slice(name.as_bytes());
+                b.make_ascii_lowercase();
+                std::str::from_utf8(b).unwrap_or(name)
+            }
+            None => {
+                owned = name.to_ascii_lowercase();
+                &owned
+            }
+        };
+        if lname.starts_with("st") && debug_text() {
             log::info!("callback {name} stack {:?} strings {:?}", &stacks.st[..stacks.st.len().min(8)], stacks.sst.last());
         }
-        match lname.as_str() {
+        match lname {
             "getfontindex" => {
                 let font = stacks.pop_str();
                 let idx = match self.fonts.entries.iter().position(|f| f.0.eq_ignore_ascii_case(&font)) {
@@ -382,7 +394,7 @@ impl Host for VehicleHost {
                 let text = stacks.pop_str();
                 // as Omsi.exe measures it (0x5d6c00): the glyphs and the gaps between them
                 let w = self.font_atlas(font).map(|a| a.font.text_width(&text) as f32).unwrap_or(0.0);
-                if omsi_cfg::env::var_os("OMSI_DEBUG_TEXT").is_some() {
+                if debug_text() {
                     log::info!("TextLength(font {font} = {:?}, {text:?}) = {w}", self.font_atlas(font).map(|a| a.font.name.clone()));
                 }
                 stacks.push(w);
@@ -456,7 +468,7 @@ impl Host for VehicleHost {
                 let x = arg_i32(stacks.pop());
                 let i = arg_idx(stacks.pop());
                 let atlas = self.font_atlas(font);
-                if omsi_cfg::env::var_os("OMSI_DEBUG_TEXT").is_some() {
+                if debug_text() {
                     log::info!("STTextOut(tex {i}, x {x}, y {y}, font {font}, spacing {spacing}, {text:?}) atlas {:?} from {:?} bitmap {:?} {}x{} E {:?}", atlas.as_ref().map(|a| a.font.name.clone()), atlas.as_ref().map(|a| a.font.path.clone()), atlas.as_ref().map(|a| a.font.alpha.clone()), atlas.as_ref().map(|a| a.width).unwrap_or(0), atlas.as_ref().map(|a| a.height).unwrap_or(0), atlas.as_ref().and_then(|a| a.font.glyph('E').map(|g| (g.x0, g.x1, g.y))));
                 }
                 if let (Some(t), Some(a)) = (self.script_textures.get_mut(i), atlas) {
@@ -478,7 +490,7 @@ impl Host for VehicleHost {
             }
             "stgetr" | "stgetg" | "stgetb" | "stgeta" => {
                 let i = arg_idx(stacks.pop());
-                let k = match lname.as_str() {
+                let k = match lname {
                     "stgetr" => 0,
                     "stgetg" => 1,
                     "stgetb" => 2,
@@ -680,9 +692,9 @@ impl Host for VehicleHost {
             }
             _ => {
                 // numeric callbacks default to 0; say once which one the host lacks
-                if !self.unknown_callbacks.iter().any(|n| n == &lname) {
+                if !self.unknown_callbacks.iter().any(|n| n == lname) {
                     log::warn!("script callback (M.V.{name}) is not provided; it reads 0");
-                    self.unknown_callbacks.push(lname);
+                    self.unknown_callbacks.push(lname.to_string());
                 }
                 stacks.push(0.0);
             }
@@ -922,4 +934,9 @@ mod tests {
         assert_eq!(st.get(p.var("collision_energy").unwrap()), 135.5);
         assert_eq!(st.get(p.var("collision_energy_eng").unwrap()), 115.5);
     }
+}
+
+fn debug_text() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| omsi_cfg::env::var_os("OMSI_DEBUG_TEXT").is_some())
 }

@@ -221,14 +221,37 @@ fn bmp32_alpha(bytes: &[u8], width: u32, height: u32, rgba: &mut [u8]) -> bool {
 /// (may carry a path and any extension); `dirs` are searched in order.
 static SEASON: Mutex<Option<String>> = Mutex::new(None);
 
-/// Season texture subfolder (`spring`, `fall`, `Winter`, `WinterSnow`): textures found in
-/// `<texture dir>/<season>/` take precedence, like OMSI's `[addseason]`.
+/// Season texture subfolder (`Spring`, `Fall`, `Winter`, `WinterSnow`, `WinterSnowfall`,
+/// `SummerDry`): textures found in `<texture dir>/<season>/` take precedence, like OMSI's
+/// `[addseason]` - or in the folders after it that [`season_folders`] lists.
 pub fn set_season_folder(folder: Option<String>) {
     *SEASON.lock() = folder;
 }
 
 pub fn season_folder() -> Option<String> {
     SEASON.lock().clone()
+}
+
+/// The folders a texture's variant is looked for in under the season `head`, best first,
+/// as Omsi.exe picks it (0x7f910c): in snow the snowy roads of `WinterSnowfall` when the
+/// weather has snow on the road, else `WinterSnow`, and a texture with no snow picture
+/// takes its `Winter` one, else its `Fall` one; in winter `Winter`, else `Fall`. (With the
+/// one folder alone, a road whose snowy picture is in `WinterSnowfall` - the stock asphalt
+/// - stayed bare under the heaviest snowfall, and a texture with only a winter picture
+/// stayed green in the snow.)
+pub fn season_chain(head: &str) -> Vec<String> {
+    let chain: &[&str] = match head.to_ascii_lowercase().as_str() {
+        "wintersnowfall" => &["WinterSnowfall", "WinterSnow", "Winter", "Fall"],
+        "wintersnow" => &["WinterSnow", "Winter", "Fall"],
+        "winter" => &["Winter", "Fall"],
+        _ => return vec![head.to_string()],
+    };
+    chain.iter().map(|f| f.to_string()).collect()
+}
+
+/// The folders of the current season (see [`season_chain`]), none in summer.
+pub fn season_folders() -> Vec<String> {
+    season_folder().map(|f| season_chain(&f)).unwrap_or_default()
 }
 
 pub fn find_texture(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
@@ -353,7 +376,7 @@ fn find_texture_in_season(name: &str, dirs: &[&Path], season: Option<&str>) -> O
     // folder with it, so the season goes in front of the file name, not in front of the
     // whole path; both spellings are tried.
     let mut names: Vec<String> = Vec::new();
-    if let Some(f) = season {
+    for f in season.map(season_chain).unwrap_or_default() {
         match (stem_path.parent(), stem_path.file_name()) {
             (Some(par), Some(file)) if !par.as_os_str().is_empty() => names.push(format!("{}/{}/{}", par.display(), f, file.to_string_lossy())),
             (_, Some(file)) => names.push(format!("{}/{}", f, file.to_string_lossy())),
@@ -656,6 +679,38 @@ mod tests {
             find_texture_in_season("fallback.bmp", &dirs, Some("Fall")),
             Some(global.join("Fall/fallback.dds")),
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// In snow a texture takes the variant Omsi.exe takes: the stock asphalt's snowy
+    /// picture (`WinterSnowfall`) only with snow on the road, a texture without a snow
+    /// picture its winter one, one without that its autumn one, else itself.
+    #[test]
+    fn a_texture_without_a_snow_picture_falls_back_as_omsi_does() {
+        let dir = std::env::temp_dir().join(format!("omsi-texture-snow-{}", std::process::id()));
+        let tex = dir.join("texture");
+        for f in ["WinterSnowfall", "WinterSnow", "Winter", "Fall"] {
+            std::fs::create_dir_all(tex.join(f)).unwrap();
+        }
+        for path in ["road.bmp", "WinterSnowfall/road.bmp", "walk.bmp", "WinterSnow/walk.bmp", "WinterSnowfall/walk.bmp", "hedge.bmp", "Winter/hedge.bmp", "Fall/hedge.bmp", "tree.bmp", "Fall/tree.bmp", "plain.bmp"] {
+            std::fs::write(tex.join(path), b"lookup-only fixture").unwrap();
+        }
+        let dirs = [tex.as_path()];
+        let find = |name: &str, season: &str| find_texture_in_season(name, &dirs, Some(season)).unwrap();
+        // snow on the road
+        assert_eq!(find("road.bmp", "WinterSnowfall"), tex.join("WinterSnowfall/road.bmp"));
+        assert_eq!(find("walk.bmp", "WinterSnowfall"), tex.join("WinterSnowfall/walk.bmp"));
+        assert_eq!(find("hedge.bmp", "WinterSnowfall"), tex.join("Winter/hedge.bmp"));
+        // snow, the roads clear
+        assert_eq!(find("road.bmp", "WinterSnow"), tex.join("road.bmp"));
+        assert_eq!(find("walk.bmp", "WinterSnow"), tex.join("WinterSnow/walk.bmp"));
+        assert_eq!(find("hedge.bmp", "WinterSnow"), tex.join("Winter/hedge.bmp"));
+        assert_eq!(find("tree.bmp", "WinterSnow"), tex.join("Fall/tree.bmp"));
+        assert_eq!(find("plain.bmp", "WinterSnow"), tex.join("plain.bmp"));
+        // winter: its own picture, else the autumn one
+        assert_eq!(find("hedge.bmp", "Winter"), tex.join("Winter/hedge.bmp"));
+        assert_eq!(find("tree.bmp", "Winter"), tex.join("Fall/tree.bmp"));
+        assert_eq!(find("walk.bmp", "Winter"), tex.join("walk.bmp"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

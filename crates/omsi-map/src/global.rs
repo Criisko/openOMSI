@@ -65,13 +65,15 @@ pub struct Season {
 }
 
 impl Season {
-    /// Texture subfolder of a season kind: 1 spring, 2 autumn, 3 winter, 4 winter with snow.
+    /// Texture subfolder of a season kind: 1 spring, 2 autumn, 3 winter, 4 winter with snow,
+    /// 5 dry summer (`SummerDry`, the editor's "Summer (dry)": Omsi.exe 0x7f93a6).
     pub fn folder(kind: i32) -> Option<&'static str> {
         match kind {
             1 => Some("spring"),
             2 => Some("fall"),
             3 => Some("Winter"),
             4 => Some("WinterSnow"),
+            5 => Some("SummerDry"),
             _ => None,
         }
     }

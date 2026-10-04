@@ -391,6 +391,16 @@ fn ray_triangle(o: Vec3, d: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
     (t > 0.0).then_some(t)
 }
 
+/// The outside camera's orbit centre, raised to [`GROUND_CLEARANCE`] over the ground where a
+/// bus's `[camera_outside_center]` lies lower than that: from under it every ray of
+/// [`free_length`] met the ground at once and the camera stayed trapped under the bus (#702).
+pub fn lift_pivot(world: &World, pivot: DVec3) -> DVec3 {
+    match world.camera_ground(pivot.x, pivot.y, pivot.z + GROUND_CLEARANCE) {
+        Some(g) if pivot.z < g + GROUND_CLEARANCE => DVec3::new(pivot.x, pivot.y, g + GROUND_CLEARANCE),
+        _ => pivot,
+    }
+}
+
 /// How far the camera may go from `pivot` along the unit vector `dir` (at most `want`):
 /// the nearest hit of the five rays with scenery, less the margin, and the point where the
 /// middle ray comes within [`GROUND_CLEARANCE`] of the ground. `right`/`up` span the plane

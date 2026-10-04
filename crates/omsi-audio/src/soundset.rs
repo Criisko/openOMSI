@@ -68,6 +68,15 @@ pub struct SoundSet {
     pub parts: Vec<(usize, SoundSet)>,
 }
 
+/// The file a `(T.F.)` trigger names, as Omsi.exe opens it (0x74f2e8 through 0x7eed78): the
+/// characters a Windows file name cannot have are `%` in it, the folders' `\` and a drive's
+/// `:` stay. The stock IBIS announces a stop by its name, and Spandau's "Falkenseer
+/// Ch/Stadtrandstr" is `Falkenseer Ch%Stadtrandstr.wav`: read as a folder, it was not found
+/// and the stop was not announced (#1096).
+fn file_trigger_name(file: &str) -> String {
+    file.chars().map(|c| if matches!(c, '/' | '?' | '*' | '"' | '<' | '>' | '|') { '%' } else { c }).collect()
+}
+
 /// Say once per file that a `(T.F.)` sound cannot be found: every AI bus of a type asks for
 /// the same missing announcement at every stop.
 fn warn_missing_once(trigger: &str, path: &Path) {
@@ -282,7 +291,7 @@ impl SoundSet {
         if !engine.enabled || file.trim().is_empty() {
             return;
         }
-        let path = omsi_cfg::resolve_path(&self.dir, file);
+        let path = omsi_cfg::resolve_path(&self.dir, &file_trigger_name(file));
         let Some(clip) = engine.load_clip(&path) else {
             warn_missing_once(trigger, &path);
             return;
@@ -809,5 +818,26 @@ mod tests {
         assert_eq!(eval(&ctx(2, true), hit.clone(), &fired).gain, 1.0);
         let set = SoundSet { sounds: vec![RuntimeSound::new(hit, None)], master: 1.0, dir: Default::default(), inside: true, ai: false, listener_vehicle: true, muffled: false, parts: Vec::new() };
         assert_eq!(set.curve_triggers(), vec!["ev_doorhitclose_0".to_string()]);
+    }
+
+    /// The stock IBIS announces Spandau's "Falkenseer Ch/Stadtrandstr" with the file
+    /// `Falkenseer Ch%Stadtrandstr.wav`, as Omsi.exe's file triggers write `/` (#1096).
+    #[test]
+    fn a_file_trigger_writes_what_a_file_name_cannot_have_as_percent() {
+        let file = r"..\..\Announcements\Spandau\Falkenseer Ch/Stadtrandstr.wav";
+        assert_eq!(file_trigger_name(file), r"..\..\Announcements\Spandau\Falkenseer Ch%Stadtrandstr.wav");
+        assert_eq!(file_trigger_name(r"C:\a?b*c\d<e>f|g.wav"), r"C:\a%b%c\d%e%f%g.wav");
+        // found where the announcement lies
+        let root = std::env::temp_dir().join(format!("openomsi-file-trigger-{}", std::process::id()));
+        let sound = root.join("Vehicles").join("MAN_NL_NG").join("Sound");
+        let spandau = root.join("Vehicles").join("Announcements").join("Spandau");
+        std::fs::create_dir_all(&sound).unwrap();
+        std::fs::create_dir_all(&spandau).unwrap();
+        std::fs::write(spandau.join("Falkenseer Ch%Stadtrandstr.wav"), b"RIFF").unwrap();
+        let path = omsi_cfg::resolve_path(&sound, &file_trigger_name(file));
+        assert!(path.is_file(), "{}", path.display());
+        // (the name as the script wrote it: a folder "Falkenseer Ch" that is not there)
+        assert!(!omsi_cfg::resolve_path(&sound, file).is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

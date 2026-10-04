@@ -112,6 +112,38 @@ fn engine_fed(name: &str) -> bool {
         || matches!(n.as_str(), "n_wheel" | "wetness" | "time" | "timegap")
 }
 
+/// Every variable of a vehicle type that goes to the others (`omsi_net::vars`): the
+/// variables its own varlists declare - not those every copy works out for itself
+/// (`engine_fed`), nor the engine's own (the view, the weather) - and all its strings, by
+/// their ids, with a hash of their names that tells two copies made from the same files.
+pub struct VarTable {
+    pub hash: u32,
+    pub floats: Vec<u16>,
+    pub strings: Vec<u16>,
+}
+
+fn var_table(program: &omsi_script::Program) -> VarTable {
+    let mut h: u32 = 0x811c_9dc5;
+    let mut eat = |s: &str| {
+        for b in s.bytes().chain(std::iter::once(0)) {
+            h = (h ^ b.to_ascii_lowercase() as u32).wrapping_mul(0x0100_0193);
+        }
+    };
+    let mut floats = Vec::new();
+    for (k, n) in program.var_names.iter().enumerate().take(u16::MAX as usize) {
+        if program.script_vars.contains(&n.to_ascii_lowercase()) && !engine_fed(n) {
+            eat(n);
+            floats.push(k as u16);
+        }
+    }
+    let mut strings = Vec::new();
+    for (k, n) in program.str_var_names.iter().enumerate().take(u16::MAX as usize) {
+        eat(n);
+        strings.push(k as u16);
+    }
+    VarTable { hash: h, floats, strings }
+}
+
 /// Sound entries of the full `[sound]` set that are heard from outside as well: the horn,
 /// the indicator relay, kneeling.
 fn outside_entry(e: &omsi_vehicle::SoundEntry) -> bool {
@@ -185,7 +217,8 @@ impl SyncTable {
                     .chain(m.light_enh.iter().map(|l| l.variable.clone()))
                     .chain(m.light_enh_2.iter().map(|l| l.variable.clone()))
             })
-            .chain(types.iter().flat_map(|t| t.model.interior_lights.iter()).map(|l| l.variable.clone()));
+            .chain(types.iter().flat_map(|t| t.model.interior_lights.iter()).map(|l| l.variable.clone()))
+            .chain(types.iter().flat_map(|t| t.model.spotlights_2.iter()).map(|l| l.variable.clone()));
         let lamps = collect(
             &mut lamp_names.collect::<Vec<_>>().into_iter(),
             &|n| engine_fed(n) || paint_vars.contains(&n.to_ascii_lowercase()),
@@ -463,12 +496,24 @@ pub struct RemoteVehicle {
     offset: Option<f64>,
     /// The moment of theirs drawn (see `PlayClock`).
     play: crate::lan_world::PlayClock,
+    /// Every variable of theirs as it came (`omsi_net::vars`), pinned each frame, and their
+    /// strings - for the same vehicle files only (`vars`' hash); and the variables the pose
+    /// already carries, which glide instead (lamps, switches, moving parts, doors).
+    vars: Option<VarTable>,
+    synced: hashbrown::HashMap<u16, f32>,
+    synced_strings: hashbrown::HashMap<u16, String>,
+    smooth: hashbrown::HashSet<u16>,
 }
 
 impl RemoteVehicle {
     /// The LAN player's vehicle as it is drawn here.
     pub fn vehicle(&self) -> &omsi_sim::VehicleInstance {
         &self.vehicle
+    }
+
+    /// The same, for the plugins (`omsi.set_other_var`: their next state writes it again).
+    pub fn vehicle_mut(&mut self) -> &mut omsi_sim::VehicleInstance {
+        &mut self.vehicle
     }
 }
 
@@ -575,6 +620,9 @@ pub struct LanGame {
     /// tried: tried again only after a while (every frame, a server read a big add-on bus
     /// it could not load over and over and stood still for everybody).
     failed: hashbrown::HashMap<(u32, String), std::time::Instant>,
+    /// Our vehicle's variable table (by its program), for `omsi_net::vars`.
+    my_vars: Option<(usize, Arc<VarTable>)>,
+    vars_log: f32,
 }
 
 /// What the frame knows that LAN play needs.
@@ -816,6 +864,107 @@ pub fn publish_vehicles(root: PathBuf, only: Vec<String>) {
     });
 }
 
+/// The buses the server we joined offers (its `vehicles`, else every bus it has), as its
+/// status page says, tied to the session that asked: each session starts with every bus
+/// offered, and a server's answer counts only while the session that asked it is the one
+/// running (on a phone the launcher and the game share one process, one drive after the
+/// other).
+struct ServerOffers {
+    /// The session now: counted up by every `lan::start`.
+    session: u64,
+    /// The offered buses as `bus_key`s. None: any - not on a server, or it has not said (yet).
+    list: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+}
+
+impl ServerOffers {
+    /// A new session: every bus offered until its server says otherwise. Its number.
+    fn reset(&mut self) -> u64 {
+        self.session += 1;
+        self.list = None;
+        self.session
+    }
+
+    /// A server's answer to `session`: taken while that session runs, else dropped (an
+    /// answer late for a session that ended).
+    fn answer(&mut self, session: u64, vehicles: &[String]) -> bool {
+        if session != self.session {
+            return false;
+        }
+        self.list = Some(std::sync::Arc::new(offered_keys(vehicles)));
+        true
+    }
+}
+
+static SERVER_OFFERS: std::sync::Mutex<ServerOffers> = std::sync::Mutex::new(ServerOffers { session: 0, list: None });
+
+fn server_offers_state() -> std::sync::MutexGuard<'static, ServerOffers> {
+    SERVER_OFFERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The address to ask for the buses a server offers, for what the player joins: a server's
+/// web address, or a host's address (`host`, `host:port`, a port on this computer - its
+/// status page is found at that port, ten above it or 27025, see `omsi_net::ws::web_bases`).
+/// None for a search of the network or a session code: nobody to ask.
+fn offers_query_target(target: &str) -> Option<String> {
+    let t = target.trim();
+    if t.is_empty() || ["auto", "discover", "search"].iter().any(|w| t.eq_ignore_ascii_case(w)) {
+        return None;
+    }
+    if omsi_net::ws::ws_url(t).is_some() {
+        return Some(t.to_string());
+    }
+    if omsi_net::looks_like_code(t) {
+        return None;
+    }
+    if t.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(format!("127.0.0.1:{t}"));
+    }
+    Some(t.to_string())
+}
+
+/// A player joining a server asks it in the background which buses it offers, so that the
+/// game menu's "Place a vehicle" and "Swap" offer only those, as the launcher's bus step
+/// does: a whitelist in `server.cfg` was dodged by placing another bus in the game (#1183).
+fn ask_server_offers(target: &str, session: u64) {
+    let Some(target) = offers_query_target(target) else { return };
+    let _ = std::thread::Builder::new().name("server buses".into()).spawn(move || match omsi_net::ws::query(&target, false) {
+        Ok(i) if !i.vehicles.is_empty() => {
+            if server_offers_state().answer(session, &i.vehicles) {
+                log::info!("LAN: the server offers {} buses", i.vehicles.len());
+            }
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("LAN: the server did not say which buses it offers ({e}); every bus is offered"),
+    });
+}
+
+/// The buses the server we joined offers, as `bus_key`s (None: any, see `ServerOffers`).
+pub(crate) fn server_offers() -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+    server_offers_state().list.clone()
+}
+
+/// A vehicle file from its `Vehicles` folder on, in lower case and with forward slashes: a
+/// server names it as its `server.cfg` does, or under its own content folder.
+fn bus_key(s: &str) -> String {
+    let s = s.trim().replace('\\', "/").to_ascii_lowercase();
+    let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+    match parts.iter().rposition(|p| *p == "vehicles") {
+        Some(i) => parts[i..].join("/"),
+        None => parts.join("/"),
+    }
+}
+
+/// A server's bus list as the keys `offers` looks a bus up in.
+fn offered_keys(list: &[String]) -> std::collections::HashSet<String> {
+    list.iter().map(|v| bus_key(v)).collect()
+}
+
+/// Whether `bus` (a vehicle file as the game's lists name it, `Vehicles/<folder>/<file>`) is
+/// one of `offered` (see `server_offers`): the same file, in any case and with either slash.
+pub(crate) fn offers(offered: &std::collections::HashSet<String>, bus: &str) -> bool {
+    offered.contains(&bus_key(bus))
+}
+
 /// The port of the WebSocket gateway this game opened.
 fn port_of_gateway() -> Option<u16> {
     WS_PATH.lock().ok()?.as_ref()?.gateway.as_ref().map(|g| g.addr.port())
@@ -831,6 +980,17 @@ pub fn update_server_info(players: usize, time: &str, weather: &str) {
                 if !weather.is_empty() {
                     i.weather = weather.to_string();
                 }
+            }
+        }
+    }
+}
+
+/// A server run: its shared world now, for `GET /status`.
+pub fn update_server_world(world: omsi_net::ws::WorldCounts) {
+    if let Ok(w) = WS_PATH.lock() {
+        if let Some(g) = w.as_ref().and_then(|w| w.gateway.as_ref()) {
+            if let Ok(mut i) = g.info.lock() {
+                i.world = Some(world);
             }
         }
     }
@@ -874,6 +1034,8 @@ fn ws_join_target(url: &str) -> Result<String, String> {
 /// cannot be started is reported and the game runs on alone. A joining player waits
 /// briefly for the host's welcome, so that its map is loaded with the host's world.
 pub fn start(args: &Args) -> Option<LanSession> {
+    // (every bus offered until the server joined now says otherwise, see `ServerOffers`)
+    let offers_session = server_offers_state().reset();
     let world = world_info(args);
     let session = match (&args.lan_host, &args.lan_join) {
         (Some(port), _) => {
@@ -896,14 +1058,22 @@ pub fn start(args: &Args) -> Option<LanSession> {
             // a server's address (https://…, a trycloudflare name): over a WebSocket
             let direct = match omsi_net::ws::ws_url(target) {
                 Some(url) => match ws_join_target(&url) {
-                    Ok(local) => local,
+                    Ok(local) => {
+                        ask_server_offers(target, offers_session);
+                        local
+                    }
                     Err(e) => {
                         log::warn!("LAN: cannot reach '{target}': {e}");
                         write_failure(&format!("cannot reach '{target}': {e}"));
                         return None;
                     }
                 },
-                None => target.clone(),
+                // (an address over UDP: a server there answers at its web port too; a code
+                // or a search has nobody to ask)
+                None => {
+                    ask_server_offers(target, offers_session);
+                    target.clone()
+                }
             };
             match LanSession::join(&direct, &player_name(args), world, Duration::from_secs(3)) {
                 Ok(s) => Some(s),
@@ -1470,6 +1640,31 @@ fn relative_position(me: &omsi_sim::VehicleInstance, pose: &Pose) -> String {
     }
 }
 
+/// The other players for the navigator and the city map (#1011, #1080); `my_id` is ours.
+pub fn nav_players(game: &LanGame, my_id: u32) -> Vec<crate::navigator::NavPlayer> {
+    let bus_of = |id: u32| game.remotes.get(&id).map(|r| (r.vehicle.position, r.vehicle.heading));
+    let mut out: Vec<_> = game.remotes.values().filter_map(|r| nav_player(&r.last, &r.name, (r.vehicle.position, r.vehicle.heading), my_id, bus_of)).collect();
+    // (always in the same order: the tags of two players close together do not swap)
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// A player as the maps show them: with the bus they drive (`bus`: as drawn here), else on
+/// foot where they walk - riding in a third player's bus, with that bus (`bus_of`; the
+/// walker's own point lags behind it), and not at all in ours, which is our own arrow.
+fn nav_player(pose: &Pose, name: &str, bus: (DVec3, f64), my_id: u32, bus_of: impl Fn(u32) -> Option<(DVec3, f64)>) -> Option<crate::navigator::NavPlayer> {
+    let (position, heading) = match pose.walker {
+        None => bus,
+        Some(w) => match w.aboard {
+            Some(a) if a.owner == my_id => return None,
+            Some(a) => bus_of(a.owner).unwrap_or((DVec3::new(w.x, w.y, w.z), w.heading as f64)),
+            None => (DVec3::new(w.x, w.y, w.z), w.heading as f64),
+        },
+    };
+    let name = if name.trim().is_empty() { format!("player {}", pose.id) } else { name.trim().to_string() };
+    Some(crate::navigator::NavPlayer { position, heading, name })
+}
+
 /// The other players' name tags, as ETS2 has them: the name over the bus's roof and a
 /// small line under it (line and destination, how far away), fading out beyond 300 m.
 /// Screen positions in physical pixels of a `width` x `height` picture (on a triple-screen
@@ -1555,12 +1750,7 @@ pub fn name_tags(
 fn content_relative(path: &Path, root: &Path) -> String {
     let mut roots = omsi_cfg::content_roots();
     roots.push(root.to_path_buf());
-    for r in roots {
-        if let Ok(rel) = path.strip_prefix(&r) {
-            return rel.to_string_lossy().replace('\\', "/");
-        }
-    }
-    String::new()
+    crate::lan_world::relative_to_roots(path, &roots).unwrap_or_default()
 }
 
 /// The paint scheme `--paint` picked, by name.
@@ -1634,8 +1824,10 @@ fn line_and_destination(p: &Player, duty: Option<(&str, &str)>) -> (String, Stri
             .get(i as usize)
             .filter(|t| t.code != 0)
             .map(|t| {
+                // (its sign's first line; a blank one names nothing on the others' side)
                 t.strings
-                    .first()
+                    .iter()
+                    .find(|s| !s.trim().is_empty())
                     .cloned()
                     .unwrap_or_else(|| t.texture_id.clone())
             })
@@ -2281,9 +2473,7 @@ fn remote_type(
     player: Option<&Player>,
 ) -> Option<(Arc<omsi_sim::VehicleType>, bool)> {
     let allowed = crate::server::SERVER_VEHICLES.get().filter(|l| !l.is_empty());
-    let norm = |s: &str| s.trim().replace('\\', "/").to_ascii_lowercase();
-    let listed = allowed.map(|l| l.iter().any(|v| norm(v) == norm(&pose.bus) || norm(&pose.bus).ends_with(&norm(v)))).unwrap_or(true);
-    let loaded = if listed {
+    let loaded = if allowed.is_none_or(|l| crate::server::allows(l, &pose.bus)) {
         remote_bus_file(args, &pose.bus).and_then(|path| omsi_sim::VehicleType::load(&args.root, &path).map_err(|e| e.to_string()))
     } else {
         Err("the server does not offer it".to_string())
@@ -2426,6 +2616,10 @@ fn new_remote(
         samples: std::collections::VecDeque::new(),
         offset: None,
         play: Default::default(),
+        vars: None,
+        synced: Default::default(),
+        synced_strings: Default::default(),
+        smooth: Default::default(),
     })
 }
 
@@ -2771,8 +2965,78 @@ fn drive_remote(rv: &mut RemoteVehicle, pose: &Pose, dt: f32, exact: bool) {
         at_station_side: 0.0,
         priority_warning: false,
     };
+    // and every other variable of theirs, as their scripts have it (`omsi_net::vars`)
+    pinned.extend(rv.synced.iter().filter(|(id, _)| !rv.smooth.contains(*id)).map(|(id, v)| (*id as VarId, *v)));
     rv.vehicle.update_ai_with(dt, &frame, &inputs, &pinned);
+    for (id, text) in &rv.synced_strings {
+        if let Some(s) = rv.vehicle.state.str_vars.get_mut(*id as usize) {
+            if s != text {
+                s.clone_from(text);
+            }
+        }
+    }
     rv.last = pose.clone();
+}
+
+/// Our vehicle's variables to the others, and theirs taken into the copies drawn here.
+fn sync_vars(lan: &mut LanSession, game: &mut LanGame, player: Option<&Player>, dt: f32) {
+    if omsi_cfg::env::var_os("OMSI_NO_VAR_SYNC").is_some() {
+        return;
+    }
+    if let Some(p) = player {
+        let program = &p.vehicle.ty.program;
+        let key = Arc::as_ptr(program) as usize;
+        if game.my_vars.as_ref().map(|m| m.0) != Some(key) {
+            let t = var_table(program);
+            log::info!("LAN: {} variables and {} strings of our bus go to the others (table {:08x})", t.floats.len(), t.strings.len(), t.hash);
+            game.my_vars = Some((key, Arc::new(t)));
+        }
+        let t = game.my_vars.as_ref().map(|m| m.1.clone()).expect("just made");
+        let vars = &p.vehicle.state.vars;
+        let floats: Vec<f32> = t.floats.iter().map(|id| vars.get(*id as usize).copied().unwrap_or(0.0)).collect();
+        let strs = &p.vehicle.state.str_vars;
+        let strings: Vec<String> = t.strings.iter().map(|id| strs.get(*id as usize).cloned().unwrap_or_default()).collect();
+        lan.send_vars(t.hash, &t.floats, &floats, &t.strings, &strings, dt);
+        // `OMSI_DEBUG_VAR_SYNC=<variable>`: ours every two seconds, theirs as it came
+        if let Some(name) = omsi_cfg::env::var("OMSI_DEBUG_VAR_SYNC").ok() {
+            game.vars_log += dt;
+            if game.vars_log > 2.0 {
+                game.vars_log = 0.0;
+                log::info!("LAN vars: ours {name} = {:?}", p.vehicle.var(&name));
+                for (id, rv) in &game.remotes {
+                    let theirs = rv.vehicle.ty.program.var(&name).and_then(|k| rv.synced.get(&(k as u16)).copied());
+                    log::info!("LAN vars: player {id}'s {name} = {theirs:?} ({} variables, {} strings taken)", rv.synced.len(), rv.synced_strings.len());
+                }
+            }
+        }
+    }
+    for v in lan.take_vars() {
+        let Some(rv) = game.remotes.get_mut(&v.id) else { continue };
+        if rv.stand_in {
+            continue;
+        }
+        if rv.vars.is_none() {
+            let t = var_table(&rv.vehicle.ty.program);
+            let tbl = &rv.table;
+            rv.smooth = tbl.lamps.iter().chain(&tbl.switches).chain(&tbl.values).map(|(_, id)| *id as u16).chain(tbl.doors.iter().map(|id| *id as u16)).chain(tbl.engine_n.map(|id| id as u16)).collect();
+            rv.vars = Some(t);
+        }
+        let Some(t) = rv.vars.as_ref() else { continue };
+        if t.hash != v.table {
+            continue;
+        }
+        let (nf, ns) = (rv.vehicle.state.vars.len(), rv.vehicle.state.str_vars.len());
+        for (id, x) in v.floats {
+            if (id as usize) < nf && x.is_finite() {
+                rv.synced.insert(id, x);
+            }
+        }
+        for (id, s) in v.strings {
+            if (id as usize) < ns {
+                rv.synced_strings.insert(id, s);
+            }
+        }
+    }
 }
 
 /// The outside sounds of a remote bus: made when it comes into earshot, dropped beyond.
@@ -2908,6 +3172,7 @@ pub fn tick(
         }
     }
     let gone = lan.tick(dt, &mine);
+    sync_vars(lan, game, player.as_deref(), dt);
     game.world.tick(
         lan,
         dt,
@@ -3447,6 +3712,73 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every session starts with every bus offered: a server joined before (on a phone the
+    /// launcher and the game share one process) no longer limits a drive alone or the next
+    /// server, and an answer late for an ended session is dropped (#1183).
+    #[test]
+    fn a_new_session_forgets_the_last_servers_buses() {
+        let mut o = ServerOffers { session: 0, list: None };
+        let first = o.reset();
+        assert!(o.answer(first, &["Vehicles/MAN_SD200/MAN_SD77.bus".to_string()]));
+        assert!(o.list.as_ref().is_some_and(|l| offers(l, "Vehicles/MAN_SD200/MAN_SD77.bus")));
+        let second = o.reset();
+        assert!(o.list.is_none());
+        // (the first server's answer, late)
+        assert!(!o.answer(first, &["Vehicles/MAN_SD200/MAN_SD77.bus".to_string()]));
+        assert!(o.list.is_none());
+        assert!(o.answer(second, &["Vehicles/MAN_SD202/MAN_D92.bus".to_string()]));
+        assert!(o.list.as_ref().is_some_and(|l| !offers(l, "Vehicles/MAN_SD200/MAN_SD77.bus") && offers(l, "Vehicles/MAN_SD202/MAN_D92.bus")));
+    }
+
+    /// Whom a joining game asks for the buses offered: a server's web address, or a host's
+    /// address over UDP (its status page is found from there); nobody for a code or a search
+    /// (#1183).
+    #[test]
+    fn the_buses_offered_are_asked_at_an_address() {
+        assert_eq!(offers_query_target("https://abc.trycloudflare.com").as_deref(), Some("https://abc.trycloudflare.com"));
+        assert_eq!(offers_query_target(" 203.0.113.5:27015 ").as_deref(), Some("203.0.113.5:27015"));
+        assert_eq!(offers_query_target("bus.example.org").as_deref(), Some("bus.example.org"));
+        assert_eq!(offers_query_target("27015").as_deref(), Some("127.0.0.1:27015"));
+        assert_eq!(offers_query_target("auto"), None);
+        assert_eq!(offers_query_target(""), None);
+        let code = omsi_net::SessionCode { session: 0x1234_5678_9abc, port: 27015, ips: vec!["192.168.1.20".parse().unwrap()], protocol: omsi_net::PROTOCOL as u8 }.encode();
+        assert_eq!(offers_query_target(&code), None);
+    }
+
+    /// A server's `vehicles` list (as its `server.cfg` writes it, or every bus under its own
+    /// content folder) against the game's lists' `Vehicles/<folder>/<file>`: the same file
+    /// only (#1183).
+    #[test]
+    fn a_server_offers_the_buses_of_its_list_only() {
+        let list = offered_keys(&["Vehicles\\MAN_SD200\\MAN_SD77.bus".to_string(), "OMSI 2/Vehicles/MAN_SD202/MAN_D92.bus".to_string()]);
+        assert!(offers(&list, "Vehicles/MAN_SD200/MAN_SD77.bus"));
+        assert!(offers(&list, "vehicles/man_sd202/man_d92.bus"));
+        assert!(offers(&list, "Archives/pack.zip/Vehicles/MAN_SD202/MAN_D92.bus"));
+        assert!(!offers(&list, "Vehicles/MAN_SD200/MAN_SD83.bus"));
+        assert!(!offers(&list, "Vehicles/MAN_SD202/MAN_D86.bus"));
+        // (the same file name in another folder is another bus)
+        assert!(!offers(&list, "Vehicles/Mod_SD200/MAN_SD77.bus"));
+        assert!(!offers(&offered_keys(&[]), "Vehicles/MAN_SD200/MAN_SD77.bus"));
+    }
+
+    /// The maps show another player with their bus, on foot where they walk, riding in a
+    /// third player's bus with that bus, and not at all riding in ours (#1011, #1080).
+    #[test]
+    fn the_maps_show_a_player_where_they_are() {
+        let bus = (DVec3::new(100.0, 200.0, 5.0), 90.0);
+        let third = |id: u32| (id == 7).then_some((DVec3::new(-50.0, 10.0, 0.0), 180.0));
+        let mut pose = Pose { id: 3, ..Default::default() };
+        let p = nav_player(&pose, " Anna ", bus, 2, third).unwrap();
+        assert_eq!((p.position, p.heading, p.name.as_str()), (bus.0, 90.0, "Anna"));
+        pose.walker = Some(omsi_net::Walker { x: 1.0, y: 2.0, z: 3.0, heading: 45.0, ..Default::default() });
+        let p = nav_player(&pose, "", bus, 2, third).unwrap();
+        assert_eq!((p.position, p.heading, p.name.as_str()), (DVec3::new(1.0, 2.0, 3.0), 45.0, "player 3"));
+        pose.walker.as_mut().unwrap().aboard = Some(omsi_net::Aboard { owner: 7, ..Default::default() });
+        assert_eq!(nav_player(&pose, "Anna", bus, 2, third).unwrap().position, DVec3::new(-50.0, 10.0, 0.0));
+        pose.walker.as_mut().unwrap().aboard = Some(omsi_net::Aboard { owner: 2, ..Default::default() });
+        assert!(nav_player(&pose, "Anna", bus, 2, third).is_none());
+    }
 
     /// What is seen comes before what is heard in the capped values list: the AA-FR Agora
     /// L's sound variables filled it in name order before its roller blind's scroll.

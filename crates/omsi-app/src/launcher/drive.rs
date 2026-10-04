@@ -721,6 +721,19 @@ pub(super) fn default_livery_label(vehicle: &omsi_launcher_lib::VehicleInfo) -> 
     if vehicle.default_paint.trim().is_empty() { "Default paint" } else { vehicle.default_paint.trim() }
 }
 
+/// How many liveries a bus type with `repaints` has, as its Livery list counts them (its own
+/// paint and the repaints): beside each type in the list, as a family says how many types it
+/// has (#717).
+pub(super) fn liveries_text(repaints: usize) -> String {
+    let n = repaints + 1;
+    format!("{n} {}", omsi_ui::tr(if n == 1 { "livery" } else { "liveries" }))
+}
+
+/// A type of a bus family in its dropdown: the type and its liveries.
+fn variant_option(variant: &BusVariant) -> String {
+    format!("{} · {}", variant.variant, liveries_text(variant.paints))
+}
+
 fn variant_matches(variant: &BusVariant, q: &str) -> bool {
     q.is_empty() || variant.name.to_lowercase().contains(q) || variant.variant.to_lowercase().contains(q) || display_bus_name(&variant.file).to_lowercase().contains(q)
 }
@@ -815,7 +828,7 @@ fn step_bus(l: &mut Launcher, r: Rect) {
             let title = Rect::new(row.x + 42.0, row.y + 7.0, row.w - 78.0, 20.0);
             ui.text_in(&model.name, title, 13.0, Weight::Medium, TEXT, Align::Left);
             ui.tooltip(title, &model.name);
-            let subtitle = if model.variants.len() == 1 { omsi_ui::tr(&model.variants[0].variant).into_owned() }
+            let subtitle = if model.variants.len() == 1 { format!("{} · {}", omsi_ui::tr(&model.variants[0].variant), liveries_text(model.variants[0].paints)) }
             else if let Some(v) = selected { format!("{} · {} {}", omsi_ui::tr(&v.variant), model.variants.len(), omsi_ui::tr("models")) }
             else { format!("{} {}", model.variants.len(), omsi_ui::tr("models")) };
             let subtitle = if selected.is_some_and(|v| v.incomplete) { format!("{subtitle} · {}", omsi_ui::tr("PARTS MISSING")) }
@@ -840,7 +853,7 @@ fn step_bus(l: &mut Launcher, r: Rect) {
             if open {
                 let variants: Vec<&BusVariant> = model.variants.iter().filter(|variant| (q.is_empty() || model.name.to_lowercase().contains(&q) || variant.file == chosen || variant_matches(variant, &q)) && (!only || variant.file == chosen || is_fav(&variant.file))).collect();
                 let selected_index = variants.iter().position(|variant| variant.file == chosen);
-                let mut options: Vec<String> = variants.iter().map(|variant| variant.variant.clone()).collect();
+                let mut options: Vec<String> = variants.iter().map(|variant| variant_option(variant)).collect();
                 let offset = if selected_index.is_none() { options.insert(0, "Choose a bus".into()); 1 } else { 0 };
                 let mut sel = selected_index.unwrap_or(0);
                 ui.label(Rect::new(view.x + 38.0, y, view.w - 50.0, 22.0), "Type / variant");
@@ -861,7 +874,7 @@ fn step_bus(l: &mut Launcher, r: Rect) {
                     ui.tooltip(sr, if on { "Remove from the favourites" } else { "Add to the favourites" });
                 }
                 if let Some(variant) = selected {
-                    ui.tooltip(dropdown, &format!("{}\n{}\n{} {}", variant.name, variant.file, variant.paints, omsi_ui::tr("liveries")));
+                    ui.tooltip(dropdown, &format!("{}\n{}\n{}", variant.name, variant.file, liveries_text(variant.paints)));
                 }
                 y += ROW + 10.0;
             }
@@ -1571,6 +1584,19 @@ mod vehicle_picker_tests {
         let filtered = build_bus_manufacturers(&vehicles, Some(&allowed), &Default::default());
         assert_eq!(filtered[0].variants.len(), 1);
         assert_eq!(filtered[0].variants[0].file, vehicles[1].file);
+    }
+
+    /// Each type in a family's dropdown says how many liveries it has, as the Livery list
+    /// beside counts them: its own paint and its repaints (#717).
+    #[test]
+    fn each_bus_type_says_how_many_liveries_it_has() {
+        let mut one = vehicle("MAN_SD200", "MAN", "SD77", "sd77");
+        one.paints.clear();
+        let mut many = vehicle("MAN_SD200", "MAN", "SD78", "sd78");
+        many.paints = vec!["BVG".into(), "Werbung".into(), "Neu".into()];
+        let manufacturers = build_bus_manufacturers(&[one, many], None, &Default::default());
+        let options: Vec<String> = manufacturers[0].variants.iter().map(variant_option).collect();
+        assert_eq!(options, vec!["SD77 · 1 livery".to_string(), "SD78 · 4 liveries".to_string()]);
     }
 
     #[test]

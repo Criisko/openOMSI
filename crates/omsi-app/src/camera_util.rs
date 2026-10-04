@@ -296,8 +296,17 @@ const MIRROR_ASPECT: f32 = 1.6;
 /// mirrors, the kerb-side blind-spot mirrors and the door monitors of many buses looked into
 /// the saloon or at the sky.)
 pub(crate) fn mirror_view(v: &omsi_sim::VehicleInstance, c: &omsi_vehicle::Camera, eye: DVec3, off: [f32; 2]) -> omsi_vehicle::Camera {
-    let rot = v.body_rotation();
-    let at = v.position + rot.transform_point3(glam::Vec3::new(c.pos[0], c.pos[1], c.pos[2])).as_dvec3();
+    mirror_view_in(v.position, v.body_rotation(), c, eye, off)
+}
+
+/// [`mirror_view`] for a camera of a body at `position`, turned by `rot` (a rear section's).
+/// A `[add_camera_reflexion_static]` camera (`fixed`) is no mirror: it looks along its own
+/// yaw and pitch (and the player's turn of it), wherever the eye is.
+fn mirror_view_in(position: DVec3, rot: glam::Mat4, c: &omsi_vehicle::Camera, eye: DVec3, off: [f32; 2]) -> omsi_vehicle::Camera {
+    if c.fixed {
+        return omsi_vehicle::Camera { yaw: c.yaw + off[0], pitch: (c.pitch + off[1]).clamp(-89.0, 89.0), ..c.clone() };
+    }
+    let at = position + rot.transform_point3(glam::Vec3::new(c.pos[0], c.pos[1], c.pos[2])).as_dvec3();
     let d = rot.inverse().transform_vector3((at - eye).as_vec3());
     let Some(d) = d.try_normalize() else { return c.clone() };
     let (y, p) = ((c.yaw + off[0]).to_radians(), (c.pitch + off[1]).to_radians());
@@ -341,15 +350,27 @@ pub(crate) fn render_mirrors(
     // (aimed from the eye of the view being drawn, as Omsi.exe aims them - from the
     // driver's without one)
     let eye = view.as_ref().map(|v| v.0.position).unwrap_or_else(|| driver_eye(p));
-    let cams: Vec<omsi_vehicle::Camera> = p
-        .vehicle
-        .ty
-        .def
-        .cameras_reflexion
-        .iter()
-        .enumerate()
-        .map(|(i, c)| mirror_view(&p.vehicle, &adjusted(c, p.mirror_shifts.get(i).copied().unwrap_or([0.0; 3]), p.mirror_fovs.get(i).copied().unwrap_or(0.0)), eye, p.mirror_offsets.get(i).copied().unwrap_or([0.0; 2])))
-        .collect();
+    // the leading vehicle's cameras, then its rear sections' (openOMSI: numbered on from the
+    // last of the one in front, so a screen in the cab can show a camera on a rear door),
+    // each aimed and placed in its own body
+    let v = &p.vehicle;
+    let mut cams: Vec<(omsi_vehicle::Camera, (DVec3, f32, f32, f32))> = Vec::new();
+    let aim = |i: usize, c: &omsi_vehicle::Camera, position: DVec3, rot: glam::Mat4| {
+        let c = adjusted(c, p.mirror_shifts.get(i).copied().unwrap_or([0.0; 3]), p.mirror_fovs.get(i).copied().unwrap_or(0.0));
+        mirror_view_in(position, rot, &c, eye, p.mirror_offsets.get(i).copied().unwrap_or([0.0; 2]))
+    };
+    for c in &v.ty.def.cameras_reflexion {
+        let c = aim(cams.len(), c, v.position, v.body_rotation());
+        let at = v.camera_world_full(&c);
+        cams.push((c, at));
+    }
+    for t in &v.trailers {
+        for c in &t.ty.def.cameras_reflexion {
+            let c = aim(cams.len(), c, t.position, t.body_rotation());
+            let at = t.camera_world_full(&c);
+            cams.push((c, at));
+        }
+    }
     if cams.is_empty() {
         return 0;
     }
@@ -384,22 +405,23 @@ pub(crate) fn render_mirrors(
             *w *= k;
         }
     }
-    // the mirrors in the picture (all of them without a view); none in it, none redrawn
+    // the mirrors in the picture (all of them without a view); none in it, none redrawn (a
+    // static camera's screen is somewhere else than the camera: it always takes its turn)
     let seen: Vec<usize> = (0..cams.len())
-        .filter(|&i| view.as_ref().map(|v| mirror_in_view(p.vehicle.camera_world_full(&cams[i]).0, cams[i].extra.unwrap_or(0.0).max(MIRROR_MIN_RADIUS), v)).unwrap_or(true))
+        .filter(|&i| cams[i].0.fixed || view.as_ref().map(|v| mirror_in_view(cams[i].1 .0, cams[i].0.extra.unwrap_or(0.0).max(MIRROR_MIN_RADIUS), v)).unwrap_or(true))
         .collect();
     if seen.is_empty() {
         return 0;
     }
     let pick = only.map(|k| seen[k % seen.len()]);
-    for (i, c) in cams.iter().enumerate() {
+    for (i, (c, at)) in cams.iter().enumerate() {
         if !seen.contains(&i) || pick.is_some_and(|k| k != i) {
             continue;
         }
         let Some(Some(tex)) = textures.get(i) else {
             continue;
         };
-        let (eye, yaw, pitch, roll) = p.vehicle.camera_world_full(c);
+        let (eye, yaw, pitch, roll) = *at;
         let pitch = pitch.clamp(-89.0, 89.0);
         if omsi_cfg::env::var_os("OMSI_DEBUG_MIRRORS").is_some() {
             log::info!("mirror {i}: eye {:.2},{:.2},{:.2} yaw {yaw:.1} pitch {pitch:.1} roll {roll:.2} fov {:.0} ({} of {} in view)", eye.x, eye.y, eye.z, c.fov, seen.len(), cams.len());
@@ -420,4 +442,27 @@ pub(crate) fn render_mirrors(
         renderer.render_to_texture(scene, *tex, &cam, &lighting, MIRROR_ASPECT);
     }
     seen.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::{DVec3, Mat4};
+
+    /// A mirror's camera looks along the eye's ray reflected in its face; a static one looks
+    /// where it is pointed, wherever the eye is, turned by the player's offset.
+    #[test]
+    fn a_static_camera_does_not_follow_the_eye() {
+        let mirror = omsi_vehicle::Camera { pos: [1.2, 5.0, 2.0], fov: 30.0, yaw: 180.0, ..Default::default() };
+        let cctv = omsi_vehicle::Camera { fixed: true, yaw: 90.0, pitch: -40.0, ..mirror.clone() };
+        let views = |c: &omsi_vehicle::Camera| {
+            [DVec3::new(0.0, 4.0, 2.0), DVec3::new(-0.5, 3.0, 2.2)]
+                .map(|eye| super::mirror_view_in(DVec3::ZERO, Mat4::IDENTITY, c, eye, [0.0; 2]))
+                .map(|c| (c.yaw, c.pitch))
+        };
+        let [a, b] = views(&mirror);
+        assert!((a.0 - b.0).abs() > 1.0, "{a:?} {b:?}");
+        assert_eq!(views(&cctv), [(90.0, -40.0); 2]);
+        let turned = super::mirror_view_in(DVec3::ZERO, Mat4::IDENTITY, &cctv, DVec3::ZERO, [5.0, -60.0]);
+        assert_eq!((turned.yaw, turned.pitch), (95.0, -89.0));
+    }
 }

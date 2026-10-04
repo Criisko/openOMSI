@@ -634,7 +634,8 @@ outside in through open doors, underpasses echo (`[triggerbox_setreverb]`, a Sch
 **sun** from `timezone.txt` (zone, place, summer time); **grip** from `StreetCond` and the
 temperature (black ice); **nothing written into the original** (personnel files, key bindings);
 **particles** - `[smoke]` and `[particle_emitter]` (TRauch: exhaust, coolant, spray, chimneys,
-the fireworks) drawn with `Texture/rauch.tga`; **coronas** - z offset, rotating 0/1/2, inner
+the fireworks) drawn with `Texture/rauch.tga` (how Omsi.exe moves and draws them, and where a
+puff meets the road: FORMATS.md, Model); **coronas** - z offset, rotating 0/1/2, inner
 cone, star, double brightness; `[nomaplighting]`; **railways** - trains throw the switches
 (`[switchdir]`), signals from `signalroutes.cfg` (Signal/NextSignal), `train_*coupling`;
 `[blockpath]` conflicts; **ticket desk** - `[view_ticketselling]`/`[view_schedule]` cameras,

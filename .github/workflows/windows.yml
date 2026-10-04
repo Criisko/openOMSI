@@ -100,7 +100,17 @@ jobs:
           }
           Set-Content $file $patched -NoNewline
 
-          Add-Content Cargo.toml "`n# Lets ReShade load: see vendor/wgpu-hal/src/dx12/instance.rs`n[patch.crates-io]`nwgpu-hal = { path = `"vendor/wgpu-hal`" }`n"
+          # (the project keeps a [patch.crates-io] section of its own, for gpu-allocator: a
+          # second table of that name is a duplicate key and cargo refuses the whole file, so
+          # our entry goes inside the section that is there - or makes one when there is none)
+          $ours = "# Lets ReShade load: see vendor/wgpu-hal/src/dx12/instance.rs`nwgpu-hal = { path = `"vendor/wgpu-hal`" }`n"
+          $text = Get-Content Cargo.toml -Raw
+          if ($text -match '(?m)^\[patch\.crates-io\]\r?\n') {
+            $text = $text -replace '(?m)^(\[patch\.crates-io\]\r?\n)', "`$1$ours"
+          } else {
+            $text = $text + "`n[patch.crates-io]`n$ours"
+          }
+          Set-Content Cargo.toml $text -NoNewline
 
       # No --locked here: the [patch.crates-io] entry above changes Cargo.lock, so the build
       # has to be allowed to record that (one entry, wgpu-hal's source).
@@ -157,39 +167,23 @@ jobs:
           Get-ChildItem out
 
       # What this fork adds on top of the project is checked before anything is handed to
-      # anyone. The build above compiles happily with a setting's key, or a launcher row,
-      # quietly gone - and the nightly merge (.github/workflows/sync-upstream.yml) is where
-      # that could happen. A failure here publishes nothing, exactly like a merge that
-      # conflicts, so a silent loss is a red run and no update rather than a release
-      # without the feature.
+      # anyone: the DLSS change, which is the one thing left here that the project does not
+      # have (the ReShade workaround is the other, applied to wgpu above where nothing can
+      # lose it, and the head sway, the look smoothing and the cabin/outside key have gone
+      # upstream and are the project's own code now). The build compiles happily with a
+      # setting's key, or a launcher row, quietly gone - and the nightly merge
+      # (.github/workflows/sync-upstream.yml) is where that could happen. A failure here
+      # publishes nothing, exactly like a merge that conflicts, so a silent loss is a red run
+      # and no update rather than a release without the feature.
       - name: What the fork adds is still whole
         shell: pwsh
         run: |
           if (-not (Test-Path crates/omsi-render/src/dlss.rs)) { throw 'dlss.rs is gone' }
-          if (-not (Test-Path crates/omsi-app/src/head_idle.rs)) { throw 'head_idle.rs is gone' }
           $mentions = @{
             'dlss' = @(
               'crates/omsi-app/src/settings.rs',
               'crates/omsi-app/src/launcher/pages.rs',
               'crates/omsi-launcher-core/src/lib.rs'
-            )
-            'view_toggle_interior' = @(
-              'crates/omsi-app/src/input_script.rs',
-              'crates/omsi-app/src/launcher/pages.rs'
-            )
-            'look_smoothing_ms' = @(
-              'crates/omsi-app/src/settings.rs',
-              'crates/omsi-app/src/game_lists.rs',
-              'crates/omsi-app/src/launcher/pages.rs',
-              'crates/omsi-launcher-core/src/lib.rs'
-            )
-            'head_idle' = @(
-              'crates/omsi-app/src/settings.rs',
-              'crates/omsi-app/src/game_lists.rs',
-              'crates/omsi-app/src/launcher/pages.rs',
-              'crates/omsi-launcher-core/src/lib.rs',
-              'crates/omsi-app/src/app_events.rs',
-              'crates/omsi-app/src/player.rs'
             )
           }
           foreach ($needle in $mentions.Keys) {

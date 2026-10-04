@@ -223,15 +223,7 @@ fn host_action(app: &mut App, action: &str, by: Option<u32>) {
             }
         }
         "traffic" if arg.trim() == "clear" => {
-            // every AI vehicle off the road (the random traffic comes back by itself, the
-            // timetable's buses with their next departures)
-            if let (Some(t), Some(w), Some(r), Some(scene)) = (app.traffic.as_mut(), app.world.as_ref(), app.renderer.as_ref(), app.scene.as_mut()) {
-                let ids: Vec<u64> = t.cars.iter().filter(|c| !c.is_bus()).map(|c| c.id).collect();
-                for id in &ids {
-                    t.remove_car(w, r, scene, *id);
-                }
-                app.service_msg = Some((format!("{} AI vehicles taken off the road", ids.len()), 3.0));
-            }
+            clear_ai_traffic(app);
         }
         "traffic" => {
             if let Some(t) = app.traffic.as_mut() {
@@ -241,6 +233,19 @@ fn host_action(app: &mut App, action: &str, by: Option<u32>) {
             }
         }
         _ => log::info!("admin: unknown action '{action}'"),
+    }
+}
+
+/// Take the current random AI traffic off the road. Timetable buses are kept, and the
+/// configured random traffic target will populate the roads again normally.
+pub(crate) fn clear_ai_traffic(app: &mut App) {
+    if app.lan.as_ref().is_some_and(|l| l.role == Role::Client) {
+        app.service_msg = Some(("In a LAN session only the host can clear AI traffic".into(), 3.0));
+        return;
+    }
+    if let (Some(t), Some(w), Some(r), Some(scene)) = (app.traffic.as_mut(), app.world.as_ref(), app.renderer.as_ref(), app.scene.as_mut()) {
+        let removed = t.clear_random(w, r, scene);
+        app.service_msg = Some((format!("{removed} AI vehicles taken off the road"), 3.0));
     }
 }
 
@@ -435,6 +440,18 @@ pub(crate) fn command(app: &mut App, from: u32, text: &str) {
                 }
             }
         }
+        // (host → us) the server's dispatch takes the duty back: free drive, as the game menu's
+        // "end the duty"; the host hears `duty-off-ok` (there was one) or `duty-off-none`
+        "duty-off" if from == 1 => {
+            let had = app.duty.take().map(|d| format!("{} {}", d.line, d.tour));
+            log::info!("LAN: the server took our duty back ({})", had.as_deref().unwrap_or("we had none"));
+            if had.is_some() {
+                app.service_msg = Some(("The dispatch took the duty back: free drive".into(), 6.0));
+            }
+            if let Some(l) = app.lan.as_mut() {
+                l.command(1, if had.is_some() { "duty-off-ok" } else { "duty-off-none" });
+            }
+        }
         "admin-locked" if from == 1 => app.service_msg = Some(("Too many wrong admin passwords: try again later".into(), 4.0)),
         "admin-ok" if from == 1 => {
             app.is_admin = true;
@@ -462,11 +479,30 @@ pub(crate) struct ServerAdmin {
     /// An admin chose this weather (`Weather/….owt`, checked against the installed ones by
     /// the host loop).
     pub set_weather: Option<String>,
+    /// An admin's traffic order, for the host loop (`traffic <density>`, `traffic clear`).
+    pub traffic: Option<TrafficOrder>,
     /// The challenge each asking player was given (used once).
     challenges: std::collections::HashMap<u32, String>,
     /// When wrong answers came lately (the lock counts them, whoever sent them: a player
     /// who reconnects is somebody new).
     failures: Vec<std::time::Instant>,
+}
+
+/// A dedicated server admin's order for the AI traffic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum TrafficOrder {
+    Density(usize),
+    Clear,
+}
+
+impl TrafficOrder {
+    /// `clear`, or a density (held to 0 .. 100).
+    pub fn parse(arg: &str) -> Option<TrafficOrder> {
+        match arg.trim() {
+            "clear" => Some(TrafficOrder::Clear),
+            v => v.parse::<usize>().ok().map(|n| TrafficOrder::Density(n.min(100))),
+        }
+    }
 }
 
 /// Wrong answers within `LOCK_WINDOW` that lock the administration for everybody.
@@ -606,6 +642,19 @@ pub(crate) fn server_command(lan: &mut LanSession, from: u32, text: &str, adm: &
                         }
                     }
                 }
+                // the duty taken back from a player: `duty-off <id>` (see `command`)
+                "duty-off" => {
+                    if let Some(id) = id {
+                        lan.command(id, "duty-off");
+                    }
+                }
+                // the AI traffic: `traffic <density>` (as server.cfg's `traffic`) or `traffic
+                // clear` (every AI car off the road, a jam; the timetable's buses stay)
+                "traffic" => {
+                    if let Some(o) = TrafficOrder::parse(a) {
+                        adm.traffic = Some(o);
+                    }
+                }
                 "bringall" => {
                     if let Some((pos, h)) = positions(from) {
                         let ids: Vec<u32> = lan.peers().map(|p| p.pose.id).filter(|id| *id != from && *id != lan.my_id).collect();
@@ -640,6 +689,8 @@ pub(crate) fn server_command(lan: &mut LanSession, from: u32, text: &str, adm: &
         }
         // a player's game took the duty it was given (`duty`), or could not: said for the tool
         // that gave it
+        "duty-off-ok" => log::info!("server: player {from} left the duty"),
+        "duty-off-none" => log::info!("server: player {from} had no duty to leave"),
         "duty-ok" => log::info!("server: player {from} took duty {}", arg.trim()),
         "duty-no" => log::info!("server: player {from} could not take the duty: {}", arg.trim()),
         // a player's game showed a notification (`notify`): said for the tool that sent it
@@ -746,6 +797,22 @@ mod notice_target_tests {
         assert_eq!(notice_targets("1", [2, 5].into_iter(), 1), (vec![], true));
         // not a number: nobody
         assert_eq!(notice_targets("x", [2, 5].into_iter(), 1), (vec![], false));
+    }
+}
+
+#[cfg(test)]
+mod traffic_order_tests {
+    use super::TrafficOrder;
+
+    #[test]
+    fn a_traffic_order_is_read() {
+        assert_eq!(TrafficOrder::parse("clear"), Some(TrafficOrder::Clear));
+        assert_eq!(TrafficOrder::parse(" 20 "), Some(TrafficOrder::Density(20)));
+        assert_eq!(TrafficOrder::parse("0"), Some(TrafficOrder::Density(0)));
+        assert_eq!(TrafficOrder::parse("400"), Some(TrafficOrder::Density(100)));
+        for bad in ["", "next", "-5", "2.5"] {
+            assert_eq!(TrafficOrder::parse(bad), None, "{bad}");
+        }
     }
 }
 
