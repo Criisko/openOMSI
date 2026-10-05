@@ -47,7 +47,40 @@ is tagged `dlss-ours-2026-10-03`. Its `dlss.rs`, `upscale.wgsl`, `shader.wgsl` a
 `.github/workflows/sync-upstream.yml` merges the project's `main` into this fork's `main`
 every night; a merge that conflicts fails that job and leaves the fork exactly where it was.
 Before `.github/workflows/windows.yml` publishes anything, it checks that what this fork adds
-is still whole - the DLSS file, the keys that carry it where they are read, the view toggle,
-the look smoothing, and the project's own two contracts (the settings round trip, and every
-launcher row named in `by_tab()`). A failure there publishes nothing, so a merge that silently
-dropped part of a change is a red run and no update, rather than a release without the feature.
+is still whole: `crates/omsi-render/src/dlss.rs` is there, the word `dlss` still appears in the
+three files that read or write the setting (`crates/omsi-app/src/settings.rs`,
+`crates/omsi-app/src/launcher/pages.rs`, `crates/omsi-launcher-core/src/lib.rs`), and the
+project's own two contracts pass (the settings round trip, and every launcher row named in
+`by_tab()`). A failure there publishes nothing, so a merge that silently dropped part of a
+change is a red run and no update, rather than a release without the feature.
+
+## The pieces a merge has to keep
+
+The files are listed in `FORK.md`; these are the pieces inside them, which is what a conflict
+or a merge that reads suspiciously should be checked against.
+
+- `crates/omsi-render/src/dlss.rs` - the whole runtime: Streamline's DLLs loaded from beside
+  the game, the swap chain watched, the options set, and the present paced.
+- `crates/omsi-render/src/lib.rs` - `DlssMode` and its round trip, `RenderOptions::dlss`,
+  `DlssState` and `DlssPipelines`, the motion pipelines (`dlss_pipes`, `make`, the sky pass),
+  and the `prev_models` swap in `arrays_as_textures`.
+- `crates/omsi-render/src/shader.wgsl` - the entry points `vs_motion`, `fs_motion`,
+  `fs_motion_test`, `fs_motion_transmap`, `vs_motion_sky`, `fs_motion_sky`, the `motion`
+  uniform block, `@group(3) @binding(1) prev_models`, and `motion_pixels()`.
+- `crates/omsi-render/src/upscale.wgsl` - the upscale's mode 2.
+- `crates/omsi-render/Cargo.toml` - the `windows` features (`Win32_Graphics_Dxgi_Common`,
+  `Direct3D12`, `System_LibraryLoader`), `windows-core`, and `wgpu-hal` with `dx12`.
+- `crates/omsi-app/src/settings.rs` - `pub dlss: String`, `dlss_mode()` with its `OMSI_DLSS`
+  override, the `dlss: "off"` default, the `dlss={}` line the file is written with, and the
+  arm that parses it back (which clamps anything unknown to `off`).
+- `crates/omsi-app/src/launcher/pages.rs` - `dlss_on()`, `aa_setting()` (the row that offers
+  MSAA or DLSS / DLAA), the `s-dlss` quality row, which takes the render scale row's place,
+  and the `s-dlss` id in `by_tab()`.
+- `crates/omsi-app/src/startup.rs` - DirectX 12 is wanted when the headset or DLSS asks for it.
+- `crates/omsi-app/src/launcher/mod.rs` - the showroom's `RenderOptions` turns DLSS off.
+- `crates/omsi-launcher-core/src/lib.rs` - `dlss_mode()`, the default in the options list, the
+  arm that reads the file's value, the line that is written back, and
+  `dlss_settings_round_trip`.
+- `crates/omsi-app/locales/app.yml` - the strings, in every language the launcher has.
+- `docs/USER_GUIDE.md` - what the player is told about the setting and the DLLs beside the
+  game.

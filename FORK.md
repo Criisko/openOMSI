@@ -44,6 +44,47 @@ The fork keeps the project's own pipeline (`.github/workflows/release.yml`) rena
 have, and the project's release job waits for every platform - so one missing secret would mean
 no release at all.
 
+## What this fork adds, file by file
+
+`git diff --stat origin/main...HEAD` is the whole answer - 23 files in October 2026 - and this
+is what each of them is for. Anything not on this list is the project's own code, so a merge
+that turns up a difference somewhere else has found something to read rather than to keep.
+
+**DLSS**, kept here on purpose (`FORK-DLSS.md` says what it is and where it touches the
+project):
+
+| file | what is there |
+|---|---|
+| `crates/omsi-render/src/dlss.rs` | the runtime - new file |
+| `crates/omsi-render/src/lib.rs` | the mode, the pipeline state, the motion prepass, the upscaler |
+| `crates/omsi-render/src/shader.wgsl` | the motion entry points the prepass draws with |
+| `crates/omsi-render/src/upscale.wgsl` | the upscale pass's DLSS path |
+| `crates/omsi-render/Cargo.toml` | the Windows features and the crates it needs |
+| `crates/omsi-app/src/settings.rs` | the setting, its spelling and its round trip |
+| `crates/omsi-app/src/launcher/pages.rs` | the row that offers it, in place of the render scale |
+| `crates/omsi-app/src/startup.rs` | DirectX 12 when it is on |
+| `crates/omsi-app/src/launcher/mod.rs` | the showroom draws without it |
+| `crates/omsi-app/locales/app.yml` | the strings |
+| `crates/omsi-launcher-core/src/lib.rs` | the mode where the launcher reads and writes it |
+| `docs/USER_GUIDE.md`, `CHANGELOG.md` | what the player is told |
+
+**This fork's own pipeline**, so that a build from here updates itself and carries the
+workaround:
+
+| file | what is there |
+|---|---|
+| `.github/workflows/windows.yml` | the release: the ReShade workaround, the check that all of the above is still whole, the zip |
+| `.github/workflows/sync-upstream.yml` | the nightly merge of the project's `main` |
+| `.github/workflows/release.yml.off` | the project's own release, renamed away |
+| `.gitattributes` | the changelog merges as a union, the settings may not, and why |
+| `crates/omsi-app/src/updater.rs` | the update check asks this fork's releases |
+| `crates/omsi-app/src/launcher/update.rs` | the repository it shows the player |
+| `Cargo.lock` | the crates `omsi-render` gained for DLSS |
+
+**These documents**: `FORK.md`, `FORK-DLSS.md`, `FORK-DLSS.patch`, `FORK-MERGE.md`.
+
+Bringing the project's latest onto this fork is written down step by step in `FORK-MERGE.md`.
+
 ## Upstream
 
 The real project, with the issues, the documentation and the discussions:
