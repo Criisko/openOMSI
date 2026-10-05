@@ -11883,6 +11883,9 @@ fn arrays_as_textures(src: &str, path: ArrayPath) -> String {
     swap("var<storage, read> models: array<vec4<f32>>;", load("models", "f32", ""), "models", "models_at");
     swap("var<storage, read> inst_params: array<vec4<f32>>;", load("inst_params", "f32", ""), "inst_params", "inst_params_at");
     swap("var<storage, read> draw_list: array<u32>;", load("draw_list", "u32", ".x"), "draw_list", "draw_list_at");
+    // (last frame's matrices, which the DLSS motion pass reads: the same rule applies there, since
+    // a vertex stage on those chips cannot read a storage buffer either)
+    swap("var<storage, read> prev_models: array<vec4<f32>>;", load("prev_models", "f32", ""), "prev_models", "prev_models_at");
     if path == ArrayPath::NoStorage {
         swap(
             "@group(0) @binding(3) var<storage, read> lights: array<PointLight>;",
