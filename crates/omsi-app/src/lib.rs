@@ -11,10 +11,10 @@
 
 mod admin;
 mod discord;
-mod head_idle;
 #[cfg(steam)]
 mod steam;
 mod voice;
+mod head_idle;
 mod headtrack;
 #[cfg(windows)]
 mod openxr;
