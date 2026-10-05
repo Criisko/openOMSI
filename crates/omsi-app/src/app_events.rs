@@ -224,6 +224,7 @@ impl ApplicationHandler for App {
                     return;
                 }
                 self.mouse_look = state == ElementState::Pressed;
+                self.mmb_held = state == ElementState::Pressed;
                 self.update_hover();
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -682,9 +683,8 @@ impl ApplicationHandler for App {
                 ctl.ff_engine = self.settings.ff_engine_vib;
                 ctl.ff_fade = self.settings.ff_fade;
                 ctl.steer_gain = if self.settings.wheel_lock >= 45.0 { (self.settings.wheel_range / self.settings.wheel_lock).clamp(0.1, 20.0) } else { 1.0 };
-                if ctl.disabled.is_empty() && !self.settings.ctrl_off.is_empty() {
-                    ctl.disabled = self.settings.ctrl_off.split('|').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                }
+                ctl.disabled = self.settings.ctrl_off.split('|').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                ctl.set_editing(self.game_menu.is_some() || self.chooser.is_some());
                 let analog = ctl.poll();
                 let actions = std::mem::take(&mut ctl.actions);
                 let moved = match (analog.steering, self.last_ctl_steer) {
@@ -736,6 +736,7 @@ impl ApplicationHandler for App {
                     micro: 0.0,
                     dt,
                 });
+                crate::game_controller_menu::frame(self);
                 // OMSI's mouse control: the cursor's place across steers, above the middle
                 // of the window is the throttle, below it the brake.
                 // Steering as Omsi.exe has it (0x6f4284..0x6f447b): the whole width of the
@@ -844,9 +845,11 @@ impl ApplicationHandler for App {
                 // the controller's view buttons are the game's, not the bus's: looking around
                 // while held (`view_look_*`), and OMSI's view actions (other cameras, views)
                 let mut actions = actions;
-                if self.game_menu.is_none() {
+                {
+                    let menu_open = self.game_menu.is_some() || self.chooser.is_some();
                     let mut game: Vec<String> = Vec::new();
                     actions.retain(|(name, down)| {
+                        if menu_open && *down { return false; }
                         let n = name.to_ascii_lowercase();
                         if let Some(k) = ["view_look_left", "view_look_right", "view_look_up", "view_look_down"].iter().position(|x| *x == n) {
                             self.pad_look[k] = *down;
@@ -880,8 +883,8 @@ impl ApplicationHandler for App {
                     p.axes.red_steer_spd = self.settings.red_steer_spd;
                     p.axes.pedal_hold = self.settings.brake_hold;
                     p.analog = analog;
-                    if self.game_menu.is_none() {
-                        for (name, down) in actions {
+                    for (name, down) in actions {
+                        if !down || (self.game_menu.is_none() && self.chooser.is_none()) {
                             p.action(&name, down);
                         }
                     }
@@ -1039,6 +1042,7 @@ impl ApplicationHandler for App {
                                 look,
                                 &self.view,
                                 self.settings.seat_pitch_deg,
+                                vr_on,
                             );
                             // what turns the bus's own camera into the picture: the head's turn,
                             // the field of view setting and the zoom (for the camera left in a
@@ -1414,6 +1418,10 @@ impl ApplicationHandler for App {
                         self.career.stop_served(arrival, departure);
                     }
                     crate::journey::note(&mut self.journey, d, due, served, &self.args.root, || crate::journey::head(&self.career, &w.global.name, &p.vehicle, &self.clock));
+                    if let Some((count, due_at, at)) = d.take_skipped() {
+                        use omsi_plugin::InfoValue::Num;
+                        crate::plugins::queue_event(&mut self.plugin_events, "stops_skipped", vec![Num(count as f64), Num(due_at as f64), Num(at as f64)]);
+                    }
                     if d.take_trip_change() && p.duty_typed {
                         let (trip, stop) = d.trip_for_ibis();
                         p.set_duty_destination(trip, stop);
@@ -1440,6 +1448,9 @@ impl ApplicationHandler for App {
                     if crash > 0.0 {
                         self.career.crashed(crash, p.vehicle.physics.velocity_kmh() / 3.6);
                         self.service_msg = Some((format!("Crash: {:.0} kJ", crash / 1000.0), 6.0));
+                        use omsi_plugin::InfoValue::Num;
+                        let args = vec![Num(crash as f64 / 1000.0), Num(p.vehicle.physics.velocity_kmh().abs() as f64)];
+                        crate::plugins::queue_event(&mut self.plugin_events, "crash", args);
                     }
                 }
                 if !self.paused {
@@ -1509,6 +1520,7 @@ impl ApplicationHandler for App {
                 if !plugins.is_empty() && !self.paused {
                     let info = crate::plugins::game_info(self);
                     let keys = std::mem::take(&mut self.plugin_keys);
+                    let events = std::mem::take(&mut self.plugin_events);
                     let plugins = self.plugins.as_mut().unwrap();
                     // the vehicles around it: the AI traffic and the other players' buses
                     let mut others: Vec<(u64, &'static str, &mut omsi_sim::VehicleInstance)> = Vec::new();
@@ -1516,7 +1528,7 @@ impl ApplicationHandler for App {
                         others.extend(t.cars.iter_mut().map(|c| (c.id, "ai", &mut c.vehicle)));
                     }
                     others.extend(self.remotes.remotes.iter_mut().map(|(id, r)| ((1u64 << 48) | *id as u64, "player", r.vehicle_mut())));
-                    let mut io = crate::plugins::Io { vehicle: self.player.as_mut().map(|p| &mut p.vehicle), others, dt, message: None, info, commands: Vec::new(), keys };
+                    let mut io = crate::plugins::Io { vehicle: self.player.as_mut().map(|p| &mut p.vehicle), others, dt, message: None, info, commands: Vec::new(), keys, events };
                     plugins.frame(&mut io);
                     let commands = std::mem::take(&mut io.commands);
                     if let Some(m) = io.message {
@@ -1540,6 +1552,10 @@ impl ApplicationHandler for App {
                     }
                 } else {
                     self.plugin_keys.clear();
+                    // (while the game is paused they wait for the next frame)
+                    if self.plugins.as_ref().is_none_or(|p| p.is_empty()) {
+                        self.plugin_events.clear();
+                    }
                 }
                 // OMSI_WATCH_VARS=a,b: every change of those variables of the player's bus
                 if let (Some(p), Ok(list)) = (self.player.as_ref(), omsi_cfg::env::var("OMSI_WATCH_VARS")) {
@@ -1568,6 +1584,7 @@ impl ApplicationHandler for App {
                     if hurt > 0 {
                         self.career.crashes[1] += hurt as i32;
                         self.service_msg = Some(("Pedestrian knocked down!".into(), 6.0));
+                        crate::plugins::queue_event(&mut self.plugin_events, "pedestrian", vec![omsi_plugin::InfoValue::Num(hurt as f64)]);
                     }
                 }
                 // looking around and zooming work in every view, not only the free camera
@@ -2355,6 +2372,7 @@ impl ApplicationHandler for App {
                             info_room: self.touch.info_room.filter(|_| self.touch.enabled),
                             tutorial: self.tutorial.as_ref().filter(|t| !t.hidden && self.game_menu.is_none()).and_then(|t| t.page().map(|p| (p.title.as_str(), p.text.as_str(), p.image.as_deref(), t.at, t.pages.len()))),
                             chat,
+                            chat_size: self.settings.chat_size,
                             tags,
                             notices: &self.notices,
                             notice_anchor: self.navigator.as_ref().and_then(|n| n.screen_rect()),
@@ -2945,7 +2963,13 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // the server sent us away (kick, ban): the game ends, the launcher says why
+        if self.lan.as_ref().and_then(crate::lan::turned_away).is_some() {
+            self.finish_session();
+            crate::platform::exit(event_loop);
+            return;
+        }
         crate::game_lists::flush_settings(false);
         if self.mouse_edge != 0.0 && !self.mouse_drive {
             self.mouse_edge = 0.0;
@@ -3032,6 +3056,13 @@ impl App {
         // the wheel over the chat (or while typing) scrolls its history
         if let Some(ui) = self.ui.as_mut() {
             if self.lan.is_some() && (ui.chat.hovered || lan::chat_open(&self.remotes)) {
+                // Ctrl + the wheel makes the chat larger or smaller (kept for the next game)
+                if self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight) {
+                    let to = ((self.settings.chat_size + amount.signum() * 0.1) * 10.0).round() / 10.0;
+                    self.settings.chat_size = to.clamp(0.5, 3.0);
+                    crate::game_lists::remember_setting("chat_size", &self.settings.chat_size.to_string());
+                    return;
+                }
                 ui.chat.wheel(self.remotes.chat.lines.len(), amount);
                 return;
             }

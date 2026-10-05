@@ -17,6 +17,17 @@ pub enum RenderType {
     AfterVehicles,
 }
 
+impl RenderType {
+    /// Drawn as a layer of the ground (`presurface`, `surface`, `on_surface`). The numbered
+    /// types (1, 3, 4) only say when an object is drawn - before the others, after them,
+    /// after the vehicles - and are standing objects like any other: the lamp posts, the
+    /// traffic light poles and the shelters of many mods say `3`, and taken as ground they
+    /// cast no shadow and had the terrain cut away under them.
+    pub fn is_ground_layer(self) -> bool {
+        matches!(self, RenderType::PreSurface | RenderType::Surface | RenderType::OnSurface)
+    }
+}
+
 /// Parse the OMSI `[rendertype]` spelling used by both a .sco and its model.cfg.
 pub fn parse_render_type(value: &str) -> RenderType {
     match value.trim().to_ascii_lowercase().as_str() {

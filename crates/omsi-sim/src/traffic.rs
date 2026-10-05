@@ -1482,9 +1482,9 @@ pub struct TrafficLightController {
     pub request: Vec<bool>,
     /// The clock waits at a stop point.
     pub held: bool,
-    /// A stop point the clock has just been let past without moving (it is not asked again
-    /// at the same instant).
-    passed: Option<usize>,
+    /// Points already let past at this instant. Remember all of them so coincident
+    /// inactive points cannot keep making one another eligible again.
+    passed: Vec<usize>,
     /// A short backwards jump has replayed its stretch once. Do not take it again before
     /// the clock has moved past its source time.
     rewound: Option<usize>,
@@ -1494,7 +1494,7 @@ pub struct TrafficLightController {
 impl TrafficLightController {
     pub fn new(lights: Vec<Vec<(i32, f32)>>, cycle: f32) -> TrafficLightController {
         let n = lights.len();
-        TrafficLightController { lights, cycle, offset: 0.0, approach: vec![None; n], stops: Vec::new(), time: 0.0, request: vec![false; n], held: false, passed: None, rewound: None, started: false }
+        TrafficLightController { lights, cycle, offset: 0.0, approach: vec![None; n], stops: Vec::new(), time: 0.0, request: vec![false; n], held: false, passed: Vec::new(), rewound: None, started: false }
     }
 
     /// From the `[traffic_light]` program of a crossing object: (per light: name, phases
@@ -1549,8 +1549,9 @@ impl TrafficLightController {
                 this.rewound = None;
             }
         };
-        // a handful of points per frame at most (a jump may land just before another one)
-        for _ in 0..16 {
+        // Allow every coincident inactive point without losing this frame's time,
+        // but still bound authored jump loops.
+        for _ in 0..16 + self.stops.len() {
             let mut best: Option<(usize, f64)> = None;
             for (k, p) in self.stops.iter().enumerate() {
                 if self.rewound == Some(k) {
@@ -1558,7 +1559,7 @@ impl TrafficLightController {
                 }
                 let d = (p.time as f64 - self.time).rem_euclid(cycle);
                 let d = if d > cycle - 1e-6 { 0.0 } else { d };
-                if d < 1e-6 && self.passed == Some(k) {
+                if d < 1e-6 && self.passed.contains(&k) {
                     continue;
                 }
                 if d <= left && best.map(|b| d < b.1).unwrap_or(true) {
@@ -1568,13 +1569,13 @@ impl TrafficLightController {
             let Some((k, d)) = best else {
                 if left > 0.0 {
                     clear_rewind(self, left);
-                    self.passed = None;
+                    self.passed.clear();
                 }
                 self.time = (self.time + left).rem_euclid(cycle);
                 return;
             };
             if d > 1e-6 {
-                self.passed = None;
+                self.passed.clear();
             }
             clear_rewind(self, d);
             self.time = (self.time + d).rem_euclid(cycle);
@@ -1583,7 +1584,7 @@ impl TrafficLightController {
             let asked = self.request.get(p.light).copied().unwrap_or(false);
             let active = if p.if_request { !asked } else { asked };
             if !active {
-                self.passed = Some(k);
+                self.passed.push(k);
                 continue;
             }
             match p.jump_to {
@@ -1592,7 +1593,7 @@ impl TrafficLightController {
                     // a loop: after replaying that small stretch, continue through it.
                     self.rewound = (to > 1e-6 && to < p.time - 1e-6).then_some(k);
                     self.time = (to as f64).rem_euclid(cycle);
-                    self.passed = None;
+                    self.passed.clear();
                     if left <= 0.0 {
                         return;
                     }
@@ -1600,7 +1601,7 @@ impl TrafficLightController {
                 None => {
                     self.time = p.time as f64;
                     self.held = true;
-                    self.passed = None;
+                    self.passed.clear();
                     return;
                 }
             }
@@ -2823,6 +2824,86 @@ mod tests {
             c.advance(0.1);
         }
         assert_eq!(c.state(0), 9, "the clock left the replayed green");
+    }
+
+    #[test]
+    fn simultaneous_inactive_events_do_not_stall_the_cycle() {
+        let mut c = TrafficLightController::from_program(
+            vec![(vec![(0, 4.0), (6, 16.0)], None); 2],
+            Some(20.0),
+            &[[0.0, 4.0, 0.0]],
+            &[[1.0, 4.0, 0.0, 12.0]],
+        );
+        c.start(0.0);
+        c.advance(5.0);
+        assert_eq!(c.time, 5.0);
+        assert_eq!(c.state(0), 6);
+        for _ in 0..40 {
+            c.advance(1.0);
+        }
+        assert_eq!(c.time, 5.0, "the clock completes later cycles too");
+        assert!(!c.held);
+    }
+
+    #[test]
+    fn simultaneous_inactive_events_do_not_hide_a_later_active_jump() {
+        let mut c = TrafficLightController::from_program(
+            vec![(vec![(0, 4.0), (6, 16.0)], None); 3],
+            Some(20.0),
+            &[[0.0, 4.0, 0.0]],
+            &[[1.0, 4.0, 0.0, 9.0], [2.0, 4.0, 0.0, 12.0]],
+        );
+        c.request[2] = true;
+        c.start(0.0);
+        c.advance(5.0);
+        assert_eq!(c.time, 13.0, "take the jump and consume the remaining second");
+        assert!(!c.held);
+    }
+
+    #[test]
+    fn simultaneous_stops_release_and_are_checked_on_the_next_cycle() {
+        let mut c = TrafficLightController::from_program(
+            vec![(vec![(0, 4.0), (6, 16.0)], None); 3],
+            Some(20.0),
+            &[[0.0, 4.0, 0.0], [1.0, 4.0, 0.0], [2.0, 4.0, 0.0]],
+            &[],
+        );
+        c.request[2] = true;
+        c.start(0.0);
+        c.advance(5.0);
+        assert_eq!(c.time, 4.0);
+        assert!(c.held);
+        c.advance(1.0);
+        assert_eq!(c.time, 4.0, "an active stop remains held next frame");
+        c.request[2] = false;
+        c.advance(1.0);
+        assert_eq!(c.time, 5.0);
+        assert!(!c.held);
+        c.advance(16.0);
+        assert_eq!(c.time, 1.0);
+        c.request[2] = true;
+        c.advance(4.0);
+        assert_eq!(c.time, 4.0, "the released stop is evaluated after wrapping");
+        assert!(c.held);
+    }
+
+    #[test]
+    fn many_simultaneous_inactive_events_consume_the_frame_time() {
+        let mut c = TrafficLightController::new(vec![vec![(0, 4.0), (6, 16.0)]], 20.0);
+        c.stops = vec![
+            LightStop {
+                light: 0,
+                time: 4.0,
+                if_request: false,
+                jump_to: None,
+            };
+            33
+        ];
+        c.start(4.0);
+        c.advance(0.25);
+        assert_eq!(c.time, 4.25, "the inactive group must not exhaust the event budget");
+        assert_eq!(c.state(0), 6);
+        assert!(!c.held);
     }
 
     #[test]

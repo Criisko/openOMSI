@@ -799,6 +799,14 @@ mod tests {
         v.set_server(Some(VoiceServer { server_uid: "UID".into(), channel: "7".into(), password: String::new(), range: 20.0 }));
         v.tick(0.1, ("Max", 1), None, &[]);
         let (mut conn, _) = listener.accept().unwrap();
+        // Follow the plugin protocol: read hello before refusing. Closing with the
+        // client's unread hello can reset the TCP connection on Windows and discard
+        // the refusal before the game sees it.
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut first = String::new();
+        BufReader::new(conn.try_clone().unwrap()).read_line(&mut first).unwrap();
+        let hello: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(hello["type"], "hello");
         conn.write_all(b"{\"type\":\"refused\",\"error\":\"another openOMSI game is already linked\"}\n").unwrap();
         drop(conn);
         let deadline = Instant::now() + Duration::from_secs(5);

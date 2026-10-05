@@ -32,6 +32,62 @@ pub struct Daylight {
     /// envir.cfg's three light colours relative to the stock file's at this sun altitude
     /// (A, B, C; 1 = stock): the enhanced renderer tints its physical sky with them.
     pub envir_tint: [Vec3; 3],
+    /// Unit vector towards the moon (x east, y north, z up).
+    pub moon_dir: Vec3,
+    /// How much of the moon's disc is lit (0 new moon .. 1 full moon).
+    pub moon_illum: f32,
+    /// The day of the year (1..366) and the map's latitude (degrees north): the season.
+    pub day_of_year: f32,
+    pub latitude: f32,
+    /// One number per calendar day: what the enhanced renderer draws the day's own air
+    /// from (how clear or hazy it is), so that no two days look quite alike.
+    pub day_seed: u32,
+}
+
+/// Days since 2000-01-01 12:00 UTC (J2000) for the map clock at `place`.
+fn days_j2000(clock: &SimClock, place: &SunPlace) -> f64 {
+    let y = clock.year;
+    // whole days from 2000-01-01 to the start of this year
+    let mut days = 0i64;
+    if y >= 2000 {
+        for yy in 2000..y {
+            days += crate::clock::days_in_year(yy) as i64;
+        }
+    } else {
+        for yy in y..2000 {
+            days -= crate::clock::days_in_year(yy) as i64;
+        }
+    }
+    let utc_hours = clock.time / 3600.0 - place.timezone - place.dst_hours(clock);
+    days as f64 + (clock.day_of_year - 1) as f64 + utc_hours / 24.0 - 0.5
+}
+
+/// The moon's altitude, azimuth (degrees; azimuth clockwise from north) and lit fraction
+/// for the map clock at `place`: a low-precision lunar theory (the main terms of the
+/// longitude and latitude, about half a degree), which is all a sky needs.
+pub fn moon_position(clock: &SimClock, place: &SunPlace) -> (f64, f64, f64) {
+    let d = days_j2000(clock, place);
+    let rad = |x: f64| x.to_radians();
+    let l = 218.316 + 13.176_396 * d;
+    let m = 134.963 + 13.064_993 * d;
+    let f = 93.272 + 13.229_350 * d;
+    let lon = rad(l + 6.289 * rad(m).sin());
+    let lat = rad(5.128 * rad(f).sin());
+    let eps = rad(23.439);
+    let ra = (lon.sin() * eps.cos() - lat.tan() * eps.sin()).atan2(lon.cos());
+    let dec = (lat.sin() * eps.cos() + lat.cos() * eps.sin() * lon.sin()).asin();
+    let gmst = 280.460_618_37 + 360.985_647_366_29 * d;
+    let ha = rad(gmst + place.longitude) - ra;
+    let phi = rad(place.latitude);
+    let sin_alt = phi.sin() * dec.sin() + phi.cos() * dec.cos() * ha.cos();
+    let alt = sin_alt.clamp(-1.0, 1.0).asin();
+    let az = (-ha.sin()).atan2(dec.tan() * phi.cos() - phi.sin() * ha.cos());
+    // the sun's ecliptic longitude, for the phase
+    let g = rad(357.529 + 0.985_600_28 * d);
+    let sun_lon = rad(280.459 + 0.985_647_36 * d) + rad(1.915) * g.sin() + rad(0.020) * (2.0 * g).sin();
+    let elong = (lat.cos() * (lon - sun_lon).cos()).clamp(-1.0, 1.0).acos();
+    let illum = (1.0 - elong.cos()) * 0.5;
+    (alt.to_degrees(), az.to_degrees().rem_euclid(360.0), illum)
 }
 
 /// Where the map lies and how its clocks run, from its `timezone.txt` (OMSI
@@ -169,7 +225,31 @@ impl Daylight {
         // (FUN_006ff1bc), the same value at which a scenery object's NightlightA does
         let brightness = ((alt + 6.0) / 12.0).clamp(0.0, 1.0);
         let light_a = ((a.x + a.y + a.z) / 3.0).clamp(0.0, 1.0);
-        Daylight { sun_dir, altitude_deg: alt, sun_color, secondary, ambient, sky, night, lamps_on: brightness < 0.6, brightness, light_a, azimuth_rad: az.to_radians() as f32, sky_weights, envir_tint }
+        let here = place();
+        let (m_alt, m_az, moon_illum) = moon_position(clock, &here);
+        let (ma, mz) = (m_alt.to_radians(), m_az.to_radians());
+        let moon_dir = Vec3::new((ma.cos() * mz.sin()) as f32, (ma.cos() * mz.cos()) as f32, ma.sin() as f32).normalize_or_zero();
+        let day_seed = (clock.year.rem_euclid(10_000) as u32) * 400 + clock.day_of_year.max(0) as u32;
+        Daylight {
+            sun_dir,
+            altitude_deg: alt,
+            sun_color,
+            secondary,
+            ambient,
+            sky,
+            night,
+            lamps_on: brightness < 0.6,
+            brightness,
+            light_a,
+            azimuth_rad: az.to_radians() as f32,
+            sky_weights,
+            envir_tint,
+            moon_dir,
+            moon_illum: moon_illum as f32,
+            day_of_year: clock.day_of_year as f32,
+            latitude: here.latitude as f32,
+            day_seed,
+        }
     }
 }
 
@@ -222,6 +302,26 @@ mod tests {
         c.time = 13.12 * 3600.0;
         let (_, az) = sun_position(&c, &SunPlace::default());
         assert!(az > 195.0, "no DST: az {az:.1}");
+    }
+
+    #[test]
+    fn the_moon_rises_and_waxes_on_time() {
+        // full moon of 20 January 2000 04:40 UTC: nearly all lit, opposite the sun, high
+        // in a Berlin winter night
+        let berlin = SunPlace { latitude: 52.5, longitude: 13.4, timezone: 0.0, dst: Vec::new() };
+        let c = SimClock { year: 2000, day_of_year: 20, time: 4.67 * 3600.0, ..Default::default() };
+        let (alt, _, illum) = moon_position(&c, &berlin);
+        assert!(illum > 0.98, "illum {illum}");
+        assert!(alt > 10.0, "alt {alt}");
+        // new moon of 6 January 2000 18:14 UTC: dark
+        let c = SimClock { year: 2000, day_of_year: 6, time: 18.23 * 3600.0, ..Default::default() };
+        assert!(moon_position(&c, &berlin).2 < 0.02);
+        // first quarter of 14 January 2000 13:34 UTC: half lit, in the south-east to south
+        // in the afternoon
+        let c = SimClock { year: 2000, day_of_year: 14, time: 13.57 * 3600.0, ..Default::default() };
+        let (alt, az, illum) = moon_position(&c, &berlin);
+        assert!((illum - 0.5).abs() < 0.08, "illum {illum}");
+        assert!((90.0..200.0).contains(&az) && alt > 0.0, "alt {alt} az {az}");
     }
 
     #[test]

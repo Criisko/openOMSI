@@ -1,7 +1,10 @@
 // The "playing now" counter of openOMSI: a running game says every three minutes that it is
-// being played (crates/omsi-app/src/presence.rs), the website and the README badge read
-// how many are. One Durable Object keeps the sessions (a random id each, its system and
-// the game's version, the time of its last word) and forgets one ten minutes after that.
+// being played (crates/omsi-app/src/presence.rs; every ten minutes, every three in games
+// before 0.1.1552), the website and the README badge read how many are. One Durable Object
+// keeps the sessions (a random id each, its system and the game's version, the time of its
+// last word) and forgets one 25 minutes after that. Everything has to fit the free plan's
+// 100 000 requests a day: over it Cloudflare answers every request with error 1027 until
+// midnight UTC.
 // No address and nothing else about a player is kept.
 //
 //   POST /ping  {"id": "<32 hex>", "v": "0.1.1512", "os": "windows"}   -> 204
@@ -11,7 +14,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 
-const ALIVE_MS = 10 * 60 * 1000;
+const ALIVE_MS = 25 * 60 * 1000;
 const SYSTEMS = ["windows", "macos", "linux", "android"];
 
 export class Presence extends DurableObject {
@@ -87,16 +90,16 @@ export default {
       return new Response(null, { status: 204, headers: CORS });
     }
     if (request.method === "GET" && (url.pathname === "/players" || url.pathname === "/badge")) {
-      // (read at most every half minute from the counter: the website and the badge can be
-      // asked as often as anybody likes)
+      // (read at most every two minutes from the counter, and cached by browsers and
+      // shields.io as long: the website and the badge can be asked as often as anybody likes)
       const cache = caches.default;
       const key = new Request(url.origin + url.pathname);
       const hit = await cache.match(key);
       if (hit) return hit;
       const c = await counter.count();
       const out = url.pathname === "/badge"
-        ? json({ schemaVersion: 1, label: "playing now", message: String(c.players), color: c.players > 0 ? "brightgreen" : "lightgrey", cacheSeconds: 60 }, 200, { "Cache-Control": "public, max-age=30" })
-        : json(c, 200, { "Cache-Control": "public, max-age=30" });
+        ? json({ schemaVersion: 1, label: "playing now", message: String(c.players), color: c.players > 0 ? "brightgreen" : "lightgrey", cacheSeconds: 300 }, 200, { "Cache-Control": "public, max-age=120" })
+        : json(c, 200, { "Cache-Control": "public, max-age=120" });
       ctx.waitUntil(cache.put(key, out.clone()));
       return out;
     }

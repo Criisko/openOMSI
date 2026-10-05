@@ -1156,6 +1156,22 @@ pub fn start(args: &Args) -> Option<LanSession> {
     Some(session)
 }
 
+/// The line the launcher looks for in the game's log when the game is over: the server sent
+/// the player away (kick, ban) or turned it away at the door, with the server's message.
+pub const LEFT_SERVER: &str = "LAN: disconnected from the server: ";
+
+/// A joining game the server sent or turned away: the reason, once (the game then ends and the
+/// launcher shows "Disconnected from the server" with it). None for a host, or while it may play.
+pub fn turned_away(lan: &LanSession) -> Option<String> {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let why = lan.turned_away.clone().filter(|_| lan.role == Role::Client)?;
+    if SAID.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    log::warn!("{LEFT_SERVER}{why}");
+    Some(why)
+}
+
 /// The host's mods (see `lan_mods`): the host serves them on its session's port number
 /// (TCP), a joining player fetches what it lacks before its world is made, and says how
 /// far it has got in the status the launcher shows.
@@ -1365,7 +1381,10 @@ fn host_weather(args: &Args, weather: &str) -> Result<Option<String>, String> {
     if w.is_empty() {
         return Ok(None);
     }
-    if crate::weather_setup::custom_weather(Some(w)).is_some(){return Ok(Some(w.to_string()));}
+    // the natural model and the cycle are made on each machine: no file to have
+    if crate::weather_model::is_natural(Some(w)) || w == "cycle" || crate::weather_setup::custom_weather(Some(w)).is_some() {
+        return Ok(Some(w.to_string()));
+    }
     // a METAR report's values: made into a weather here, no file and no sync of our own
     if w.starts_with(crate::weather_setup::REPORT) {
         return if crate::weather_setup::from_report(w).is_some() {
@@ -3712,6 +3731,18 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The natural weather and the cycle need no file: a client takes them from any host.
+    #[test]
+    fn a_hosts_natural_weather_or_cycle_is_taken_without_a_file() {
+        use clap::Parser;
+        let args = crate::cli::Args::parse_from(["openomsi"]);
+        for w in ["natural", "Natural", "cycle"] {
+            assert_eq!(host_weather(&args, w), Ok(Some(w.to_string())), "{w}");
+        }
+        assert_eq!(host_weather(&args, ""), Ok(None));
+        assert!(host_weather(&args, "weather/none_such.owt").is_err());
+    }
 
     /// Every session starts with every bus offered: a server joined before (on a phone the
     /// launcher and the game share one process) no longer limits a drive alone or the next

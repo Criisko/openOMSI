@@ -35,6 +35,7 @@ mod career;
 mod describe;
 mod editor;
 mod game_lists;
+mod game_controller_menu;
 mod rail_drive;
 mod driver;
 mod export;
@@ -73,6 +74,7 @@ mod app_events;
 mod bus_service;
 mod camera_util;
 mod controllers;
+mod hpattern;
 mod ffb_calibration;
 #[cfg(windows)]
 mod dinput;
@@ -103,6 +105,7 @@ mod traffic_link;
 mod tutorial;
 mod weather_setup;
 mod weather_cycle;
+mod weather_model;
 mod world_load;
 
 // the interface's translations (locales/app.yml; the English text is the key)
@@ -353,8 +356,10 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
     {
         args.drive_keys = settings.drive_keys.clone();
     }
+    let plus = args.enhanced_plus || omsi_cfg::env::var_os("OMSI_ENHANCED_PLUS").is_some();
+    ENHANCED_PLUS.store(plus, std::sync::atomic::Ordering::Relaxed);
     ENHANCED.store(
-        settings.enhanced || args.enhanced || omsi_cfg::env::var_os("OMSI_ENHANCED").is_some(),
+        settings.enhanced || args.enhanced || plus || omsi_cfg::env::var_os("OMSI_ENHANCED").is_some(),
         std::sync::atomic::Ordering::Relaxed,
     );
     CLOUDS.store(settings.clouds && omsi_cfg::env::var_os("OMSI_NO_CLOUDS").is_none(), std::sync::atomic::Ordering::Relaxed);
@@ -373,6 +378,11 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
     } else {
         None
     };
+    // turned away at the door (banned, full, another version): no game to play there
+    if lan.as_ref().and_then(lan::turned_away).is_some() {
+        log::info!("game ends");
+        return Ok(None);
+    }
     // the host's mods: served by the host, fetched by a joining player before its world is
     // made (see `lan_mods`)
     lan_mods::remove_stale();
@@ -495,6 +505,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         speed: 30.0,
         mouse_look: false,
         buttons_held: (false, false),
+        mmb_held: false,
         both_drag: None,
         f1_reset: None,
         vr_zoom_active: false,
@@ -512,6 +523,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         pane_scroll_drag: None,
         pane_scroll: None,
         plugin_keys: Vec::new(),
+        plugin_events: Vec::new(),
         clock_hold: 0.0,
         pad_look: [false; 4],
         arrow_glance: false,
@@ -553,6 +565,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         game_keys: omsi_content::KeyboardCfg::load(&crate::startup::keyboard_cfg(&args_root_for_keys)).unwrap_or_default().with_game_defaults().with_vr_defaults().game,
         own_keys: crate::startup::own_keys(&args_root_for_keys),
         own_shift: crate::startup::own_bindings(&args_root_for_keys, omsi_content::input::KEY_SHIFT),
+        key_capture: None,
         menu_prev_pause: false,
         info_bar,
         pending_time: None,

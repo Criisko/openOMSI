@@ -74,6 +74,13 @@ fn cloud_shell(d: vec3<f32>, h: f32) -> f32 {
     return select(-1.0, hi, hi > 0.0);
 }
 
+// The sun's irradiance at height z (as `cloud_height` gives it) in the cloud layer:
+// between the base, middle and top of `enh.cloud_sun`.
+fn cloud_sun_at(z: f32) -> vec3<f32> {
+    let t = clamp((z - CLOUD_BOTTOM) / (CLOUD_TOP - CLOUD_BOTTOM), 0.0, 1.0) * 2.0;
+    return select(mix(enh.cloud_sun[1].rgb, enh.cloud_sun[2].rgb, t - 1.0), mix(enh.cloud_sun[0].rgb, enh.cloud_sun[1].rgb, t), t < 1.0);
+}
+
 // How much of the sky the weather covers here: its type (camera.clouds.x) and, over tens
 // of kilometres, its own cloud picture.
 fn cloud_coverage(p: vec2<f32>) -> f32 {
@@ -133,9 +140,8 @@ fn cloud_layer(d: vec3<f32>, below: vec3<f32>, pix: f32) -> vec4<f32> {
     let ds = (t1 - t0) / f32(CLOUD_STEPS);
     // how many texels of the shape map a pixel spans where the ray meets the clouds
     let lod = log2(max(t0 * pix * f32(textureDimensions(t_cloud_shape).x) / CLOUD_SHAPE_PERIOD, 1.0));
-    // (the sun before the clouds: how much of it the cover lets through, lights.w, is what
-    // this march works out itself)
-    let sun = enh.sun_disc.rgb * smoothstep(-0.08, 0.02, sd.z);
+    // (the sun before the clouds - at their own height, through the air from up there:
+    // how much of it the cover lets through, lights.w, is what this march works out itself)
     let sky_top = sh_irradiance(vec3<f32>(0.0, 0.0, 1.0)) / PI;
     let ground = sh_irradiance(vec3<f32>(0.0, 0.0, -1.0)) / PI;
     let cos_sun = dot(d, sd);
@@ -166,6 +172,7 @@ fn cloud_layer(d: vec3<f32>, below: vec3<f32>, pix: f32) -> vec4<f32> {
             }
             // multiple scattering (Hillaire 2016): octaves of weaker extinction, weaker
             // light and a flatter phase
+            let sun = cloud_sun_at(p.z);
             var direct = vec3<f32>(0.0);
             var a = 1.0;
             var b = 1.0;
@@ -209,8 +216,15 @@ fn cloud_layer(d: vec3<f32>, below: vec3<f32>, pix: f32) -> vec4<f32> {
     let t_hi = 7000.0 / max(d.z, 0.02);
     let p_hi = cloud_ground(d, t_hi);
     let hi = cloud_fbm((p_hi + drift * 1.7) / 2500.0);
-    let hi_cover = clamp((hi - 0.6 + camera.clouds.x * 0.2) * 2.0, 0.0, 1.0) * clamp(d.z * 8.0, 0.0, 1.0) * 0.35 * (1.0 - a) * (1.0 - closed);
-    col = mix(col, (enh.sun_disc.rgb * enh.lights.w * max(sd.z, 0.0) * 0.6 / PI + sky_top) * 0.9, hi_cover);
+    // (and the veil of the weather, as thick as its optical depth along the view makes it,
+    // fibrous where the high layer's texture is)
+    let veil = enh.cloud_sun[0].w;
+    let veil_cover = (1.0 - exp(-veil / max(d.z, 0.08) * (0.55 + 0.45 * hi))) * 0.8;
+    let hi_cover = max(clamp((hi - 0.6 + camera.clouds.x * 0.2) * 2.0, 0.0, 1.0) * 0.35, veil_cover) * clamp(d.z * 8.0, 0.0, 1.0) * (1.0 - a) * (1.0 - closed);
+    // (lit by the sun at its own height, through thin ice: forward scattering towards the
+    // sun, a dull grey away from it)
+    let hi_sun = enh.cloud_sun[3].rgb * (0.12 + 0.5 * hg_phase(cos_sun, 0.6) * 4.0 * PI * 0.25);
+    col = mix(col, (hi_sun * (1.0 - closed) / PI + sky_top) * 0.9, hi_cover);
     return vec4<f32>(col, max(max(a, hi_cover), closed));
 }
 
@@ -259,9 +273,92 @@ fn fs_enhanced(in: VsOut) -> @location(0) vec4<f32> {
         let l = enh.sun_disc.rgb / (PI * r * r) * disc * limb * (1.0 - cover) * enh.lights.w * t;
         col = col + l;
     }
+    col = col + night_sky(d, cube.a, fwidth(d));
     // the dome is drawn pre-exposed; the disc is kept within what the target and the glow
     // filter handle
     return vec4<f32>(min(col * pre, vec3<f32>(4000.0)), 1.0);
+}
+
+fn star_hash(c: vec3<i32>) -> vec4<f32> {
+    var x = vec4<u32>(bitcast<vec3<u32>>(c), 0x9e3779b9u).xyzw;
+    x = x * 1664525u + 1013904223u;
+    x.x = x.x + x.y * x.w;
+    x.y = x.y + x.z * x.x;
+    x.z = x.z + x.x * x.y;
+    x.w = x.w + x.y * x.z;
+    x = x ^ (x >> vec4<u32>(16u));
+    x.x = x.x + x.y * x.w;
+    x.y = x.y + x.z * x.x;
+    x.z = x.z + x.x * x.y;
+    x.w = x.w + x.y * x.z;
+    return vec4<f32>(x & vec4<u32>(0xffffffu)) / 16777216.0;
+}
+
+// The moon and the stars towards d (radiance), behind what cloud covers it. The moon is a
+// lit sphere: its lit side faces the sun, its phase is what the sun's direction makes of
+// it, and its grey seas darken parts of the disc. The stars are a few thousand points
+// fixed in the sky, of a few magnitudes, slightly coloured; they show only where the sky
+// behind them is dark - a lit city's glow and the haze leave the brightest few.
+fn night_sky(d: vec3<f32>, cover: f32, pix: vec3<f32>) -> vec3<f32> {
+    var col = vec3<f32>(0.0);
+    if (d.z < -0.01) {
+        return col;
+    }
+    let h0 = camera.cam_pos.z - enh.fog.z;
+    let through = air_of(d, 30000.0, h0, h0 + 30000.0 * max(d.z, 0.0), 0.0).a * (1.0 - cover);
+    if (through < 0.01) {
+        return col;
+    }
+    let m = enh.moon.xyz;
+    let r = enh.moon.w;
+    let cm = dot(d, m);
+    if (cm > cos(r * 1.3) && max(enh.moon_disc.r, enh.moon_disc.g) > 0.0) {
+        // the point on the moon's sphere seen in direction d
+        let right = normalize(cross(m, vec3<f32>(0.0, 0.0, 1.0)) + vec3<f32>(1e-5, 0.0, 0.0));
+        let up = cross(right, m);
+        let q = vec2<f32>(dot(d, right), dot(d, up)) / r;
+        let q2 = dot(q, q);
+        let rim = 1.0 - smoothstep(0.92, 1.05, sqrt(q2));
+        let nz = sqrt(max(1.0 - q2, 0.0));
+        let n = normalize(right * q.x + up * q.y - m * nz);
+        let sun_side = smoothstep(-0.04, 0.08, dot(n, normalize(camera.sun_dir.xyz)));
+        // the seas: a few broad dark patches fixed on the face
+        let sea = smoothstep(0.45, 0.7, cloud_fbm(q * 1.7 + vec2<f32>(3.1, 7.7)));
+        let albedo = 1.0 - 0.38 * sea;
+        // (as bright as the lit part's share of the irradiance spread over the disc; the
+        // dark part keeps a trace of earthshine)
+        let lit_share = max(0.5 + 0.5 * dot(-m, normalize(camera.sun_dir.xyz)), 0.03);
+        let l = enh.moon_disc.rgb / (PI * r * r * lit_share) * (sun_side + 0.004) * albedo * rim;
+        col = col + l * through;
+    }
+    // the stars: one candidate in some of the cells of a grid on the sphere
+    let vis = enh.moon_disc.w;
+    if (vis > 0.0 && d.z > 0.0) {
+        let cells = 140.0;
+        let g = d * cells;
+        let c = vec3<i32>(floor(g));
+        let h = star_hash(c);
+        let density = 0.014;
+        if (h.x < density) {
+            let p = (vec3<f32>(c) + vec3<f32>(0.25) + h.yzw * 0.5) / cells;
+            let sd = normalize(p);
+            let ang = acos(clamp(dot(d, sd), -1.0, 1.0));
+            // a point of light about a pixel across
+            let size = clamp(length(pix) * 0.6, 1e-5, 0.004);
+            let spot = exp(-ang * ang / (size * size));
+            // brightness: many faint ones, a few bright (a power law of the magnitudes)
+            let b = pow(1.0 - h.x / density, 4.0);
+            let tint = mix(vec3<f32>(1.0, 0.86, 0.72), vec3<f32>(0.8, 0.88, 1.0), h.w);
+            // the faintest that shows against the sky behind it (in the picture's own
+            // units): a dark country sky shows thousands, a city's glow the few dozen
+            // brightest, a twilight none
+            let sky_l = dot(sky_table(d), vec3<f32>(0.2126, 0.7152, 0.0722)) * enh.exposure.x;
+            let limit = clamp(sky_l * 90.0 + (1.0 - vis), 0.0, 1.2);
+            let shows = smoothstep(limit, limit + 0.15, b) * (1.0 - smoothstep(0.03, 0.1, sky_l));
+            col = col + tint * (0.04 + 1.4 * b) * spot * shows * through / max(enh.exposure.x, 1e-6) * smoothstep(0.0, 0.15, d.z);
+        }
+    }
+    return col;
 }
 
 // --- the reflection probe: a cube map of the sky seen from the camera, drawn now and then

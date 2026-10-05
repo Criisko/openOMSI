@@ -11,6 +11,30 @@ Thanks for helping! A few rules keep the project healthy:
 * `cargo test --workspace` and `cargo build --release` must pass (CI checks all platforms).
 * Code style: `rustfmt` defaults, comments explain *why*.
 
+## Files and licences
+
+* **Contributions are MIT**, like the rest of the code and documentation. The few
+  third-party files the game ships (the Roboto fonts, the Material icons with their
+  `LICENSE.txt`) keep their own licences; adding another - map data from OpenStreetMap
+  (ODbL), CC-BY-SA pictures, other fonts or icon sets - needs the maintainers' agreement
+  first. A format can be documented here and its real data published elsewhere (a release,
+  a repository of its own, the mod itself).
+* **No large files.** A file of a megabyte or more fails the PR checks. Screenshots and
+  videos belong in the pull request's description, not in a commit; test data is small and
+  made for the test.
+* **No generated or downloaded content**: no builds, caches, converted textures or example
+  maps.
+
+## Translations
+
+The interface texts are in [`crates/omsi-app/locales/app.yml`](crates/omsi-app/locales/app.yml),
+with the English text as the key. A pull request that changes it is checked automatically:
+
+* add or correct texts of your language; keep the placeholders (`%{packs}`, `{}`) of the key;
+* do not remove a key or reword the English one - the code looks texts up by it;
+* changing another contributor's existing translation is fine when it is a correction - say
+  so in the description, the check lists every changed text for the reviewers.
+
 ## Issues
 
 * **English only** - titles and text, so every contributor can read and search them. An
@@ -19,6 +43,11 @@ Thanks for helping! A few rules keep the project healthy:
   they are.
 * One problem or idea per issue, on the latest release. Questions go to the
   [Discord server](https://discord.gg/VG2EKVafYG).
+* New issues are sorted automatically: the form's "What is it about?" becomes an `area:`
+  label and the issue gets a first milestone (a regression or a crash: v0.1.x), which the
+  maintainers move when it fits better elsewhere. A crash report with the same panic as an
+  open issue is closed as its duplicate - add what you were doing to that issue instead.
+* **Security problems are not reported as issues**: see [SECURITY.md](SECURITY.md).
 
 ## Where things are
 

@@ -194,12 +194,52 @@ override ALPHA_TO_COVERAGE: bool = false;
 @group(0) @binding(8) var t_ao: texture_2d<f32>;
 @group(0) @binding(9) var s_ao: sampler;
 
+// Enhanced+: the traced lighting at a pixel (rt.wgsl, full size; camera.clouds.w 2): x the
+// ambient occlusion, z the sun's visibility (< 0 where it was not traced), w 1 where the
+// texel lies at this surface's depth (the pixel's own or a neighbour's; 0: the surface is
+// not in the depth prepass - a pane, a blended layer - and the shadow map stands in).
+fn rt_at(frag: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
+    if (camera.clouds.w < 1.5) {
+        return vec4<f32>(1.0, 0.0, -1.0, 0.0);
+    }
+    let size = vec2<i32>(textureDimensions(t_ao));
+    let z = (camera.view_proj * vec4<f32>(world, 1.0)).w;
+    let tol = 0.03 + 0.01 * z;
+    let px = vec2<i32>(frag);
+    var best = vec4<f32>(1.0, 0.0, -1.0, 0.0);
+    var best_d = tol;
+    for (var k = 0; k < 5; k = k + 1) {
+        var o = vec2<i32>(0, 0);
+        switch k {
+            case 1: { o = vec2<i32>(1, 0); }
+            case 2: { o = vec2<i32>(-1, 0); }
+            case 3: { o = vec2<i32>(0, 1); }
+            case 4: { o = vec2<i32>(0, -1); }
+            default: {}
+        }
+        let s = textureLoad(t_ao, clamp(px + o, vec2<i32>(0), size - vec2<i32>(1)), 0);
+        let d = abs(s.g - z);
+        if (s.g > 0.0 && d < best_d) {
+            best_d = d;
+            best = vec4<f32>(s.r, s.g, s.b, 1.0);
+        }
+        if (k == 0 && d < tol * 0.3) {
+            break;
+        }
+    }
+    return best;
+}
+
 // The ambient occlusion at a pixel of the full picture. It is worked out at half size, and
 // a plain bilinear lookup blended the occlusion of the ground behind an edge with that of
 // the object in front: every wheel, pole and kerb stood in a pale outline on the shaded
 // ground under the bus. Of the four half-size texels around the pixel only those at the
 // pixel's own depth count (a depth-aware upsample); none of them: the closest in depth.
 fn ao_at(frag: vec2<f32>, world: vec3<f32>) -> f32 {
+    if (camera.clouds.w > 1.5) {
+        let t = rt_at(frag, world);
+        return select(t.x, 1.0, t.w < 0.5);
+    }
     let size = vec2<i32>(textureDimensions(t_ao));
     let z = (camera.view_proj * vec4<f32>(world, 1.0)).w;
     let f = frag * 0.5 - vec2<f32>(0.5);
@@ -510,7 +550,11 @@ fn vertex_main(in_pos: vec3<f32>, in_normal: vec3<f32>, in_uv: vec2<f32>, in_ins
         // line of sight bowed the road's long triangles over the short ones of what lies on
         // it, by millimetres near the eye, and the rails went under the road there (#1196).
         // (surface objects, 1.25, a little more than the splines under them)
-        let decal = select(0.0, 0.01 + 0.001 * d, surf > 1.1 && surf < 1.5);
+        // (a vehicle's shadow blob, 2: drawn without a depth test in the original, right
+        // over the road it lies on - with the road's own pull alone the two fought for
+        // every pixel and the road mostly won; a few centimetres more bring it through the
+        // road and still leave it behind the body and the wheels standing on it)
+        let decal = select(select(0.0, 0.01 + 0.001 * d, surf > 1.1 && surf < 1.5), 0.05 + 0.002 * d, surf > 1.5);
         let pull = min(0.003 * d + decal, d * 0.3);
         cp = wp.xyz - to / max(d, 1e-3) * pull;
     }
@@ -1478,7 +1522,10 @@ fn fs_vanilla_reflections(in: FsIn) -> EnhancedOut {
     var weight = 0.0;
     let c = shade_vanilla(in, &weight, camera.cam_pos.xyz);
     let coverage = select(c.a, 0.0, in.params2.w > 1.5);
-    return EnhancedOut(c, vec4<f32>(0.0, weight * 0.49, weight, coverage));
+    var out: EnhancedOut;
+    out.color = c;
+    out.mask = vec4<f32>(0.0, weight * 0.49, weight, coverage);
+    return out;
 }
 
 fn shade_vanilla(in: FsIn, puddle_weight: ptr<function, f32>, eye: vec3<f32>) -> vec4<f32> {

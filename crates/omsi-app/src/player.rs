@@ -32,9 +32,14 @@ pub(crate) fn steering_view_yaw(current: f32, steering: f32, dt: f32, enabled: b
     current + (target - current) * (1.0 - (-dt.max(0.0) / response.clamp(0.05, 1.0)).exp())
 }
 
-pub(crate) fn driver_head_look(look: (f32, f32), view: &str, pitch_deg: f32) -> (f32, f32) {
+pub(crate) fn driver_head_look(
+    look: (f32, f32),
+    view: &str,
+    pitch_deg: f32,
+    vr_on: bool,
+) -> (f32, f32) {
     if view == "driver" {
-        (look.0, look.1 + pitch_deg)
+        (look.0, look.1 + if vr_on { 0.0 } else { pitch_deg })
     } else {
         look
     }
@@ -45,19 +50,21 @@ mod driver_head_look_tests {
     use super::driver_head_look;
 
     #[test]
-    fn head_pitch_adjusts_driver_view_in_any_display_mode_only() {
-        assert_eq!(driver_head_look((4.0, 2.0), "driver", 10.0), (4.0, 12.0));
-        assert_eq!(driver_head_look((4.0, 2.0), "pax", 10.0), (4.0, 2.0));
-        assert_eq!(driver_head_look((4.0, 2.0), "outside", 10.0), (4.0, 2.0));
+    fn head_pitch_adjusts_only_non_vr_driver_view() {
+        assert_eq!(
+            driver_head_look((4.0, 2.0), "driver", 10.0, false),
+            (4.0, 12.0)
+        );
+        assert_eq!(
+            driver_head_look((4.0, 2.0), "driver", 10.0, true),
+            (4.0, 2.0)
+        );
+        assert_eq!(driver_head_look((4.0, 2.0), "pax", 10.0, false), (4.0, 2.0));
+        assert_eq!(
+            driver_head_look((4.0, 2.0), "outside", 10.0, false),
+            (4.0, 2.0)
+        );
     }
-}
-
-fn is_manual_gate_action(name: &str) -> bool {
-    let Some(gate) = name.get(..5).filter(|p| p.eq_ignore_ascii_case("kw_s_")).and_then(|_| name.get(5..)) else {
-        return false;
-    };
-    let gate = gate.strip_suffix("_fest").unwrap_or(gate);
-    gate.eq_ignore_ascii_case("r") || gate.eq_ignore_ascii_case("n") || gate.parse::<u32>().is_ok()
 }
 
 /// The vehicle actions of the keys held whose `Inputs/keyboard.cfg` entry has the "held"
@@ -738,10 +745,10 @@ impl Player {
             return true;
         }
         let suffix = if pressed { "" } else { "_off" };
-        let release_gear = !pressed
-            && self.momentary_gears
-            && self.vehicle.ty.program.manual_gearbox()
-            && is_manual_gate_action(name);
+        if let Some(gate) = crate::hpattern::resolve(&self.vehicle.ty.program, name) {
+            if pressed { self.clutch_for_gate(&gate); }
+            if let Some(done) = crate::hpattern::action(&mut self.vehicle, &gate, pressed, self.momentary_gears) { return done; }
+        }
         // the ticket key of Inputs/keyboard.cfg (T): sell the ticket the passenger at the
         // desk asked for, on buses whose script has no ticket printer
         if let Some(n) = door_action(name) {
@@ -777,9 +784,6 @@ impl Player {
         let headlights = pressed && name.eq_ignore_ascii_case("kw_scheinwerfer_toggle");
         let lamps_before = if headlights { self.outside_lamps_lit() } else { 0 };
         if self.vehicle.trigger(&format!("{name}{suffix}")) {
-            if release_gear {
-                self.select_neutral();
-            }
             self.repair_roller_blind(&format!("{name}{suffix}"));
             if headlights {
                 self.headlights_with_side_lights(lamps_before);
@@ -789,9 +793,6 @@ impl Player {
         // a key whose press reached the script's own trigger releases as Omsi.exe does, with
         // `<name>_off` only: an alias's `_off` (parking_brake_mouse_off) would undo it (#420)
         if !pressed && self.vehicle.ty.program.trigger(name).is_some() {
-            if release_gear {
-                self.select_neutral();
-            }
             return true;
         }
         let Some((_, aliases)) = ACTION_ALIASES
@@ -802,29 +803,12 @@ impl Player {
         };
         for alias in *aliases {
             if self.vehicle.trigger(&format!("{alias}{suffix}")) {
-                if release_gear {
-                    self.select_neutral();
-                }
                 self.repair_roller_blind(&format!("{alias}{suffix}"));
                 return true;
             }
         }
         let done = self.toggle_as_steps(name, pressed);
-        if release_gear {
-            self.select_neutral();
-        }
         done
-    }
-
-    /// A held gate is released into OMSI's neutral trigger; the usual action release still
-    /// runs first so buses with an explicit gate-off script retain their own behavior.
-    fn select_neutral(&mut self) {
-        for name in ["kw_s_N", "kw_s_N_fest"] {
-            if self.vehicle.ty.program.trigger(name).is_some() && self.vehicle.trigger(name) {
-                self.vehicle.trigger(&format!("{name}_off"));
-                break;
-            }
-        }
     }
 
     /// OMSI's automatic clutch for a gear lever whose scripts only take a gear with the
@@ -2302,10 +2286,10 @@ pub(crate) fn orbit_pivot(position: DVec3, heading_deg: f64, center: [f32; 3]) -
             .as_dvec3()
 }
 
-/// The driver's eye sits a touch forward of the authored seat point (bus frame:
-/// x right, y forward, z up): without it, turning the head shows the inside
-/// of the driver's seat mesh (stock and mod buses alike; OMSI 2 never shows it).
-pub(crate) const EYE_NUDGE: Vec3 = Vec3::new(0.0, 0.12, 0.0);
+/// Driver eye forward offset, currently zeroed: how OMSI 2 keeps the turning
+/// head from clipping inside the seat mesh still needs figuring out (per-bus
+/// mesh handling), so no global offset until then. Kept as the single knob.
+pub(crate) const EYE_NUDGE: Vec3 = Vec3::ZERO;
 
 /// Put a vehicle's meshes where its state says (animations, visibility, lights, the
 /// matrix textures) - the player's bus, and the launcher's showroom bus.

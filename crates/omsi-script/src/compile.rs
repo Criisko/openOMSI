@@ -31,6 +31,7 @@ pub struct Block {
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     pub var_names: Vec<String>,
+    pub strings: Vec<String>,
     pub str_var_names: Vec<String>,
     pub names: Vec<String>,
     pub curves: Vec<Curve>,
@@ -258,7 +259,8 @@ impl Program {
         let mut out: Vec<String> = Vec::new();
         for b in &self.blocks {
             for w in b.ops.windows(2) {
-                if let (Op::PushStr(s), Op::Callback(n)) = (&w[0], &w[1]) {
+                if let (Op::PushStr(i), Op::Callback(n)) = (&w[0], &w[1]) {
+                    let s = &self.strings[*i as usize];
                     if self.name(*n).eq_ignore_ascii_case(callback) && !out.contains(s) {
                         out.push(s.clone());
                     }
@@ -598,7 +600,9 @@ impl<'a> Compiler<'a> {
                     }
                     Tok::Str(s) => {
                         if let Some((_, block, _)) = cur.as_mut() {
-                            block.ops.push(Op::PushStr(s));
+                            let i = self.p.strings.len() as u32;
+                            self.p.strings.push(s);
+                            block.ops.push(Op::PushStr(i));
                         }
                     }
                     Tok::Paren(inner) => {
@@ -713,7 +717,8 @@ impl<'a> Compiler<'a> {
                 Some(id) => Some(Op::LoadStr(id)),
                 None => {
                     self.err(file, line, format!("SC_ErrorInCommand_varinvalid: string variable \"{name}\" not found"));
-                    Some(Op::PushStr(String::new()))
+                    self.p.strings.push(String::new());
+                    Some(Op::PushStr(self.p.strings.len() as u32 - 1))
                 }
             },
             (b'S', b'$') => match self.p.str_var(&lname) {

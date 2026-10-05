@@ -837,6 +837,28 @@ fn paint_schemes(vehicle: &omsi_vehicle::Vehicle) -> (Vec<String>, Vec<PathBuf>)
     (names, dirs_read)
 }
 
+/// The `[name]`s of the depot files in the top-level `HOFs/` folder of every content root
+/// (shared by all vehicles; a higher-priority root's file hides the same file name lower down).
+fn shared_depot_names() -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for base in bases() {
+        let dir = base.join("HOFs");
+        let mut list = omsi_cfg::vfs::list_dir(&dir).unwrap_or_default();
+        list.sort();
+        for (n, is_dir) in list {
+            let file = n.to_string_lossy().to_ascii_lowercase();
+            if is_dir || !file.ends_with(".hof") || !seen.insert(file) {
+                continue;
+            }
+            if let Some(name) = omsi_vehicle::Hof::read_name(&dir.join(&n)) {
+                names.push(name.trim().to_string());
+            }
+        }
+    }
+    names
+}
+
 /// One line into ~/.openomsi/launcher.log.
 fn log_line(line: &str) {
     use std::io::Write;
@@ -860,6 +882,7 @@ pub fn list_vehicles_progress(progress: impl Fn(&[VehicleInfo], usize, usize)) -
     root()?;
     let lang = content_language();
     let folders = merged_folders("Vehicles");
+    let shared_hofs = shared_depot_names();
     let keys: Vec<String> = folders.iter().map(|(_, dirs)| format!("bus4|{lang}|{}", dirs.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>().join("|"))).collect();
     let read = |(folder, dirs): &(String, Vec<PathBuf>), key: &String| -> Vec<VehicleInfo> {
         // the stamp covers every copy of the folder and their direct entries (Model/,
@@ -886,7 +909,17 @@ pub fn list_vehicles_progress(progress: impl Fn(&[VehicleInfo], usize, usize)) -
             Some(pool) => pool.install(|| chunk.par_iter().zip(chunk_keys.par_iter()).map(|(f, k)| read(f, k)).collect()),
             None => chunk.iter().zip(chunk_keys.iter()).map(|(f, k)| read(f, k)).collect(),
         };
-        let batch: Vec<VehicleInfo> = lists.into_iter().flatten().collect();
+        let mut batch: Vec<VehicleInfo> = lists.into_iter().flatten().collect();
+        // the shared depot files after each bus's own (as the game offers them,
+        // `omsi_vehicle::hof::depot_files`; a bus's own of the same name wins) - after the
+        // cache, whose stamps cover only the vehicle folders
+        for v in batch.iter_mut() {
+            for name in &shared_hofs {
+                if !v.hofs.iter().any(|h| h.eq_ignore_ascii_case(name)) {
+                    v.hofs.push(name.clone());
+                }
+            }
+        }
         done += chunk.len();
         // what was read is kept every few seconds: a first reading left half-way (the
         // launcher closed) starts from there the next time
@@ -1709,6 +1742,7 @@ pub const LANGUAGES: &[(&str, &str, &str, &[&str])] = &[
     ("CZE", "Čeština", "cs", &["cs", "cz", "czech", "čeština", "ces"]),
     ("HUN", "Magyar", "hu", &["hu", "hungarian", "magyar"]),
     ("ESP", "Español", "es", &["es", "spa", "spanish", "español"]),
+    ("CAT", "Català", "ca", &["ca", "cat", "ca-es", "ca-ad", "catalan", "català", "catala"]),
     ("PTB", "Português (Brasil)", "pt", &["pt", "br", "pt-br", "por", "portuguese", "português"]),
     ("PTP", "Português (Portugal)", "pt-pt", &["pt-pt", "pt_pt", "pt-portugal", "portuguese-portugal", "português (portugal)", "português de portugal"]),
     ("ITA", "Italiano", "it", &["it", "italian", "italiano"]),
@@ -1742,10 +1776,11 @@ pub fn language_iso(code: &str) -> &'static str {
     LANGUAGES.iter().find(|l| l.0 == c).map(|l| if l.2 == "en" { "" } else { l.2 }).unwrap_or("")
 }
 
-/// `vanilla` (as OMSI 2), `vanilla_plus` or `enhanced`, from the ways a file may spell them
-/// (as the game's `settings::graphics_mode`).
+/// `vanilla` (as OMSI 2), `vanilla_plus`, `enhanced` or `enhanced_plus`, from the ways a file
+/// may spell them (as the game's `settings::graphics_mode`).
 pub fn graphics_mode(v: &str) -> &'static str {
     match v.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
+        "enhanced_plus" | "enhanced+" | "enhancedplus" | "enhanced_+" | "2" => "enhanced_plus",
         "enhanced" | "1" => "enhanced",
         "vanilla" | "classic" | "original" | "omsi" | "omsi2" | "omsi_2" => "vanilla",
         _ => "vanilla_plus",
@@ -1805,11 +1840,11 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
     // the game's information bar along the top, as the last session left it (#1164)
     v["info_bar"] = json!(false);
     // OMSI's own options
-    for (k, d) in [("maintenance", json!(0)), ("ai_unsched_factor", json!(100)), ("ai_max_scheduled", json!(0)), ("ai_max_parked", json!(0)), ("ai_max_humans", json!(200)), ("use_real_time", json!(false)), ("use_real_date", json!(false)), ("use_real_year", json!(false)), ("collision_vehicles", json!(true)), ("collision_objects", json!(true)), ("collision_pedestrians", json!(true)), ("head_movement", json!(true)), ("driverview_smooth", json!(true)), ("hands_in_cab", json!(false)), ("alt_view", json!(true))] {
+    for (k, d) in [("maintenance", json!(0)), ("ai_unsched_factor", json!(100)), ("ai_max_scheduled", json!(0)), ("ai_max_parked", json!(0)), ("ai_max_humans", json!(200)), ("use_real_time", json!(false)), ("use_real_date", json!(false)), ("use_real_year", json!(false)), ("collision_vehicles", json!(true)), ("collision_objects", json!(true)), ("collision_pedestrians", json!(true)), ("head_movement", json!(true)), ("driverview_smooth", json!(true)), ("hands_in_cab", json!(false)), ("alt_view", json!(true)), ("precision_zoom", json!(false))] {
         v[k] = d;
     }
     // openOMSI's own: what passengers say, OMSI's route arrows, getting up from the seat
-    for (k, d) in [("pax_voices", json!("all")), ("nav_arrows", json!(false)), ("nav_ai", json!(true)), ("get_up", json!(false)), ("time_speed", json!("1")), ("time_sync", json!(false)), ("metar_sync", json!(false)), ("metar_station", json!("")), ("machine_translation", json!(false)), ("shadow_casters", json!("all")), ("shadow_blobs", json!(true)), ("reflections", json!(true)), ("mouse_sens", json!(1.0)), ("graphics_api", json!("auto")), ("ctrl_off", json!("")), ("steering_linear", json!(false)), ("old_steering", json!(false)), ("red_steer_spd", json!(false)), ("ff_invert", json!(false)), ("ff_enabled", json!(true)), ("brake_hold", json!(true)), ("auto_clutch", json!(true)), ("momentary_gears", json!(false)), ("wheel_range", json!(900.0)), ("wheel_lock", json!(0.0)), ("fov", json!(0.0)), ("camera_collision", json!(true)), ("right_stick_look", json!(true)), ("steer_look", json!(false)), ("pedal_throttle", json!(1.0)), ("pedal_brake", json!(1.0)), ("seat_x", json!(0.0)), ("seat_y", json!(0.0)), ("seat_z", json!(0.0)), ("seat_pitch_deg", json!(0.0)), ("head_tracking", json!(false)), ("led_glow", json!(6)), ("led_mips", json!(1.3)), ("ui_scale", json!(1.0)), ("ui_scale_window", json!(true)), ("notes", json!(true)), ("mouse_steering", json!(false)), ("mouse_right_off", json!(false)), ("mouse_smooth", json!(true)), ("blinker_cancel", json!(true)), ("ff_road_vib", json!(1.0)), ("ff_engine_vib", json!(1.0)), ("ff_fade", json!(0.28)), ("dlss", json!("off"))] {
+    for (k, d) in [("pax_voices", json!("all")), ("nav_arrows", json!(false)), ("nav_ai", json!(true)), ("get_up", json!(false)), ("time_speed", json!("1")), ("time_sync", json!(false)), ("metar_sync", json!(false)), ("metar_station", json!("")), ("machine_translation", json!(false)), ("shadow_casters", json!("all")), ("shadow_blobs", json!(true)), ("reflections", json!(true)), ("mouse_sens", json!(1.0)), ("graphics_api", json!("auto")), ("ctrl_off", json!("")), ("steering_linear", json!(false)), ("old_steering", json!(false)), ("red_steer_spd", json!(false)), ("ff_invert", json!(false)), ("ff_enabled", json!(true)), ("brake_hold", json!(true)), ("auto_clutch", json!(true)), ("momentary_gears", json!(false)), ("wheel_range", json!(900.0)), ("wheel_lock", json!(0.0)), ("fov", json!(0.0)), ("camera_collision", json!(true)), ("right_stick_look", json!(true)), ("steer_look", json!(false)), ("pedal_throttle", json!(1.0)), ("pedal_brake", json!(1.0)), ("seat_x", json!(0.0)), ("seat_y", json!(0.0)), ("seat_z", json!(0.0)), ("seat_pitch_deg", json!(0.0)), ("head_tracking", json!(false)), ("led_glow", json!(6)), ("led_mips", json!(1.3)), ("ui_scale", json!(1.0)), ("ui_scale_window", json!(true)), ("chat_size", json!(1.0)), ("notes", json!(true)), ("mouse_steering", json!(false)), ("mouse_right_off", json!(false)), ("mouse_smooth", json!(true)), ("blinker_cancel", json!(true)), ("ff_road_vib", json!(1.0)), ("ff_engine_vib", json!(1.0)), ("ff_fade", json!(0.28)), ("dlss", json!("off"))] {
         v[k] = d;
     }
     v["steer_look_angle"] = json!(30.0);
@@ -1854,7 +1889,7 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
             "mirror_refresh" => v[&k] = json!(mirror_refresh(val)),
             "max_fps" => v[&k] = json!(val.parse::<f64>().map(|x| x as i64).unwrap_or(0)),
             "max_obj_dist" => v[&k] = if val.eq_ignore_ascii_case("auto") { json!("auto") } else { json!(val.parse::<f64>().map(|m| (m.round() as i64).to_string()).unwrap_or_else(|_| "auto".into())) },
-            "ssao" | "shadows" | "shadow_blobs" | "navigator" | "enhanced" | "triple_screen" | "triple_span" | "triple_hud_center" | "vr" | "vr_desktop_mirror" | "fullscreen" | "vsync" | "exact_fare" | "detail_textures" | "texture_compression" | "chat" | "tooltips" | "name_tags" | "show_fps" | "clouds" | "doppler" | "driver" | "use_real_time" | "use_real_date" | "use_real_year" | "collision_vehicles" | "collision_objects" | "collision_pedestrians" | "head_movement" | "driverview_smooth" | "hands_in_cab" | "alt_view" => v[&k] = json!(b(val)),
+            "ssao" | "shadows" | "shadow_blobs" | "navigator" | "enhanced" | "triple_screen" | "triple_span" | "triple_hud_center" | "vr" | "vr_desktop_mirror" | "fullscreen" | "vsync" | "exact_fare" | "detail_textures" | "texture_compression" | "chat" | "tooltips" | "name_tags" | "show_fps" | "clouds" | "doppler" | "driver" | "use_real_time" | "use_real_date" | "use_real_year" | "collision_vehicles" | "collision_objects" | "collision_pedestrians" | "head_movement" | "driverview_smooth" | "hands_in_cab" | "alt_view" | "precision_zoom" => v[&k] = json!(b(val)),
             "maintenance" | "ai_unsched_factor" | "ai_max_scheduled" => v[&k] = json!(val.trim_end_matches('%').parse::<f64>().map(|x| x.max(0.0) as i64).unwrap_or(0)),
             // (-1: no parked cars at all, #864)
             "ai_max_parked" => v[&k] = json!(val.parse::<f64>().map(|x| x.max(-1.0) as i64).unwrap_or(0)),
@@ -1869,6 +1904,7 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
             "ctrl_deadzone" => v[&k] = json!(val.parse::<f64>().unwrap_or(0.0).clamp(0.0, 0.3)),
             "mouse_sens" => v[&k] = json!(val.parse::<f64>().unwrap_or(1.0).clamp(0.1, 3.0)),
             "ui_scale" => v[&k] = json!(val.parse::<f64>().ok().filter(|x| x.is_finite()).unwrap_or(1.0).clamp(0.5, 2.0)),
+            "chat_size" => v[&k] = json!(val.parse::<f64>().ok().filter(|x| x.is_finite()).unwrap_or(1.0).clamp(0.5, 3.0)),
             "wheel_range" => v[&k] = json!(val.parse::<f64>().unwrap_or(900.0).clamp(90.0, 2880.0)),
             "wheel_lock" => v[&k] = json!(val.parse::<f64>().map(|x| if x < 45.0 { 0.0 } else { x.min(2880.0) }).unwrap_or(0.0)),
             "fov" => v[&k] = json!(val.parse::<f64>().map(|x| if x < 20.0 { 0.0 } else { x.min(120.0) }).unwrap_or(0.0)),
@@ -1916,7 +1952,7 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
     // what is now Vanilla+
     let g = graphics.unwrap_or(if v["enhanced"] == json!(true) { "enhanced" } else { "vanilla_plus" });
     v["graphics"] = json!(g);
-    v["enhanced"] = json!(g == "enhanced");
+    v["enhanced"] = json!(g == "enhanced" || g == "enhanced_plus");
     // before version 2 the launcher wrote its old default `boarding=pay` for everybody
     // (passengers then waited at the cash desk for the driver): the game reads that as auto
     if version < 2 && v["boarding"] == "pay" {
@@ -2083,7 +2119,7 @@ pub fn settings_to_text(v: &Value, old: Option<&str>) -> String {
         v.get("boarding").and_then(|x| x.as_str()).unwrap_or("auto"),
         b("detail_textures", true),
         b("exact_fare", true),
-        (graphics_mode(v.get("graphics").and_then(|x| x.as_str()).unwrap_or("vanilla_plus")) == "enhanced") as u8,
+        matches!(graphics_mode(v.get("graphics").and_then(|x| x.as_str()).unwrap_or("vanilla_plus")), "enhanced" | "enhanced_plus") as u8,
         graphics_mode(v.get("graphics").and_then(|x| x.as_str()).unwrap_or("vanilla_plus")),
         b("fullscreen", false),
         b("vsync", true),
@@ -2126,7 +2162,7 @@ pub fn settings_to_text(v: &Value, old: Option<&str>) -> String {
     // OMSI's own options (options.cfg): maintenance ([wear_lifespan]), the AI counts and
     // the share of random traffic, the real clock and calendar, collisions, head movement
     let text = format!(
-        "{text}maintenance={}\nai_unsched_factor={}\nai_max_scheduled={}\nai_max_parked={}\nai_max_humans={}\nuse_real_time={}\nuse_real_date={}\nuse_real_year={}\ncollision_vehicles={}\ncollision_objects={}\ncollision_pedestrians={}\nhead_movement={}\ndriverview_smooth={}\nhands_in_cab={}\nalt_view={}\n",
+        "{text}maintenance={}\nai_unsched_factor={}\nai_max_scheduled={}\nai_max_parked={}\nai_max_humans={}\nuse_real_time={}\nuse_real_date={}\nuse_real_year={}\ncollision_vehicles={}\ncollision_objects={}\ncollision_pedestrians={}\nhead_movement={}\ndriverview_smooth={}\nhands_in_cab={}\nalt_view={}\nprecision_zoom={}\n",
         n("maintenance", 0).clamp(0, 4),
         n("ai_unsched_factor", 100).clamp(0, 300),
         n("ai_max_scheduled", 0).max(0),
@@ -2142,9 +2178,10 @@ pub fn settings_to_text(v: &Value, old: Option<&str>) -> String {
         b("driverview_smooth", true),
         b("hands_in_cab", false),
         b("alt_view", true),
+        b("precision_zoom", false),
     );
     let text = format!(
-        "{text}pax_voices={}\nnav_arrows={}\nnav_ai={}\nget_up={}\ntime_speed={}\nmachine_translation={}\nshadow_casters={}\nshadow_blobs={}\nctrl_deadzone={}\nupdate_check={}\nupdate_auto={}\nupdate_notify={}\npresence={}\nreflections={}\nmouse_sens={}\ngraphics_api={}\nctrl_off={}\nsteering_linear={}\nold_steering={}\nred_steer_spd={}\nff_invert={}\nwheel_range={}\nwheel_lock={}\nfov={}\ncamera_collision={}\npedal_throttle={}\npedal_brake={}\nseat_x={}\nseat_y={}\nseat_z={}\nseat_pitch_deg={}\nsteer_look={}\nhead_tracking={}\nff_enabled={}\nbrake_hold={}\nauto_clutch={}\nmomentary_gears={}\nled_glow={}\nled_mips={}\nui_scale={}\nui_scale_window={}\nnotes={}\nmouse_steering={}\nmouse_right_off={}\nmouse_smooth={}\nblinker_cancel={}\nff_road_vib={}\nff_engine_vib={}\nff_fade={}\n",
+        "{text}pax_voices={}\nnav_arrows={}\nnav_ai={}\nget_up={}\ntime_speed={}\nmachine_translation={}\nshadow_casters={}\nshadow_blobs={}\nctrl_deadzone={}\nupdate_check={}\nupdate_auto={}\nupdate_notify={}\npresence={}\nreflections={}\nmouse_sens={}\ngraphics_api={}\nctrl_off={}\nsteering_linear={}\nold_steering={}\nred_steer_spd={}\nff_invert={}\nwheel_range={}\nwheel_lock={}\nfov={}\ncamera_collision={}\npedal_throttle={}\npedal_brake={}\nseat_x={}\nseat_y={}\nseat_z={}\nseat_pitch_deg={}\nsteer_look={}\nhead_tracking={}\nff_enabled={}\nbrake_hold={}\nauto_clutch={}\nmomentary_gears={}\nled_glow={}\nled_mips={}\nui_scale={}\nui_scale_window={}\nchat_size={}\nnotes={}\nmouse_steering={}\nmouse_right_off={}\nmouse_smooth={}\nblinker_cancel={}\nff_road_vib={}\nff_engine_vib={}\nff_fade={}\n",
         match v.get("pax_voices").and_then(|x| x.as_str()).unwrap_or("all") {
             "tickets" => "tickets",
             "off" => "off",
@@ -2199,6 +2236,7 @@ pub fn settings_to_text(v: &Value, old: Option<&str>) -> String {
         f("led_mips", 1.3).clamp(0.0, 4.0),
         f("ui_scale", 1.0).clamp(0.5, 2.0),
         b("ui_scale_window", true),
+        f("chat_size", 1.0).clamp(0.5, 3.0),
         b("notes", true),
         b("mouse_steering", false),
         b("mouse_right_off", false),
@@ -2403,6 +2441,11 @@ mod save_slot_tests {
 /// The command line a duty becomes.
 pub fn duty_args(d: &Duty) -> Result<Vec<String>> {
     let root = root()?;
+    duty_args_for_root(d, &root)
+}
+
+// The installation is validated by duty_args; argument tests supply their own path.
+fn duty_args_for_root(d: &Duty, root: &Path) -> Result<Vec<String>> {
     if let Some(t) = d.tutorial {
         return Ok(vec!["--root".into(), root.to_string_lossy().to_string(), "--no-menu".into(), "--tutorial".into(), t.to_string()]);
     }
@@ -2803,10 +2846,10 @@ mod tests {
     #[test]
     fn a_picked_trip_starts_the_rest_of_the_tour() {
         let d = Duty { map: "maps/x/global.cfg".into(), bus: "Vehicles/x.bus".into(), time: "09:43".into(), line: Some("14".into()), tour: Some("1".into()), trip: Some("5".into()), whole_tour: true, ..Default::default() };
-        let a = duty_args(&d).unwrap();
+        let a = duty_args_for_root(&d, Path::new("test-omsi")).unwrap();
         let k = a.iter().position(|x| x == "--trip").unwrap();
         assert_eq!((a[k + 1].as_str(), a[k + 2].as_str()), ("5", "--whole-tour"));
-        let alone = duty_args(&Duty { whole_tour: false, ..d }).unwrap();
+        let alone = duty_args_for_root(&Duty { whole_tour: false, ..d }, Path::new("test-omsi")).unwrap();
         assert!(!alone.iter().any(|x| x == "--whole-tour"));
     }
 
@@ -2822,7 +2865,7 @@ mod tests {
     #[test]
     fn a_duty_passes_its_fleet_number() {
         let d: Duty = serde_json::from_str(r#"{"map":"maps/x/global.cfg","bus":"Vehicles/x.bus","time":"09:00","number":"4711"}"#).unwrap();
-        let a = duty_args(&d).unwrap();
+        let a = duty_args_for_root(&d, Path::new("test-omsi")).unwrap();
         assert!(a.windows(2).any(|w| w[0] == "--number" && w[1] == "4711"), "{a:?}");
     }
 
@@ -2832,6 +2875,18 @@ mod tests {
         assert_eq!(language_iso("PTB"), "pt");
         assert_eq!(language_code("pt-PT"), "PTP");
         assert_eq!(language_iso("PTP"), "pt-pt");
+    }
+
+    #[test]
+    fn catalan_survives_settings_round_trip() {
+        for alias in ["CAT", "ca", "ca-ES", "ca-AD", "Català", "catala", "Catalan"] {
+            assert_eq!(language_code(alias), "CAT");
+            assert_eq!(language_iso(alias), "ca");
+            let settings = settings_from_text(Some(&format!("language={alias}\n")));
+            assert_eq!(settings["language"], "CAT");
+            let saved = settings_to_text(&settings, None);
+            assert_eq!(settings_from_text(Some(&saved))["language"], "CAT");
+        }
     }
 
     #[test]
@@ -2969,6 +3024,10 @@ mod tests {
         let text = settings_to_text(&v, None);
         assert!(text.lines().any(|l| l == "ui_scale=1.5"), "{text}");
         assert_eq!(settings_from_text(Some(&text))["ui_scale"], json!(1.5));
+        v["chat_size"] = json!(2.2);
+        let text = settings_to_text(&v, None);
+        assert_eq!(text.lines().filter(|l| l.starts_with("chat_size=")).collect::<Vec<_>>(), ["chat_size=2.2"], "{text}");
+        assert_eq!(settings_from_text(Some(&text))["chat_size"], json!(2.2));
         assert_eq!(settings_from_text(Some("ui_scale=9\n"))["ui_scale"], json!(2.0));
         assert_eq!(settings_from_text(Some("ui_scale=0.1\n"))["ui_scale"], json!(0.5));
         assert_eq!(settings_from_text(Some("ui_scale=big\n"))["ui_scale"], json!(1.0));

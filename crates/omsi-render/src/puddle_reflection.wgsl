@@ -226,8 +226,10 @@ fn filter_reflection(px: vec2<i32>, axis: vec2<i32>) -> vec4<f32> {
     let kernel = array<f32, 5>(1.0, 4.0, 6.0, 4.0, 1.0);
     var sum = vec3<f32>(0.0);
     var total = 0.0;
+    // (Enhanced blurs wider: a puddle on asphalt is no mirror, its picture is soft)
+    let step = select(1, 3, p.vehicle_info.w > 0.5);
     for (var i = -2; i <= 2; i++) {
-        let q = clamp(px + axis * i, vec2<i32>(0), size - vec2<i32>(1));
+        let q = clamp(px + axis * i * step, vec2<i32>(0), size - vec2<i32>(1));
         let r = textureLoad(t_trace, q, 0);
         let difference = abs(r.a - centre.a) / max(centre.a, 1e-6);
         let w = kernel[u32(i + 2)] * (1.0 - smoothstep(0.015, 0.06, difference))

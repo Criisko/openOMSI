@@ -672,8 +672,8 @@ onlytypes end types_prefered number_tour.
 * Humans .hum: model seatheight walk_param humangeom links voice age.
 * Drivers .odr: ident busstops hektom crashs tickets rating perbusinfo. The personnel file
   is UTF-16 LE with a BOM like a situation. `[ident]` is name, sex, date of birth, date of
-  hire; `[busstops]` counts the stops served and, of those, the ones left too early and too
-  late; `[hektom]` is the distance driven in hectometres; `[crashs]` counts crashes, hurt
+  hire; `[busstops]` counts the stops served and, of those, the ones reached too late and the
+  ones left too early (in that order, like Omsi.exe's driver record); `[hektom]` is the distance driven in hectometres; `[crashs]` counts crashes, hurt
   pedestrians, abscondings and, of those, the heavy ones; `[tickets]` the tickets sold and
   the takings; `[rating]` the ratings the personnel dialog shows (driving on a 0 = excellent
   to 10 = perilous scale, passenger comfort, ticket selling) followed by two accumulators

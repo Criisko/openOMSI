@@ -92,8 +92,12 @@ pub(crate) fn cfg_path(root: &Path) -> std::path::PathBuf {
 
 /// `Inputs/gamectrler.cfg`: the configured devices.
 pub(crate) fn read_cfg(root: &Path) -> Vec<DeviceCfg> {
+    read_cfg_checked(root).unwrap_or_default()
+}
+
+pub(crate) fn read_cfg_checked(root: &Path) -> Result<Vec<DeviceCfg>, String> {
     let path = cfg_path(root);
-    let Ok(text) = std::fs::read(&path) else { return Vec::new() };
+    let text = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut devices = parse_cfg(&omsi_cfg::codepage::decode(&text));
     // An inherited OMSI file can contain 0/0 FFScale on a wheel. Keep its axis and
     // button bindings, but use openOMSI's 100/100 default until our own file is saved.
@@ -107,7 +111,7 @@ pub(crate) fn read_cfg(root: &Path) -> Vec<DeviceCfg> {
             }
         }
     }
-    devices
+    Ok(devices)
 }
 
 pub(crate) fn parse_cfg(text: &str) -> Vec<DeviceCfg> {
@@ -421,7 +425,11 @@ impl Devices {
 
         if let Some(g) = self.gilrs.as_mut() {
             while let Some(ev) = g.next_event() {
-                let pad = g.gamepad(ev.id);
+                // A focus/device change can leave a queued gilrs event pointing at a
+                // device that has already been removed. `gamepad` panics in that case.
+                let Some(pad) = g.connected_gamepad(ev.id) else {
+                    continue;
+                };
                 match ev.event {
                     EventType::Connected => log::info!("game controller connected: {} (layout {:?}, DirectInput {})", pad.name(), pad.mapping_source(), di),
                     // DirectInput handles wheels on Windows; system-mapped gamepads
@@ -544,7 +552,14 @@ impl Devices {
                 let buttons = declared_button_count(pad.name());
                 #[cfg(not(target_os = "linux"))]
                 let buttons = 0;
-                v.push(Connected { name: pad.name().to_string(), hardware_id: id, axes: di_slots(&axes), gamepad, ff: pad.is_ff_supported(), ff_capable: pad.is_ff_supported(), buttons });
+                v.push(Connected { name: pad.name().to_string(), hardware_id: id, axes: {
+                    let mut slots = di_slots(&axes);
+                    if cfg!(windows) && xinput_name(pad.name()) {
+                        let trigger = |b| pad.button_data(b).map(|d| d.value()).unwrap_or(0.0);
+                        gamepad_triggers(&mut slots, trigger(gilrs::Button::LeftTrigger2), trigger(gilrs::Button::RightTrigger2));
+                    }
+                    slots
+                }, gamepad, ff: pad.is_ff_supported(), ff_capable: pad.is_ff_supported(), buttons });
             }
         }
         // (and a wheel gilrs does not list at all: one whose only axes are the simulation
@@ -825,12 +840,104 @@ fn lattice(i: i32) -> f32 {
     (h >> 8) as f32 / 16_777_216.0
 }
 
+
+/// Button-down actions remember their original mapping until release. Editing a binding
+/// must release that action, rather than sending an unrelated new action's key-up.
+#[derive(Default)]
+struct HeldButtons(Vec<(String, usize, String, bool)>);
+
+impl HeldButtons {
+    fn event(&mut self, cfg: &[DeviceCfg], name: &str, button: usize, down: bool, actions: &mut Vec<(String, bool)>) {
+        if down {
+            if self.0.iter().any(|(n, b, ..)| names_match(n, name) && *b == button) {
+                return;
+            }
+            let Some(d) = find_device_cfg(cfg, name) else { return };
+            let Some((action, _)) = d.buttons.get(button).filter(|a| !a.0.is_empty()) else { return };
+            self.0.push((name.to_string(), button, action.clone(), d.latching.contains(&button)));
+            actions.push((action.clone(), true));
+        } else if let Some(i) = self.0.iter().position(|(n, b, ..)| names_match(n, name) && *b == button) {
+            let (_, _, action, latching) = self.0.remove(i);
+            actions.push((action.clone(), false));
+            if latching {
+                let back = latch_release(&action);
+                actions.push((back.clone(), true));
+                actions.push((back, false));
+            }
+        }
+    }
+
+    fn release(&mut self, actions: &mut Vec<(String, bool)>) {
+        for (_, _, action, _) in self.0.drain(..) {
+            // Do not toggle a latching switch just because its configuration changed.
+            actions.push((action, false));
+        }
+    }
+}
+
+/// Save only to the writable openOMSI overlay. The original OMSI installation is read-only.
+pub(crate) fn save_cfg(devices: &[DeviceCfg]) -> Result<(), String> {
+    let dir = crate::startup::content_dir().ok_or("No writable openOMSI content folder was found")?.join("Inputs");
+    save_cfg_to(&dir.join("gamectrler.cfg"), devices)?;
+    omsi_cfg::content_changed();
+    Ok(())
+}
+
+fn save_cfg_to(path: &Path, devices: &[DeviceCfg]) -> Result<(), String> {
+    let text = cfg_text(devices);
+    if cfg_text(&parse_cfg(&text)) != text {
+        return Err("Controller configuration did not pass its round-trip check".into());
+    }
+    let dir = path.parent().ok_or("Controller configuration has no parent folder")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("cfg.tmp");
+    let result = (|| {
+        std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    result
+}
+
+/// Scale only the configured gamepad, rather than borrowing a wheel's vibration setting.
+fn rumble_scale(cfg: &[DeviceCfg], name: &str) -> f32 {
+    find_device_cfg(cfg, name).and_then(|d| d.ff_scale).map(|s| s.1).unwrap_or(1.0).clamp(0.0, 2.0)
+}
+
+/// A button-only gamepad configuration keeps the automatic analog layout. Once axes
+/// are assigned, the explicit layout takes complete ownership of them.
+/// Keep the steering's device kind with the value that actually won arbitration.
+/// A centred gamepad beside a wheel must not give the wheel gamepad smoothing.
+fn set_steering(out: &mut Analog, value: f32, stick: bool) {
+    if out.steering.is_none_or(|old| value.abs() > old.abs()) {
+        out.steering = Some(value);
+        out.stick = stick;
+    }
+}
+
+fn custom_gamepad_axes(cfg: &[DeviceCfg], name: &str) -> bool {
+    find_device_cfg(cfg, name).is_some_and(|d| d.axes.iter().any(Option::is_some))
+}
+
+/// XInput exposes triggers as buttons in gilrs. Supply their full -1..1 travel in
+/// unused slider slots so they can also be assigned as independent pedals.
+fn gamepad_triggers(axes: &mut Vec<(usize, f32)>, left: f32, right: f32) {
+    for (slot, value) in [(6, left), (7, right)] {
+        if !axes.iter().any(|(k, _)| *k == slot) {
+            axes.push((slot, value.clamp(0.0, 1.0) * 2.0 - 1.0));
+        }
+    }
+}
+
 pub struct Controllers {
     /// Each wheel's suspension travel, settled over a tenth of a second (see `wheel_bump`).
     settled: Vec<f32>,
     devices: Devices,
     focused: bool,
     cfg: Vec<DeviceCfg>,
+    held: HeldButtons,
+    editing: bool,
+    pub(crate) raw_buttons: Vec<(String, usize, bool)>,
     pub enabled: bool,
     /// The settings' dead zone round the centre of a set-up device's axes (0..0.3).
     pub deadzone: f32,
@@ -880,7 +987,7 @@ pub struct Controllers {
     ff_source_logged: Option<String>,
     /// The rumble playing (`FF_Vib_Amp` and `FF_Vib_Period` of the bus), rebuilt when
     /// either changes.
-    rumble: Option<(gilrs::ff::Effect, f32, f32)>,
+    rumble: Vec<(gilrs::GamepadId, gilrs::ff::Effect, f32, f32, f32)>,
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     wheel: Option<crate::evdev_ff::Wheel>,
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -888,6 +995,23 @@ pub struct Controllers {
 }
 
 impl Controllers {
+    pub(crate) fn configuration(&self) -> Vec<DeviceCfg> { self.cfg.clone() }
+
+    pub(crate) fn connected(&self) -> Vec<Connected> { self.devices.connected() }
+
+    /// Replace the mappings on the same Devices object. DirectInput's worker, device
+    /// handles, effects and FFB filters remain alive.
+    pub(crate) fn install_cfg(&mut self, cfg: Vec<DeviceCfg>) {
+        self.held.release(&mut self.actions);
+        self.cfg = cfg;
+        self.notice = None;
+    }
+
+    pub(crate) fn set_editing(&mut self, editing: bool) {
+        if editing && !self.editing { self.held.release(&mut self.actions); }
+        self.editing = editing;
+    }
+
     pub(crate) fn refresh_devices(&self) {
         self.devices.refresh();
     }
@@ -900,7 +1024,8 @@ impl Controllers {
         self.devices.set_focus(focused);
         if !focused {
             self.steer = None;
-            self.actions.clear();
+            self.held.release(&mut self.actions);
+            self.raw_buttons.clear();
             self.ff_source_logged = None;
         }
     }
@@ -911,7 +1036,11 @@ impl Controllers {
         for c in devices.connected() {
             log::info!("game controller: {} ({})", c.name, if cfg.iter().any(|d| names_match(&d.name, &c.name)) { "set up in gamectrler.cfg" } else if c.gamepad { "as a gamepad" } else { "not set up: its X axis steers" });
         }
-Controllers { settled: Vec::new(), devices, focused: true, cfg, deadzone: 0.0, right_stick_look: true, pedal_throttle: 1.0, pedal_brake: 1.0, disabled: Vec::new(), ff_invert: false, ff_enabled: true, ff_road: 1.0, ff_engine: 1.0, ff_fade: FF_FADE, steer_gain: 1.0, enabled: true, actions: Vec::new(), announced: Vec::new(), notice: None, steer: None, ff_t: 0.0, ff_lateral: 0.0, ff_bump: 0.0, ff_bump_age: 0.0, ff_micro: Micro::default(), ff_vib: ScriptVib::default(), ff_rumble: 0.0, ff_source_logged: None, rumble: None, #[cfg(all(target_os = "linux", target_pointer_width = "64"))] wheel: None, #[cfg(all(target_os = "linux", target_pointer_width = "64"))] wheel_tried: None }
+        Self::with_devices(devices, cfg)
+    }
+
+    fn with_devices(devices: Devices, cfg: Vec<DeviceCfg>) -> Controllers {
+        Controllers { settled: Vec::new(), devices, focused: true, cfg, held: HeldButtons::default(), editing: false, raw_buttons: Vec::new(), deadzone: 0.0, right_stick_look: true, pedal_throttle: 1.0, pedal_brake: 1.0, disabled: Vec::new(), ff_invert: false, ff_enabled: true, ff_road: 1.0, ff_engine: 1.0, ff_fade: FF_FADE, steer_gain: 1.0, enabled: true, actions: Vec::new(), announced: Vec::new(), notice: None, steer: None, ff_t: 0.0, ff_lateral: 0.0, ff_bump: 0.0, ff_bump_age: 0.0, ff_micro: Micro::default(), ff_vib: ScriptVib::default(), ff_rumble: 0.0, ff_source_logged: None, rumble: Vec::new(), #[cfg(all(target_os = "linux", target_pointer_width = "64"))] wheel: None, #[cfg(all(target_os = "linux", target_pointer_width = "64"))] wheel_tried: None }
     }
 
     /// A wheel or joystick steers the bus (then the arrow keys look around, as in OMSI:
@@ -923,22 +1052,12 @@ Controllers { settled: Vec::new(), devices, focused: true, cfg, deadzone: 0.0, r
     /// Read the devices: the analog controls, and the button actions into `actions`.
     pub fn poll(&mut self) -> Analog {
         let mut out = Analog::default();
-        for (name, n, down) in self.devices.poll() {
-            if self.off(&name) {
+        self.raw_buttons = self.devices.poll();
+        for (name, n, down) in &self.raw_buttons {
+            if self.editing || !self.enabled || self.off(name) {
                 continue;
             }
-            let Some(d) = find_device_cfg(&self.cfg, &name) else { continue };
-            if let Some(action) = d.buttons.get(n).filter(|a| !a.0.is_empty()) {
-                self.actions.push((action.0.clone(), down));
-                // a latching switch coming out switches back: pressed in again it would
-                // only have toggled the hazard lights on the next press, and the lever's
-                // turn signal stayed on in the middle
-                if !down && d.latching.contains(&n) {
-                    let back = latch_release(&action.0);
-                    self.actions.push((back.clone(), true));
-                    self.actions.push((back, false));
-                }
-            }
+            self.held.event(&self.cfg, name, *n, *down, &mut self.actions);
         }
         if !self.enabled {
             return out;
@@ -968,8 +1087,8 @@ Controllers { settled: Vec::new(), devices, focused: true, cfg, deadzone: 0.0, r
                         if matches!(f, Func::Steering) {
                             steering_set_up = true;
                             let (steering, position) = wheel_steering(v, inverted, d.axis_flags[k], dz, self.steer_gain);
-                            set(&mut out.steering, steering);
-                            if steer.is_none() {
+                            set_steering(&mut out, steering, c.gamepad);
+                            if steer.is_none() && !c.gamepad {
                                 steer = Some((c.name.clone(), position, c.ff));
                             }
                             continue;
@@ -1039,7 +1158,7 @@ Controllers { settled: Vec::new(), devices, focused: true, cfg, deadzone: 0.0, r
                 // for the system's own layout: with the file naming it, nobody read it, and
                 // its triggers were no pedals, #171)
                 let xinput = cfg!(windows) && xinput_name(pad.name());
-                if pad.mapping_source() == gilrs::MappingSource::None || (!xinput && self.cfg.iter().any(|d| names_match(&d.name, pad.name()))) {
+                if pad.mapping_source() == gilrs::MappingSource::None || custom_gamepad_axes(&self.cfg, pad.name()) {
                     continue;
                 }
                 #[cfg(target_os = "macos")]
@@ -1199,37 +1318,36 @@ Controllers { settled: Vec::new(), devices, focused: true, cfg, deadzone: 0.0, r
         let amp = amp.clamp(0.0, 1.0);
         let period = if period.is_finite() { period.clamp(0.0, 100.0) } else { 0.0 };
         let Some(g) = self.devices.gilrs.as_mut() else { return };
-        if let Some((_, was, was_period)) = &self.rumble {
-            if (was - amp).abs() < 0.02 && (was_period - period).abs() < 0.05 {
-                return;
+        let pads: Vec<(gilrs::GamepadId, f32, f32)> = g.gamepads()
+            .filter(|(_, p)| p.is_ff_supported() && !self.disabled.iter().any(|n| names_match(n, p.name())))
+            .map(|(id, p)| {
+                let scale = rumble_scale(&self.cfg, p.name());
+                (id, (amp * scale).min(1.0), scale)
+            }).collect();
+        // Keep unchanged gamepad effects. A saved vibration-strength change must take
+        // effect even when the bus's vibration amplitude and period have not changed.
+        self.rumble.retain(|(id, _, was, was_period, was_scale)| pads.iter().any(|(pad, value, scale)|
+            pad == id && *value >= 0.01 && (was - value).abs() < 0.02
+                && (was_period - period).abs() < 0.05 && (was_scale - scale).abs() < 1e-6));
+        for (id, value, scale) in pads {
+            if value < 0.01 || self.rumble.iter().any(|(pad, ..)| *pad == id) { continue; }
+            let m = (value * u16::MAX as f32) as u16;
+            let ms = (period * 10.0).round() as u32;
+            let scheduling = if ms >= 20 {
+                gilrs::ff::Replay { after: gilrs::ff::Ticks::from_ms(0), play_for: gilrs::ff::Ticks::from_ms(ms / 2), with_delay: gilrs::ff::Ticks::from_ms(ms - ms / 2) }
+            } else {
+                Default::default()
+            };
+            let effect = gilrs::ff::EffectBuilder::new()
+                .add_effect(gilrs::ff::BaseEffect { kind: gilrs::ff::BaseEffectType::Strong { magnitude: m }, scheduling, ..Default::default() })
+                .add_effect(gilrs::ff::BaseEffect { kind: gilrs::ff::BaseEffectType::Weak { magnitude: m / 2 }, scheduling, ..Default::default() })
+                .repeat(gilrs::ff::Repeat::Infinitely)
+                .gamepads(&[id])
+                .finish(g);
+            if let Ok(e) = effect {
+                let _ = e.play();
+                self.rumble.push((id, e, value, period, scale));
             }
-        }
-        self.rumble = None;
-        if amp < 0.01 {
-            return;
-        }
-        let pads: Vec<gilrs::GamepadId> = g.gamepads().filter(|(_, p)| p.is_ff_supported()).map(|(id, _)| id).collect();
-        if pads.is_empty() {
-            return;
-        }
-        // (the file's [FFScale] of a set-up device scales it)
-        let scale = self.cfg.iter().find_map(|d| d.ff_scale).map(|s| s.1).unwrap_or(1.0).clamp(0.0, 2.0);
-        let m = ((amp * scale).min(1.0) * u16::MAX as f32) as u16;
-        let ms = (period * 10.0).round() as u32;
-        let scheduling = if ms >= 20 {
-            gilrs::ff::Replay { after: gilrs::ff::Ticks::from_ms(0), play_for: gilrs::ff::Ticks::from_ms(ms / 2), with_delay: gilrs::ff::Ticks::from_ms(ms - ms / 2) }
-        } else {
-            Default::default()
-        };
-        let effect = gilrs::ff::EffectBuilder::new()
-            .add_effect(gilrs::ff::BaseEffect { kind: gilrs::ff::BaseEffectType::Strong { magnitude: m }, scheduling, ..Default::default() })
-            .add_effect(gilrs::ff::BaseEffect { kind: gilrs::ff::BaseEffectType::Weak { magnitude: m / 2 }, scheduling, ..Default::default() })
-            .repeat(gilrs::ff::Repeat::Infinitely)
-            .gamepads(&pads)
-            .finish(g);
-        if let Ok(e) = effect {
-            let _ = e.play();
-            self.rumble = Some((e, amp, period));
         }
     }
 
@@ -2447,5 +2565,186 @@ mod right_stick_look_tests {
         analog.look = [0.25, -0.5];
         analog.apply_default_gamepad_look(true, -1.0, 1.0);
         assert_eq!(analog.look, [0.25, -0.5]);
+    }
+}
+
+#[cfg(test)]
+mod hot_reload_tests {
+    use super::*;
+
+    fn wheel() -> DeviceCfg {
+        let mut d = DeviceCfg { name: "Test wheel".into(), second: "0".into(), ff_scale: Some((0.65, 1.25)), ff_invert: Some(true), ..Default::default() };
+        d.axes[0] = Some((Func::Steering, true));
+        d.axes[1] = Some((Func::Throttle, true));
+        d.axes[5] = Some((Func::Brake, false));
+        d.axis_flags[0] = 2 | 8 | 0x10;
+        d.buttons = vec![("horn".into(), "7".into()), ("kw_s_1_fest".into(), "0".into()), ("blinker_warn_toggle".into(), "0".into())];
+        d.latching = vec![2];
+        d
+    }
+
+    fn no_hardware() -> Devices {
+        Devices {
+            gilrs: None,
+            #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+            calibration_wheel: None,
+            #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+            button_devices: crate::evdev_buttons::ButtonDevices::new(),
+            #[cfg(windows)]
+            di: None,
+            #[cfg(target_os = "macos")]
+            hid: None,
+            #[cfg(target_os = "macos")]
+            hid_axes: Vec::new(),
+            #[cfg(target_os = "linux")]
+            hats: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn hot_reload_keeps_device_owner_and_ffb_runtime_state() {
+        let mut c = Controllers::with_devices(no_hardware(), vec![wheel()]);
+        c.ff_t = 12.0;
+        c.ff_lateral = 0.25;
+        c.ff_bump = 0.75;
+        c.ff_bump_age = 0.125;
+        c.ff_micro = Micro { roll: 10.0, rpm: 850.0, crank: 0.1, firing: 0.2, mass: 0.3 };
+        c.ff_vib = ScriptVib { amp: 0.4, period: 2.0, t: 0.12 };
+        c.ff_rumble = 0.6;
+        c.steer = Some(("Test wheel".into(), 0.2, 0.1, true));
+        c.settled = vec![0.3, 0.4];
+        let devices = std::ptr::addr_of!(c.devices);
+        c.held.event(&c.cfg, "Test wheel", 1, true, &mut c.actions);
+        let mut cfg = c.configuration();
+        cfg[0].ff_invert = Some(false);
+        c.install_cfg(cfg);
+        assert_eq!(std::ptr::addr_of!(c.devices), devices);
+        assert_eq!((c.ff_t, c.ff_lateral, c.ff_bump, c.ff_bump_age), (12.0, 0.25, 0.75, 0.125));
+        assert_eq!(c.steer, Some(("Test wheel".into(), 0.2, 0.1, true)));
+        assert_eq!(c.settled, vec![0.3, 0.4]);
+        assert_eq!((c.ff_micro.roll, c.ff_micro.rpm, c.ff_micro.crank, c.ff_micro.firing, c.ff_micro.mass), (10.0, 850.0, 0.1, 0.2, 0.3));
+        assert_eq!((c.ff_vib.amp, c.ff_vib.period, c.ff_vib.t, c.ff_rumble), (0.4, 2.0, 0.12, 0.6));
+        assert_eq!(c.actions.last(), Some(&("kw_s_1_fest".into(), false)));
+        assert_eq!(c.configuration()[0].ff_invert, Some(false));
+    }
+
+    #[test]
+    fn hot_reload_editing_suppresses_input_and_releases_once() {
+        let mut c = Controllers::with_devices(no_hardware(), vec![wheel()]);
+        c.held.event(&c.cfg, "Test wheel", 0, true, &mut c.actions);
+        c.set_editing(true);
+        c.set_editing(true);
+        c.poll();
+        assert!(c.editing);
+        assert_eq!(c.actions, vec![("horn".into(), true), ("horn".into(), false)]);
+        c.set_editing(false);
+        assert!(!c.editing);
+    }
+
+    #[test]
+    fn hot_reload_releases_original_held_gear_and_does_not_press_new_binding() {
+        let mut held = HeldButtons::default();
+        let mut cfg = vec![wheel()];
+        let mut actions = Vec::new();
+        held.event(&cfg, "Test wheel", 1, true, &mut actions);
+        cfg[0].buttons[1].0 = "horn".into();
+        held.release(&mut actions);
+        held.event(&cfg, "Test wheel", 1, false, &mut actions);
+        assert_eq!(actions, vec![("kw_s_1_fest".into(), true), ("kw_s_1_fest".into(), false)]);
+        held.event(&cfg, "Test wheel", 1, true, &mut actions);
+        assert_eq!(actions.last(), Some(&("horn".into(), true)));
+    }
+
+    #[test]
+    fn hot_reload_does_not_toggle_latching_switch_on_menu_entry() {
+        let mut held = HeldButtons::default();
+        let cfg = vec![wheel()];
+        let mut actions = Vec::new();
+        held.event(&cfg, "Test wheel", 2, true, &mut actions);
+        held.event(&cfg, "Test wheel", 2, true, &mut actions); // duplicate down
+        held.release(&mut actions);
+        held.event(&cfg, "Test wheel", 2, false, &mut actions);
+        assert_eq!(actions, vec![("blinker_warn_toggle".into(), true), ("blinker_warn_toggle".into(), false)]);
+        // A physical release during driving still performs the existing latching behaviour.
+        held.event(&cfg, "Test wheel", 2, true, &mut actions);
+        held.event(&cfg, "Test wheel", 2, false, &mut actions);
+        assert_eq!(actions.len(), 6);
+    }
+
+    #[test]
+    fn hot_reload_release_uses_mapping_at_press_even_after_external_change() {
+        let mut held = HeldButtons::default();
+        let mut cfg = vec![wheel()];
+        let mut actions = Vec::new();
+        held.event(&cfg, "Test wheel", 0, true, &mut actions);
+        cfg[0].buttons[0].0 = "door".into();
+        held.event(&cfg, "Test wheel", 0, false, &mut actions);
+        assert_eq!(actions, vec![("horn".into(), true), ("horn".into(), false)]);
+    }
+
+    #[test]
+    fn hot_reload_preserves_axis_flags_button_metadata_and_per_device_ffb() {
+        let cfg = vec![wheel(), DeviceCfg { name: "Separate pedals".into(), second: "12".into(), ff_scale: Some((1.0, 1.0)), ..Default::default() }];
+        assert_eq!(parse_cfg(&cfg_text(&cfg)), cfg);
+        assert_eq!(cfg[0].axis_flags[0], 26);
+        let (steer, physical) = wheel_steering(0.6, true, 0, 0.1, 1.0);
+        assert!((physical + 0.6).abs() < 1e-6);
+        assert!((steer + 0.5 / 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hot_reload_mixed_devices_keep_the_selected_steering_kind() {
+        let mut out = Analog::default();
+        set_steering(&mut out, 0.75, false);
+        set_steering(&mut out, 0.0, true);
+        assert_eq!(out.steering, Some(0.75));
+        assert!(!out.stick);
+        set_steering(&mut out, -0.9, true);
+        assert_eq!(out.steering, Some(-0.9));
+        assert!(out.stick);
+        set_steering(&mut out, -0.9, false);
+        assert!(out.stick); // identical readings keep the original source
+    }
+
+    #[test]
+    fn hot_reload_gamepad_vibration_uses_its_own_device_scale() {
+        let mut cfg = vec![wheel(), DeviceCfg { name: "Xbox Controller".into(), ff_scale: Some((1.0, 0.5)), ..Default::default() }];
+        assert_eq!(rumble_scale(&cfg, "Xbox Controller"), 0.5);
+        cfg[1].ff_scale = Some((1.0, 1.5));
+        assert_eq!(rumble_scale(&cfg, "Xbox Controller"), 1.5);
+        assert_eq!(rumble_scale(&cfg, "Test wheel"), 1.25);
+        assert_eq!(rumble_scale(&cfg, "Unconfigured gamepad"), 1.0);
+    }
+
+    #[test]
+    fn hot_reload_custom_gamepad_layout_owns_analog_controls() {
+        let mut cfg = vec![DeviceCfg { name: "Xbox Controller".into(), second: "0".into(), ..Default::default() }];
+        cfg[0].buttons.push(("horn".into(), "0".into()));
+        assert!(!custom_gamepad_axes(&cfg, "Xbox Controller"));
+        cfg[0].axes[0] = Some((Func::Steering, false));
+        assert!(custom_gamepad_axes(&cfg, "Xbox Controller"));
+        let mut axes = vec![(0, 0.2), (1, -0.1)];
+        gamepad_triggers(&mut axes, 0.0, 1.0);
+        assert_eq!(axes[2..], [(6, -1.0), (7, 1.0)]);
+        gamepad_triggers(&mut axes, 1.0, 0.0);
+        assert_eq!(axes.len(), 4);
+    }
+
+    #[test]
+    fn hot_reload_save_replaces_existing_file_and_rejects_invalid_input() {
+        let dir = std::env::temp_dir().join(format!("openomsi-controllers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gamectrler.cfg");
+        let mut cfg = vec![wheel()];
+        save_cfg_to(&path, &cfg).unwrap();
+        cfg[0].ff_invert = Some(false);
+        save_cfg_to(&path, &cfg).unwrap();
+        assert_eq!(parse_cfg(&std::fs::read_to_string(&path).unwrap()), cfg);
+        let original = std::fs::read(&path).unwrap();
+        cfg[0].buttons[0].0 = "horn\n[ctrl]".into();
+        assert!(save_cfg_to(&path, &cfg).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(save_cfg_to(&path.join("not-a-directory.cfg"), &[]).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

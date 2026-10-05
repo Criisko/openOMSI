@@ -106,6 +106,8 @@ pub(crate) struct App {
     pub(crate) mouse_look: bool,
     /// The left and right mouse buttons held.
     pub(crate) buttons_held: (bool, bool),
+    /// The middle button held (looks round; the right button zooms).
+    pub(crate) mmb_held: bool,
     /// The right button (or both) held: OMSI's mouse zoom (0x82c5f8) - moving the mouse up
     /// widens the view in the bus or takes the outside camera further away, by the value at
     /// the press over 500 pixels: (the cursor's height then, the zoom or distance then).
@@ -158,6 +160,9 @@ pub(crate) struct App {
     pub(crate) menu_kbd: bool,
     /// Keys pressed (true) and let go since the Lua plugins' last frame.
     pub(crate) plugin_keys: Vec<(String, bool)>,
+    /// What happened since the Lua plugins' last frame: crashes, people knocked down,
+    /// stops skipped (see `plugins::queue_event`).
+    pub(crate) plugin_events: Vec<omsi_plugin::GameEvent>,
     /// Seconds Ctrl+Shift+Page Up/Down has been held (the clock runs faster the longer).
     pub(crate) clock_hold: f32,
     /// A controller button held for looking left, right, up, down (`view_look_*`).
@@ -249,6 +254,9 @@ pub(crate) struct App {
     pub(crate) own_keys: std::collections::HashSet<i32>,
     /// The same for keys held with Shift (a Shift+number of the player's own is not a door key).
     pub(crate) own_shift: std::collections::HashSet<i32>,
+    /// A binding chosen in the pause menu that is waiting for the next physical key:
+    /// (true: [game], false: [vehicles], index in that section).
+    pub(crate) key_capture: Option<(bool, usize)>,
     /// Whether the game stood paused before the menu opened (closing it goes back to that).
     pub(crate) menu_prev_pause: bool,
     /// OMSI's information bar (`view_toggle_informationdisplay`, Ctrl+Y): time, speed, the

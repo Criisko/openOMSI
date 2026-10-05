@@ -50,6 +50,7 @@ Everything can also be given on the command line, which then skips both:
 | `--click x,y[,dx,dy]` | press (and drag) the cockpit switch at that pixel, offscreen |
 | `--season winter` / `--situation x.osn` / `--physics simple` | season override, a saved situation, the kinematic dynamics instead of the rigid body |
 | `--enhanced` / `--export-glb bus.glb` | the physically based renderer; write the bus as glTF (the launcher's preview) and quit |
+| `--enhanced-plus` | Enhanced+: the physically based renderer with ray-traced shadows, ambient occlusion and reflections |
 | `--launcher` / `--menu` / `--no-menu` | open the launcher (the default without arguments), the in-game menu, or neither |
 
 Keys in the window: **W** throttle, **S** brake, **A**/**D** steering - the arrow keys do the
@@ -89,7 +90,7 @@ release description (GitHub's format; `file://` works, for testing - the game th
 3 s).
 
 **Playing now.** While a session runs the game tells the project's counter (a Cloudflare
-Worker, `services/presence/`) every three minutes that it is being played, and says goodbye
+Worker, `services/presence/`) every ten minutes that it is being played, and says goodbye
 when it ends; the website and the README show how many play right now. What goes out is a
 random id made new for each session, the version and the kind of system - nothing else, and
 the counter keeps no addresses. Settings → General → "Count me in the website's \"playing
@@ -342,10 +343,41 @@ lights to matter.
 `detail_textures` lays procedural (fractal) grain over the ground and the roads up close,
 in vanilla and enhanced alike. `enhanced=1` (or `--enhanced`) switches to its own
 physically based renderer: high-range lighting with energy-conserving diffuse and GGX
-reflections (roughness from `[matl_envmap]`), a computed sky (Rayleigh/Mie scattering,
-lit cumulus) that also lights the scene, contact-hardening sun shadows, aerial perspective
-and height fog, automatic exposure, a glow only real highlights produce and the PBR
-Neutral tone curve with FXAA (`post_aa`); no light shafts, vignette or grading.
+reflections (roughness from `[matl_envmap]`), a computed atmosphere that also lights the
+scene, contact-hardening sun shadows, aerial perspective and height fog, automatic
+exposure, a glow only real highlights produce and a photographic tone curve with FXAA
+(`post_aa`); no light shafts or grading.
+
+Its light comes from physics, not from colour settings. The atmosphere is computed for the
+moment: Rayleigh scattering, ozone, a boundary layer of aerosol whose amount, particle size
+(Ångström exponent) and depth change with the weather, a stratospheric aerosol layer, and
+light scattered many times over (Hillaire's method) - which is what gives the blue hour its
+depth, the twilight its purple and the sunset its colour, different every evening. Clouds
+are lit by the sun as it reaches their own height, so they glow pink after the sun has set
+for the street; a veil of high cloud dims the sun and spreads it into a white aureole (a
+milky sun, soft pale shadows); a passing cumulus takes the sun away from the street, and
+the clouds themselves brighten the sky light. The moon stands where it really is with its
+real phase and lights the night through the same atmosphere; the stars show where the sky
+is dark enough, and a city's lamps light its own haze and clouds (brightest on an overcast
+night). The camera exposes like one: for daylight, part of the way towards the light of the
+moment, with a camera's middle-tone contrast; street lamps are bright points with a little
+glare in clear air and wide halos in mist and rain.
+
+`graphics=enhanced_plus` (Enhanced+ in the launcher, `--enhanced-plus`) is Enhanced with
+hardware ray tracing, where the graphics card traces rays (Apple M3/M4 and newer, RTX and
+RDNA 2 cards and newer through Vulkan and Direct3D 12; elsewhere it draws as Enhanced, and
+should a driver refuse the ray tracing it falls back to Enhanced as well). Every solid mesh within
+420 m of the camera goes into an acceleration structure each frame, and the window's
+picture traces the sun's shadow per pixel (soft away from its caster, crisp at the
+contact; cut-out leaves and fences keep the shadow map, whose texels they need), the
+sky's occlusion within two metres, and reflections: wet roads, water, glass, envmapped
+and lacquered paint mirror what really stands around them, off the screen too, and the
+sky where nothing does. Its shadows, occlusion and reflections cannot be switched off
+apart. It shares Enhanced's tone curve, with the light a shade warmer and a light
+vignette.
+`OMSI_NO_RT=1` opens no ray queries, `OMSI_NO_RT_GRADE=1` leaves its grade out,
+`OMSI_RT_REFL_HALF=1` traces the reflections at half size, `OMSI_DEBUG_RT=n` (see
+`crates/omsi-render/src/rt.rs`) shows its buffers.
 
 Vanilla, Vanilla+ and Enhanced reflect buses, buildings and scenery in wet road puddles
 when `reflections=1`, each using its own lighting. Depth-aware filtering softens the image;
@@ -441,6 +473,11 @@ folder (`omsi_cfg::content_roots`): whatever a mod puts there is found exactly a
 been copied into OMSI 2, and a file of the same name replaces the stock one. The original
 installation is never written to. `OMSI_CONTENT=/some/dir` moves the content folder.
 
+Depot files can also be placed in a top-level `HOFs/` folder. Every vehicle can use those
+`.hof` files without keeping a separate copy in each `Vehicles/<bus>/` folder. If a
+vehicle folder and `HOFs/` contain the same file name, the vehicle's own copy takes
+priority (the launcher's depot list shows the shared ones after the bus's own).
+
 Installing a mod: the launcher's **Mods** page opens the system's folder / file picker
 (Finder, Explorer, GTK) for a mod folder or a `.zip`, `.7z` or `.rar` archive and sorts it
 into place (OMSI-style folders anywhere inside are merged; a lone bus, map, object or
@@ -474,6 +511,22 @@ only in winter, no cold presets in summer.
 
 Weather presets (`Weather/*.owt`) change the light: overcast takes the sun away, rain and
 fog thicken the air, a snow preset puts any map into its winter textures with snow cover.
+
+**Natural weather** (no weather chosen, or `--weather natural`) is a physical weather
+model instead of one fixed state: a column of the atmosphere over the map that runs with
+the clock. Highs and lows pass through (falling pressure brings rising air: first a veil of
+cirrus, then a grey deck, then rain; behind a low the air sinks and clears); the sun warms
+the ground through the clouds and the ground cools by radiation at night (far more under a
+clear sky); the day's heat mixes the air up from the ground, and where it reaches the
+condensation level cumulus forms, to dissolve again in the evening; a calm clear night
+cools the air to its dew point and leaves fog that the morning sun burns off; rain washes
+the dust out of the air and a still high collects it, and humid air swells it into a milky
+haze. So one day is grey from morning to night, the next opens up after a foggy morning,
+an afternoon brings showers and a clear blue evening follows - each following from the day
+before (the model starts three days back), with the season's and the latitude's climate.
+It sets everything a weather sets - visibility, wind, temperature, rain or snow, the wet
+road - for every graphics mode; Enhanced and Enhanced+ also take its cloud amounts and its
+air. `OMSI_DAY_AIR=haze,angstrom[,height,strat]` fixes the air for comparisons.
 
 ## Radio
 
@@ -663,7 +716,8 @@ in step. The other players' buses run their own AI scripts with the sender's inp
 drawn and heard where they stand, and are obstacles for the AI traffic like your own bus -
 as long as that bus type is installed locally, otherwise your own type stands in for it.
 **V** opens the chat line (Enter sends, Esc drops it); joining and leaving are announced
-there. The host checks everything it takes in and limits how much a player may send.
+there. The chat grows with the window like the rest of the interface, and has a size of
+its own on top: **Ctrl + the mouse wheel** over it, or Settings → General → Chat size (50-300 %). The host checks everything it takes in and limits how much a player may send.
 
 **Every variable of the other buses.** Besides the pose, each game sends all script
 variables of its bus (floats and strings: a gearbox's state, a display's or an IBIS's text,

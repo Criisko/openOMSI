@@ -284,8 +284,15 @@ impl Vm {
 /// Values push; binary operators pop both operands and push the result; unary operators
 /// replace `st[0]`. This is what the stock scripts require (`A B C || &&` evaluates
 /// `A && (B || C)`).
-#[inline]
+#[inline(always)]
 fn exec_op(s: &mut Stacks, op: &Op, p: &Program, state: &mut State, host: &mut dyn Host) {
+    if !exec_hot(s, op, p, state, host) {
+        exec_cold(s, op, p, state, host)
+    }
+}
+
+#[inline(always)]
+fn exec_hot(s: &mut Stacks, op: &Op, p: &Program, state: &mut State, host: &mut dyn Host) -> bool {
     macro_rules! bin {
         ($f:expr) => {{
             let a = s.pop();
@@ -318,19 +325,6 @@ fn exec_op(s: &mut Stacks, op: &Op, p: &Program, state: &mut State, host: &mut d
             let c = &p.curves[*id as usize];
             un!(|x| c.eval(x))
         }
-        Op::Macro(_) | Op::Random | Op::JumpIfZero(_) | Op::Jump(_) => unreachable!("handled by run_block"),
-        Op::Callback(n) => host.callback(p.name(*n), *n, s, state),
-        Op::SoundTrigger(n) => host.sound_trigger_vars(p.name(*n), *n, &state.vars),
-        Op::SoundTriggerFile(n) => {
-            let file = s.pop_str();
-            host.sound_trigger_file(p.name(*n), &file);
-        }
-        Op::LoadStr(id) => {
-            let v = state.str_vars[*id as usize].clone();
-            s.push_str(v)
-        }
-        Op::StoreStr(id) => state.str_vars[*id as usize] = s.sst[0].clone(),
-        Op::PushStr(v) => s.push_str(v.clone()),
         Op::LoadReg(i) => s.push(s.reg[*i as usize]),
         Op::StoreReg(i) => s.reg[*i as usize] = s.st[0],
         Op::Add => bin!(|b: f32, a: f32| b + a),
@@ -368,6 +362,27 @@ fn exec_op(s: &mut Stacks, op: &Op, p: &Program, state: &mut State, host: &mut d
         Op::Abs => un!(|a: f32| a.abs()),
         Op::Trunc => un!(|a: f32| a.trunc()),
         Op::Pi => s.push(std::f32::consts::PI),
+        _ => return false,
+    }
+    true
+}
+
+#[inline(never)]
+fn exec_cold(s: &mut Stacks, op: &Op, p: &Program, state: &mut State, host: &mut dyn Host) {
+    match op {
+        Op::Macro(_) | Op::Random | Op::JumpIfZero(_) | Op::Jump(_) => unreachable!("handled by run_block"),
+        Op::Callback(n) => host.callback(p.name(*n), *n, s, state),
+        Op::SoundTrigger(n) => host.sound_trigger_vars(p.name(*n), *n, &state.vars),
+        Op::SoundTriggerFile(n) => {
+            let file = s.pop_str();
+            host.sound_trigger_file(p.name(*n), &file);
+        }
+        Op::LoadStr(id) => {
+            let v = state.str_vars[*id as usize].clone();
+            s.push_str(v)
+        }
+        Op::StoreStr(id) => state.str_vars[*id as usize] = s.sst[0].clone(),
+        Op::PushStr(i) => s.push_str(p.strings[*i as usize].clone()),
         Op::StackDump => host.stack_dump(s),
         Op::StrConcat => {
             let a = s.pop_str();
@@ -482,6 +497,8 @@ fn exec_op(s: &mut Stacks, op: &Op, p: &Program, state: &mut State, host: &mut d
             let v = str_to_float(&s.pop_str());
             s.push(v)
         }
+
+        _ => unreachable!("numeric ops run in exec_hot"),
     }
 }
 

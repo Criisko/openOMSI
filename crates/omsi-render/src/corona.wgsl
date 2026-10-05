@@ -290,7 +290,26 @@ fn fs_main(in: CoronaOut) -> @location(0) vec4<f32> {
 fn fs_enhanced(in: CoronaOut) -> @location(0) vec4<f32> {
     // (a fog cone is lit fog, not glare: it keeps the scene's level too)
     let scale = select(enh.exposure.w, enh.exposure.y, in.kind > 0.5);
-    return vec4<f32>(in.color.rgb * corona_shape(in) * in.color.a * scale, 1.0);
+    var shape = corona_shape(in);
+    // (taken here, in uniform control flow: how much of the sprite one pixel spans)
+    let r = length(in.uv - vec2<f32>(0.5)) * 2.0;
+    let px = fwidth(r);
+    if (in.kind < 0.5 && in.beam < 0.5) {
+        // A lamp seen through clear air is a small, very bright core with a faint ring of
+        // glare round it, not a lit disc as wide as its sprite (OMSI's glow bitmaps are
+        // flat discs with soft rims): a narrow core bright enough for the glow pass to
+        // spread it the way a lens does, a short falloff of glare, and a dim trace of the
+        // bitmap (which keeps a star's rays and a streak's shape). Mist, fog and rain
+        // scatter the light round the lamp, and there the full halo comes back.
+        let wet = clamp(enh.fog.x * 400.0 + enh.weather.z * 0.7, 0.0, 1.0);
+        // (the core never narrower than a pixel and a half: a far lamp stays a point of
+        // light, as the sprite's distance floor keeps it on the screen)
+        let lit = textureSampleLevel(t_corona, s_corona, vec2<f32>(0.5, 0.5), 0.0).rgb;
+        let w = max(0.1, px * 1.5);
+        let core = exp(-r * r / (w * w)) * 3.0 + exp(-r * 9.0) * 0.35;
+        shape = mix(core * max(lit, shape) + shape * 0.22, shape, wet);
+    }
+    return vec4<f32>(in.color.rgb * shape * in.color.a * scale, 1.0);
 }
 
 // Smoke ([smoke] particles): the smoke texture tinted with the particle's colour, lit by the

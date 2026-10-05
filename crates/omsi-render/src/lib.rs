@@ -4,6 +4,7 @@ pub mod atmosphere;
 pub mod clouds;
 pub mod dlss;
 mod puddles;
+mod rt;
 mod triple;
 pub use triple::{panel_width, ScreenView, TripleScreen};
 
@@ -80,6 +81,7 @@ struct PostUniform {
     a: [f32; 4],
     b: [f32; 4],
     c: [f32; 4],
+    d: [f32; 4],
 }
 
 /// The enhanced lighting (enhanced_common.wgsl `Enhanced`).
@@ -102,6 +104,13 @@ struct EnhancedUniform {
     /// x how bright an LED panel's dots burn (`Lighting::led_glow`), y how much of the
     /// mip chain an LED panel is held at (`Lighting::led_mips`)
     led: [f32; 4],
+    /// xyz towards the moon, w its angular radius
+    moon: [f32; 4],
+    /// rgb the moon disc's irradiance at the ground before the clouds, w how much of the
+    /// starry sky shows (the city's lamps and the haze wash the faint stars out)
+    moon_disc: [f32; 4],
+    /// rgb the sun's irradiance at the clouds' heights (`atmosphere::CLOUD_SUN_HEIGHTS`)
+    cloud_sun: [[f32; 4]; 4],
 }
 
 /// High-range colour targets of the enhanced path for one size: the multisampled one the
@@ -113,6 +122,9 @@ struct HdrTargets {
     /// The screen mask (`MASK_FORMAT`), multisampled and resolved like the picture.
     mask_msaa: Option<wgpu::TextureView>,
     mask: wgpu::TextureView,
+    /// Enhanced+: the reflections' surfaces (`GBUF_FORMAT`, `AUX_FORMAT`): (multisampled,
+    /// resolved) each.
+    gbuf: Option<[(Option<wgpu::TextureView>, wgpu::TextureView); 2]>,
     /// Glow levels at 1/2, 1/4, ... of the size, and the upsampled sums per level.
     down: Vec<wgpu::TextureView>,
     up: Vec<wgpu::TextureView>,
@@ -197,10 +209,16 @@ const METER_GAIN: f32 = 0.4;
 const METER_TARGET: f32 = -2.84;
 const METER_DARKEN: f32 = 0.6;
 const METER_BRIGHTEN: f32 = 0.8;
+/// The tone curve's contrast about mid grey by day and at night (see `tone_contrast`).
+const TONE_CONTRAST_DAY: f32 = 1.22;
+const TONE_CONTRAST_NIGHT: f32 = 0.94;
 /// How far night vision takes the colour out of a dark scene (post.wgsl `night_vision`).
-const NIGHT_VISION: f32 = 0.55;
+const NIGHT_VISION: f32 = 0.3;
 /// The sun's angular radius as drawn (a little larger than the real 0.27°).
 const SUN_RADIUS: f32 = 0.0065;
+/// The moon's, as drawn (the real one is as large as the sun's; a little more, as the
+/// eye sees it).
+const MOON_RADIUS: f32 = 0.0062;
 
 /// The textures of the ambient-occlusion pass for one target size.
 struct AoTargets {
@@ -333,7 +351,7 @@ struct GpuPointLight {
     color: [f32; 4],
     /// Spot direction and cosine of the outer cone (-2 = a point light).
     dir: [f32; 4],
-    /// Cosine of the inner cone, the core radius, the beam's gain towards its cut-off, the
+    /// Cosine of the inner cone, the core radius, a headlamp's beam (1 low, -1 full), the
     /// radius (`pos.w` is 0 on a light only the enhanced path draws, which the vanilla
     /// shader then passes by).
     extra: [f32; 4],
@@ -366,11 +384,8 @@ pub struct PointLight {
     /// The radius within which the light is at full strength (`[maplight]`'s); 0 = an
     /// eighth of `radius` (enhanced path; vanilla always takes the eighth).
     pub core: f32,
-    /// A headlight's beam (enhanced path): up to this many times stronger towards the
-    /// horizon than along its axis, so that the road far ahead is lit as a low beam lights
-    /// it rather than only the pool in front of the bumper (0 = an even cone). Negative: a
-    /// full beam, as many times stronger towards the horizon on either side of it (no
-    /// cut-off above).
+    /// A headlamp (enhanced path), lit by a road lamp's profile instead of the cone: 1 a low
+    /// beam, with its cut-off at the lamp's horizon, -1 a full beam, without; 0 any other light.
     pub beam: f32,
     /// Which path draws the light.
     pub mode: LightMode,
@@ -736,6 +751,21 @@ pub struct Lighting {
     /// The player's vehicle's velocity (m/s, world): at speed the airstream drives the drops
     /// on its glass up the windscreen and back along the side windows.
     pub glass_wind: Vec3,
+    /// Towards the moon (world space) and how much of its disc is lit (0 new .. 1 full):
+    /// the enhanced night's moonlight and the moon in its sky.
+    pub moon_dir: Vec3,
+    pub moon_illum: f32,
+    /// The day of the year (1..366) and the latitude (degrees north): the season's air.
+    pub day_of_year: f32,
+    pub latitude: f32,
+    /// One number per calendar day, which the enhanced sky draws the day's own air from.
+    pub day_seed: u32,
+    /// The optical depth of a high ice-cloud veil (0 none .. 2 a thick milky one).
+    pub veil: f32,
+    /// The air as a weather model knows it: aerosol amount relative to a clear day, its
+    /// Ångström exponent and its layer's depth (m); without it the day's own air is drawn
+    /// from the calendar (`day_air`).
+    pub air: Option<[f32; 3]>,
 }
 
 impl Lighting {
@@ -785,6 +815,13 @@ impl Default for Lighting {
             led_glow: 1.5,
             led_mips: 1.3,
             glass_wind: Vec3::ZERO,
+            moon_dir: Vec3::new(0.0, -0.5, -0.866),
+            moon_illum: 0.0,
+            day_of_year: 150.0,
+            latitude: 52.5,
+            day_seed: 0,
+            veil: 0.0,
+            air: None,
         }
     }
 }
@@ -796,6 +833,17 @@ pub type MaterialId = usize;
 pub struct GpuMesh {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
+    /// Where the mesh lies in its page's buffers (pages hold many meshes); `page` is its
+    /// page in the scene's list, `u32::MAX` for a page of its own.
+    page: u32,
+    base_vertex: i32,
+    first_index: u32,
+    vertex_offset: u64,
+    vertex_bytes: u64,
+    index_bytes: u64,
+    /// Which mesh this is (a page's range handed to another mesh is another): what the ray
+    /// tracer's structures are kept by, with the mesh's place.
+    gen: u64,
     pub ranges: Vec<(u32, u32, u32)>,
     pub bounds_center: Vec3,
     pub bounds_radius: f32,
@@ -902,6 +950,8 @@ pub struct Material {
     uniform: MaterialUniform,
     buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// Materials that draw alike (same textures, sampler and values) share this number.
+    look: u32,
 }
 
 impl Material {
@@ -1234,10 +1284,19 @@ pub struct Scene {
     /// their entries are rewritten. Rebuilding the whole per-draw buffer for 17 000 objects
     /// because one bus moved was the biggest single CPU cost of a frame.
     changed: Vec<usize>,
+    mesh_pages: Vec<MeshPage>,
     changed_mark: Vec<bool>,
     origin_moved: bool,
     cache_bounds: bool,
     bounds_meshes: Vec<bool>,
+    /// The meshes ever reshaped (skinned), and the instances drawing one of them, so that a
+    /// new pose rescans those instead of the whole scene; stale when an instance's mesh changes.
+    bounds_known: Vec<bool>,
+    bounds_users: Vec<usize>,
+    bounds_users_stale: bool,
+    /// A mesh slot was freed or taken by another mesh: its instances' bounds are redone once
+    /// by a scan of the whole scene, without counting the slot as reshaped.
+    bounds_rescan: bool,
     block_bounds: Vec<(DVec3, DVec3)>,
     block_dirty: Vec<bool>,
     block_cursor: usize,
@@ -1255,6 +1314,8 @@ pub struct Scene {
     /// 965 materials need about a tenth as many). Only for a frame, so that nothing keeps a
     /// freed or replaced texture alive.
     bind_groups: HashMap<BindKey, (wgpu::BindGroup, wgpu::Buffer)>,
+    /// The number of each material look seen so far, by its key's hash (see `Material::look`).
+    looks: hashbrown::HashMap<u64, u32>,
     /// The PBR maps of a diffuse texture (register them before making its materials).
     pub pbr_maps: HashMap<TextureId, PbrMaps>,
     /// Textures that are a season's snow pictures (`WinterSnow` folders): a material drawn
@@ -1270,6 +1331,22 @@ fn snow_texture_flag(scene: &Scene, texture: Option<TextureId>) -> f32 {
         1.0
     } else {
         0.0
+    }
+}
+
+impl Scene {
+    /// The look number of a material bind group made of `key` (numbers start at 1; 0 is the
+    /// shared look of the opaque depth-only draws).
+    fn look(&mut self, key: &BindKey) -> u32 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        self.intern_look(h.finish())
+    }
+
+    fn intern_look(&mut self, hash: u64) -> u32 {
+        let next = self.looks.len() as u32 + 1;
+        *self.looks.entry(hash).or_insert(next)
     }
 }
 
@@ -1292,22 +1369,24 @@ impl Scene {
             .unwrap_or_default()
     }
 
+    /// Bytes the meshes' pages take on the GPU, each page once, whatever share of it is in use.
+    pub fn mesh_page_bytes(&self) -> u64 {
+        let shared: u64 = self.mesh_pages.iter().map(|p| p.vertex.size() + p.index.size()).sum();
+        // (a set: without base vertices every mesh has buffers of its own, thousands of them)
+        let mut own: std::collections::HashSet<&wgpu::Buffer> = std::collections::HashSet::new();
+        for m in self.meshes.iter().filter(|m| m.page == u32::MAX && !m.ranges.is_empty()) {
+            if own.insert(&m.vertex_buf) {
+                own.insert(&m.index_buf);
+            }
+        }
+        shared + own.iter().map(|b| b.size()).sum::<u64>()
+    }
+
     /// Bytes on the GPU: (textures, mesh buffers, per-draw and light buffers). Freed slots
     /// share one small placeholder, which is not counted.
     pub fn gpu_bytes(&self) -> (u64, u64, u64) {
         let tex = self.textures.iter().map(|t| t.bytes).sum();
-        let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
-        let mut mesh = 0u64;
-        for m in &self.meshes {
-            if m.ranges.is_empty() {
-                continue;
-            }
-            for b in [&m.vertex_buf, &m.index_buf] {
-                if seen.insert(b as *const wgpu::Buffer as *const ()) {
-                    mesh += b.size();
-                }
-            }
-        }
+        let mesh = self.mesh_page_bytes();
         let other = [&self.model_buf, &self.params_buf, &self.light_buf, &self.grid_buf, &self.draw_buf]
             .iter()
             .filter_map(|b| b.as_ref())
@@ -1843,7 +1922,7 @@ fn gl_worker_turn() -> Option<std::sync::MutexGuard<'static, ()>> {
 
 /// The card's own memory in MB where the system tells it: Windows, through DXGI, for
 /// whichever backend draws; Linux, through the DRM driver's sysfs (amdgpu; not
-/// NVIDIA's own driver) - wgpu does not say.
+/// NVIDIA's own driver, whose memory [`vulkan_vram_mb`] reads from Vulkan instead).
 fn dedicated_vram_mb(info: &wgpu::AdapterInfo) -> Option<u64> {
     #[cfg(windows)]
     unsafe {
@@ -1892,6 +1971,25 @@ fn dedicated_vram_mb(info: &wgpu::AdapterInfo) -> Option<u64> {
     }
 }
 
+/// The largest device-local memory heap of a Vulkan adapter (MB).
+#[cfg(target_os = "linux")]
+fn vulkan_vram_mb(adapter: &wgpu::Adapter) -> Option<u64> {
+    // SAFETY: the adapter outlives the borrow, and only its memory properties are read
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+    // SAFETY: the physical device belongs to this instance
+    let props = unsafe { hal.shared_instance().raw_instance().get_physical_device_memory_properties(hal.raw_physical_device()) };
+    props.memory_heaps[..props.memory_heap_count as usize]
+        .iter()
+        .filter(|h| h.flags.contains(ash::vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .map(|h| h.size >> 20)
+        .max()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn vulkan_vram_mb(_adapter: &wgpu::Adapter) -> Option<u64> {
+    None
+}
+
 pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -1916,6 +2014,10 @@ pub struct Renderer {
     cloud_shape_view: wgpu::TextureView,
     cloud_detail_view: wgpu::TextureView,
     cloud_sampler: wgpu::Sampler,
+    /// The shape map's second level (RGBA8), for the clouds' shadow on the street, and how
+    /// much of the sun the clouds let through over the camera now (smoothed).
+    cloud_shape_cpu: Vec<u8>,
+    cloud_sun: Option<f32>,
     sky_mesh: (wgpu::Buffer, wgpu::Buffer, u32),
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_layout: wgpu::BindGroupLayout,
@@ -2021,6 +2123,10 @@ pub struct Renderer {
     mip_sampler: wgpu::Sampler,
     /// Set by the device's error handler when something failed with multisampling on.
     gpu_error: Arc<std::sync::atomic::AtomicBool>,
+    /// A GPU error while Enhanced+ traces rays: its ray tracing is left out from the next
+    /// frame on (a frame whose commands the device refused shows nothing at all - left to
+    /// go on, the picture stood still on the loading screen while the game ran behind it).
+    rt_error: Arc<std::sync::atomic::AtomicBool>,
     /// The headset's pictures: the heading (degrees) the `[matl_envmap]` sphere maps are
     /// laid out by instead of each eye's view (see `set_env_heading`).
     env_heading: std::cell::Cell<Option<f32>>,
@@ -2095,6 +2201,10 @@ pub struct Renderer {
     pending_meshes: std::cell::RefCell<Vec<(MeshId, Vec<u8>)>>,
     /// What a freed mesh and a freed material hold (see `free_mesh`), made once.
     freed: std::cell::OnceCell<Freed>,
+    /// Enhanced+: the ray tracer (on a device with ray queries, see `RenderOptions::ray_tracing`).
+    rt: Option<rt::RayTracer>,
+    /// Meshes share pages of buffers (the adapter draws with a base vertex).
+    mesh_pages: bool,
 }
 
 /// The placeholders freed scene slots share: an empty vertex and index buffer and a plain
@@ -2157,6 +2267,10 @@ pub struct RenderOptions {
     /// Mali and Adreno drivers before the first frame, #364, #333, #316, #371). Asked for,
     /// they are built on every device and graphics API; a computer always builds them.
     pub no_enhanced: bool,
+    /// Enhanced+: the enhanced path with ray-traced sun shadows, ambient occlusion and
+    /// reflections, where the device can trace rays (hardware ray queries); elsewhere the
+    /// enhanced picture as it is.
+    pub ray_tracing: bool,
     /// NVIDIA DLSS (or DLAA) instead of multisampling, FXAA and the render scale: DirectX 12
     /// on a GeForce RTX with Streamline's DLLs beside the game (see `dlss`). Elsewhere, or
     /// when it cannot start, the picture is drawn as without it.
@@ -2181,6 +2295,7 @@ impl Default for RenderOptions {
             shadow_blobs: true,
             reflections: true,
             no_enhanced: false,
+            ray_tracing: false,
             dlss: DlssMode::Off,
         }
     }
@@ -2209,12 +2324,23 @@ pub const LAMP_CODE_STRIDE: u32 = 64;
 /// reflected-light weight; a is blend coverage. Sharing this attachment avoids another
 /// geometry pass or a full normal/material buffer just for water.
 const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Enhanced+: the enhanced pass's third and fourth targets, what the ray-traced reflections
+/// start from (rt.wgsl): the surface's normal (xyz) and how much it reflects (w), and its
+/// view depth and roughness (rg) - all weighted by that reflection (premultiplied), so that
+/// a pane blended over a wet road leaves the stronger reflection's surface in them.
+const GBUF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const AUX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Float;
+/// The renderer is built for Enhanced+: its HDR pipelines and targets have the two above.
+static RT_GBUF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn rt_gbuf() -> bool {
+    RT_GBUF.load(std::sync::atomic::Ordering::Relaxed)
+}
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// The colour targets of a pipeline drawing into `format`: Enhanced and classic puddle
 /// shading draw into `HDR_FORMAT` with the screen mask beside it,
 /// written by the scene's own shader only (`mask`), coverage-blended where the colour is.
-fn color_targets(format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, write: wgpu::ColorWrites, mask: bool) -> Vec<Option<wgpu::ColorTargetState>> {
+fn color_targets(format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, write: wgpu::ColorWrites, mask: bool, gbuf: bool) -> Vec<Option<wgpu::ColorTargetState>> {
     let mut v = vec![Some(wgpu::ColorTargetState { format, blend, write_mask: write })];
     if format == HDR_FORMAT {
         v.push(Some(wgpu::ColorTargetState {
@@ -2225,6 +2351,16 @@ fn color_targets(format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, w
             }),
             write_mask: if mask { wgpu::ColorWrites::ALL } else { wgpu::ColorWrites::empty() },
         }));
+        if rt_gbuf() {
+            // (premultiplied by the reflection's weight, the shader's alpha)
+            let over = blend.map(|_| wgpu::BlendState {
+                color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+                alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+            });
+            let write = if gbuf { wgpu::ColorWrites::ALL } else { wgpu::ColorWrites::empty() };
+            v.push(Some(wgpu::ColorTargetState { format: GBUF_FORMAT, blend: over, write_mask: write }));
+            v.push(Some(wgpu::ColorTargetState { format: AUX_FORMAT, blend: over, write_mask: write }));
+        }
     }
     v
 }
@@ -2303,13 +2439,13 @@ impl Renderer {
         // a discrete card is taken for one of 2-4 GB, whose rest the pictures (the render
         // targets, the shadow maps) and the driver need; an integrated one shares the
         // system's memory, Apple's generously
-        let vram = dedicated_vram_mb(&info);
+        let vram = dedicated_vram_mb(&info).or_else(|| vulkan_vram_mb(&adapter));
         let guess_mb: u64 = match info.device_type {
             // (a card of 2 or 3 GB, where Windows says: half of it - 1600 MB of a GTX 1050's
             // 2 GB left too little for the rest, and its Vulkan device was lost at the start;
             // a card of 2 GB a third of it - with half, 4x MSAA, SSAO and the shadows its
             // DirectX 12 device still ran out of memory on Grundorf within seconds, #114)
-            wgpu::DeviceType::DiscreteGpu => vram.filter(|v| *v >= 512).map_or(1600, |v| if v <= 2560 { v * 35 / 100 } else { (v / 2).min(1600) }),
+            wgpu::DeviceType::DiscreteGpu => vram.filter(|v| *v >= 512).map_or(1600, |v| if v <= 2560 { v * 35 / 100 } else if v <= 6144 { (v / 2).min(1600) } else { v * 3 / 10 }),
             wgpu::DeviceType::IntegratedGpu if info.backend == wgpu::Backend::Metal => 3000,
             wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::VirtualGpu => 1000,
             _ => 800,
@@ -2467,6 +2603,21 @@ impl Renderer {
             // textures are decoded to RGBA by upload_texture on this device.
             required_features = wgpu::Features::empty();
         }
+        // Enhanced+: hardware ray queries where the device has them (Apple silicon from the
+        // M3/A17 on, RTX and RDNA 2 cards and newer through Vulkan and Direct3D 12 - with DXC,
+        // which the Windows build ships beside the game); OMSI_NO_RT=1 leaves them out. Should
+        // the device refuse its work all the same, it falls back to Enhanced (`rt_error`).
+        let ray_query = options.ray_tracing
+            && !intel_vulkan_safe
+            && info.backend != wgpu::Backend::Noop
+            && adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
+            && omsi_cfg::env::var_os("OMSI_NO_RT").is_none();
+        if ray_query {
+            required_features |= wgpu::Features::EXPERIMENTAL_RAY_QUERY;
+            limits = limits.using_acceleration_structure_values(adapter.limits());
+        } else if options.ray_tracing {
+            log::warn!("{}: no hardware ray queries; Enhanced+ is drawn as Enhanced", info.name);
+        }
         // the per-draw arrays as storage buffers where the device reads them in a vertex
         // shader (three there, two lights arrays in a fragment shader), else as textures;
         // OMSI_GPU_ARRAYS=textures|nostorage takes those paths on any device
@@ -2496,6 +2647,8 @@ impl Renderer {
                 // "Out of memory" in the first frames with the textures well under budget,
                 // #332, #295)
                 memory_hints: if weak || modest || vram.is_some_and(|v| v <= 4200) { wgpu::MemoryHints::MemoryUsage } else { wgpu::MemoryHints::Performance },
+                // (the ray queries are still an experimental feature of wgpu)
+                experimental_features: if ray_query { unsafe { wgpu::ExperimentalFeatures::enabled() } } else { wgpu::ExperimentalFeatures::disabled() },
                 ..Default::default()
             })
             .await
@@ -2533,8 +2686,10 @@ impl Renderer {
             // 16x showed none of it - 16x kept the far dashes narrow where 8x smeared them
             // sideways - so 16x is the player's choice again, 8x the default)
             anisotropy: options.anisotropy.clamp(1, 16),
+            ray_tracing: ray_query,
             ..options
         };
+        RT_BUFFERS.store(ray_query, std::sync::atomic::Ordering::Relaxed);
         let bc = device
             .features()
             .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
@@ -2553,8 +2708,9 @@ impl Renderer {
             format,
             options,
         );
+        let mesh_pages = adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::BASE_VERTEX);
         match scope.pop().await {
-            None => Ok(renderer),
+            None => Ok(Renderer { mesh_pages, ..renderer }),
             Some(e) if options.msaa > 1 => {
                 log::error!(
                     "{}x MSAA failed on {}: {}; drawing without multisampling",
@@ -2563,13 +2719,13 @@ impl Renderer {
                     gpu_error_text(&e)
                 );
                 drop(renderer);
-                Ok(Self::build(
+                Ok(Renderer { mesh_pages, ..Self::build(
                     device,
                     queue,
                     format!("{} ({:?})", info.name, info.backend),
                     format,
                     RenderOptions { msaa: 1, ..options },
-                ))
+                ) })
             }
             Some(e) => Err(anyhow!("renderer pipelines: {}", gpu_error_text(&e))),
         }
@@ -2584,6 +2740,7 @@ impl Renderer {
         options: RenderOptions,
     ) -> Renderer {
         let (msaa, shadow_size) = (options.msaa, options.shadow_size);
+        RT_GBUF.store(options.ray_tracing, std::sync::atomic::Ordering::Relaxed);
         // A GPU error while multisampling is on is logged and switches multisampling off
         // at the next frame (`render_inner`). Otherwise it is logged and the game goes on:
         // wgpu's own handler ends the process, and one call a driver refused (a limit of
@@ -2591,6 +2748,7 @@ impl Renderer {
         // drive - a wrong picture for a frame is better than no game. The first errors and
         // then every thousandth reach the log.
         let gpu_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rt_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let out_of_memory = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let device_lost: Arc<std::sync::Mutex<Option<String>>> = Default::default();
         {
@@ -2606,6 +2764,8 @@ impl Renderer {
         }
         {
             let flag = gpu_error.clone();
+            let rt_flag = rt_error.clone();
+            let rt_on = options.ray_tracing;
             let oom = out_of_memory.clone();
             let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
             device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
@@ -2613,7 +2773,12 @@ impl Renderer {
                     oom.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if msaa > 1 && !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if rt_on {
+                    // (the ray tracing goes first: the likelier cause, and the dearer feature)
+                    if !rt_flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        log::error!("GPU error with ray tracing (Enhanced+ draws as Enhanced from now on): {}", gpu_error_text(&e));
+                    }
+                } else if msaa > 1 && !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     log::error!("GPU error with {msaa}x MSAA (drawing without it from now on): {}", gpu_error_text(&e));
                 } else if n < 20 || n % 1000 == 0 {
                     log::error!("GPU error #{} (the game goes on): {}", n + 1, gpu_error_text(&e));
@@ -2728,6 +2893,7 @@ impl Renderer {
                     cull: bool,
                     bias: i32,
                     alpha_to_coverage: bool,
+                    terrain_paint: bool,
                     samples: u32| {
             let use_alpha_to_coverage = alpha_to_coverage && samples > 1;
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2771,9 +2937,10 @@ impl Renderer {
                         blend,
                         if fs == "fs_surface_depth" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
                         fs != "fs_surface_depth",
+                        fs == "fs_enhanced",
                     ),
-                    // only the alpha-tested pipelines keep their `discard` (see ALPHA_TEST
-                    // in shader.wgsl): early depth testing for everything else
+                    // Only cutouts and painted terrain keep their discard; opaque and
+                    // ordinary blended materials retain early depth testing.
                     compilation_options: wgpu::PipelineCompilationOptions {
                         constants: &[
                             ("ALPHA_TEST", if alpha_to_coverage { 1.0 } else { 0.0 }),
@@ -2781,6 +2948,7 @@ impl Renderer {
                                 "ALPHA_TO_COVERAGE",
                                 if use_alpha_to_coverage { 1.0 } else { 0.0 },
                             ),
+                            ("TERRAIN_PAINT", if terrain_paint { 1.0 } else { 0.0 }),
                         ],
                         ..Default::default()
                     },
@@ -2797,9 +2965,9 @@ impl Renderer {
         let scene_pipelines = |f: wgpu::TextureFormat, fs: &str, samples: u32| -> Vec<wgpu::RenderPipeline> {
             let mut out = Vec::with_capacity(PIPE_KINDS as usize * 4);
             for kind in 0..PIPE_KINDS {
-                let blend = (kind == PIPE_BLEND || kind == PIPE_BLEND_NO_WRITE)
+                let blend = matches!(kind, PIPE_BLEND | PIPE_BLEND_NO_WRITE | PIPE_TERRAIN_PAINT)
                     .then_some(wgpu::BlendState::ALPHA_BLENDING);
-                let depth_write = kind != PIPE_BLEND_NO_WRITE;
+                let depth_write = kind != PIPE_BLEND_NO_WRITE && kind != PIPE_TERRAIN_PAINT;
                 for cull in [false, true] {
                     for surface in [false, true] {
                         out.push(make(
@@ -2810,6 +2978,7 @@ impl Renderer {
                             cull,
                             if surface { bias } else { 0 },
                             kind == PIPE_ALPHA_TEST,
+                            kind == PIPE_TERRAIN_PAINT && fs == "fs_enhanced",
                             samples,
                         ));
                     }
@@ -3135,7 +3304,7 @@ impl Renderer {
                 fragment: Some(wgpu::FragmentState {
                     module: &corona_shader,
                     entry_point: Some(fs),
-                    targets: &color_targets(f, Some(blend), wgpu::ColorWrites::COLOR, false),
+                    targets: &color_targets(f, Some(blend), wgpu::ColorWrites::COLOR, false, false),
                     compilation_options: Default::default(),
                 }),
                 multiview_mask: None,
@@ -3227,7 +3396,7 @@ impl Renderer {
                 },
             ],
         });
-        let (cloud_shape_view, cloud_detail_view, cloud_sampler) = cloud_noise_textures(&device, &queue);
+        let (cloud_shape_view, cloud_detail_view, cloud_sampler, cloud_shape_cpu) = cloud_noise_textures(&device, &queue);
         log::info!("renderer: compiling the sky and clouds shaders");
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky"),
@@ -3274,7 +3443,7 @@ impl Renderer {
                 fragment: Some(wgpu::FragmentState {
                     module: &sky_shader,
                     entry_point: Some(fs),
-                    targets: &color_targets(f, None, wgpu::ColorWrites::COLOR, false),
+                    targets: &color_targets(f, None, wgpu::ColorWrites::COLOR, false, false),
                     compilation_options: Default::default(),
                 }),
                 multiview_mask: None,
@@ -3670,9 +3839,10 @@ impl Renderer {
                 motion_layout,
             }
         });
-        // (not on Apple's GPUs: their tile renderer drops hidden opaque fragments by itself,
-        // and the extra pass only cost what it saved)
-        let prepass_msaa_pipelines = (msaa > 1 && !cfg!(target_vendor = "apple")).then(|| {
+        // Apple views with cutout/blended draws also need these pipelines: their
+        // visibility depends on shading, unlike opaque hidden-surface removal.
+        // Purely opaque Apple views still skip this pass below to avoid its cost.
+        let prepass_msaa_pipelines = (msaa > 1).then(|| {
             [(0, false), (0, true), (1, false), (1, true), (2, false), (2, true)]
                 .map(|(kind, cull)| make_prepass_samples(kind, cull, msaa))
         });
@@ -4375,6 +4545,7 @@ impl Renderer {
         let puddles = (!gl && !leave_out_enhanced).then(|| {
             puddles::Pipelines::new(&device, &shader, &camera_layout, &material_layout)
         });
+        let rt = options.ray_tracing.then(|| rt::RayTracer::new(&device));
         Renderer {
             _device_poller: DevicePoller::start(&device),
             upscale_pipeline,
@@ -4462,6 +4633,8 @@ impl Renderer {
             cloud_shape_view,
             cloud_detail_view,
             cloud_sampler,
+            cloud_shape_cpu,
+            cloud_sun: None,
             sky_mesh,
             overlay_pipeline,
             overlay_layout,
@@ -4481,6 +4654,7 @@ impl Renderer {
             shadow_blobs: options.shadow_blobs,
             options,
             gpu_error,
+            rt_error,
             env_heading: Default::default(),
             out_of_memory,
             device_lost,
@@ -4500,6 +4674,8 @@ impl Renderer {
             },
             pending_meshes: Default::default(),
             freed: std::cell::OnceCell::new(),
+            rt,
+            mesh_pages: false,
         }
     }
 
@@ -4722,10 +4898,15 @@ impl Renderer {
             overlay_res: Vec::new(),
             dirty: true,
             changed: Vec::new(),
+            mesh_pages: Vec::new(),
             changed_mark: Vec::new(),
             origin_moved: false,
             cache_bounds: omsi_cfg::env::var_os("OMSI_NO_BOUNDS_CACHE").is_none(),
             bounds_meshes: Vec::new(),
+            bounds_known: Vec::new(),
+            bounds_users: Vec::new(),
+            bounds_users_stale: true,
+            bounds_rescan: false,
             bounds_dirty: false,
             block_bounds: Vec::new(),
             block_dirty: Vec::new(),
@@ -4738,6 +4919,7 @@ impl Renderer {
             last_grid: Vec::new(),
             last_lights: Vec::new(),
             bind_groups: HashMap::new(),
+            looks: hashbrown::HashMap::new(),
             pbr_maps: HashMap::new(),
             snow_textures: Default::default(),
         }
@@ -4748,6 +4930,7 @@ impl Renderer {
     pub fn set_instance_mesh(&self, scene: &mut Scene, instance: usize, mesh: MeshId) {
         if scene.instances[instance].mesh != mesh {
             scene.instances[instance].mesh = mesh;
+            scene.bounds_users_stale = true;
             Self::mark_changed(scene, instance);
         }
     }
@@ -4773,7 +4956,7 @@ impl Renderer {
             .collect();
         let bytes: &[u8] = bytemuck::cast_slice(&verts);
         let m = &mut scene.meshes[id];
-        if (m.vertex_buf.size() as usize) < bytes.len() {
+        if (m.vertex_bytes as usize) < bytes.len() {
             return;
         }
         {
@@ -4802,19 +4985,41 @@ impl Renderer {
     /// creation failed validation and mapping it panicked (Windows, Vulkan).
     fn flush_pending_meshes(&self, scene: &Scene, _encoder: &mut wgpu::CommandEncoder) {
         let pending = std::mem::take(&mut *self.pending_meshes.borrow_mut());
+        if let Some(rt) = self.rt.as_ref() {
+            rt.meshes_changed(pending.iter().map(|(id, _)| *id));
+        }
         for (id, b) in &pending {
             let Some(m) = scene.meshes.get(*id) else { continue };
             let len = (b.len() as u64) / 4 * 4;
-            if len == 0 || m.vertex_buf.size() < len {
+            if len == 0 || m.vertex_bytes < len {
                 continue;
             }
-            self.queue.write_buffer(&m.vertex_buf, 0, &b[..len as usize]);
+            self.queue.write_buffer(&m.vertex_buf, m.vertex_offset, &b[..len as usize]);
         }
     }
 
     pub fn add_mesh(&self, scene: &mut Scene, data: &MeshData) -> MeshId {
-        scene.meshes.push(make_mesh(&self.device, &self.queue, data));
+        let (vb, ib) = mesh_page_bytes(data);
+        let mesh = if vb > MESH_PAGE_VERTEX_BYTES / 4 || ib > MESH_PAGE_INDEX_BYTES / 4 || !self.mesh_pages {
+            make_meshes(&self.device, &self.queue, &[data], true).pop().expect("one mesh")
+        } else {
+            let found = scene.mesh_pages.iter_mut().enumerate().find_map(|(k, p)| p.take(vb, ib).map(|at| (k, at)));
+            let (k, at) = found.unwrap_or_else(|| {
+                let mut page = MeshPage::new(&self.device, MESH_PAGE_VERTEX_BYTES, MESH_PAGE_INDEX_BYTES);
+                let at = page.take(vb, ib).expect("a new page holds a mesh a quarter its size");
+                scene.mesh_pages.push(page);
+                (scene.mesh_pages.len() - 1, at)
+            });
+            scene.mesh_pages[k].place(&self.queue, data, k as u32, at)
+        };
+        scene.meshes.push(mesh);
         scene.meshes.len() - 1
+    }
+
+    /// Whether this renderer's adapter draws meshes from shared pages (it can draw with a
+    /// base vertex); [`prepare_meshes`] is told it.
+    pub fn mesh_pages(&self) -> bool {
+        self.mesh_pages
     }
 
     /// Put a mesh made on another thread ([`prepare_mesh`]) into the scene.
@@ -4945,13 +5150,7 @@ impl Renderer {
     /// Bytes the meshes' vertex and index buffers take on the GPU (the freed ones' shared
     /// placeholder not counted).
     pub fn mesh_bytes(&self, scene: &Scene) -> u64 {
-        let freed = self.freed.get().map(|f| (f.vertex_buf.clone(), f.index_buf.clone()));
-        scene
-            .meshes
-            .iter()
-            .filter(|m| freed.as_ref().is_none_or(|(v, _)| m.vertex_buf != *v))
-            .map(|m| m.vertex_buf.size() + m.index_buf.size())
-            .sum()
+        scene.mesh_page_bytes()
     }
 
     pub fn texture_bytes(&self, scene: &Scene) -> u64 {
@@ -5441,6 +5640,7 @@ impl Renderer {
             address,
             uniform: bytemuck::cast(uniform),
         };
+        let look = scene.look(&key);
         let (bind_group, buf) = match scene.bind_groups.get(&key) {
             Some((bg, b)) => (bg.clone(), b.clone()),
             None => {
@@ -5492,6 +5692,7 @@ impl Renderer {
             uniform,
             buf,
             bind_group,
+            look,
         });
         Some(scene.materials.len() - 1)
     }
@@ -5748,6 +5949,7 @@ impl Renderer {
             address,
             uniform: bytemuck::cast(uniform),
         };
+        let look = scene.look(&key);
         let (bind_group, buf) = match scene.bind_groups.get(&key) {
             Some((bg, b)) => (bg.clone(), b.clone()),
             None => {
@@ -5793,6 +5995,7 @@ impl Renderer {
             uniform,
             buf,
             bind_group,
+            look,
         });
         scene.materials.len() - 1
     }
@@ -6163,6 +6366,9 @@ impl Renderer {
             casts_shadow: true,
             roof: None,
         });
+        if scene.bounds_known.get(mesh).copied().unwrap_or(false) {
+            scene.bounds_users.push(scene.instances.len() - 1);
+        }
         scene.instances.len() - 1
     }
 
@@ -6214,6 +6420,9 @@ impl Renderer {
             casts_shadow: false,
             roof: None,
         });
+        if scene.bounds_known.get(mesh).copied().unwrap_or(false) {
+            scene.bounds_users.push(scene.instances.len() - 1);
+        }
         scene.instances.len() - 1
     }
 
@@ -6445,6 +6654,23 @@ impl Renderer {
         scene.bounds_meshes.resize(scene.meshes.len(), false);
         scene.bounds_meshes[mesh] = true;
         scene.bounds_dirty = true;
+        scene.bounds_known.resize(scene.meshes.len(), false);
+        if !scene.bounds_known[mesh] {
+            scene.bounds_known[mesh] = true;
+            scene.bounds_users_stale = true;
+        }
+    }
+
+    /// Slot `mesh` holds another mesh now (freed, or recycled): no longer a reshaped one.
+    fn mesh_slot_replaced(scene: &mut Scene, mesh: MeshId) {
+        scene.bounds_meshes.resize(scene.meshes.len(), false);
+        scene.bounds_meshes[mesh] = true;
+        scene.bounds_dirty = true;
+        scene.bounds_rescan = true;
+        if scene.bounds_known.get(mesh).copied().unwrap_or(false) {
+            scene.bounds_known[mesh] = false;
+            scene.bounds_users_stale = true;
+        }
     }
 
     fn prepare_bounds(scene: &mut Scene) {
@@ -6479,7 +6705,20 @@ impl Renderer {
             if scene.bounds_dirty {
                 // Skinning can alter a shared mesh without changing any model matrix.
                 // Scan once per pose update, rather than once per shadow/mirror view.
-                for (k, i) in scene.instances.iter_mut().enumerate() {
+                if scene.bounds_users_stale {
+                    let known = &scene.bounds_known;
+                    scene.bounds_users = (0..scene.instances.len()).filter(|&k| known.get(scene.instances[k].mesh).copied().unwrap_or(false)).collect();
+                    scene.bounds_users_stale = false;
+                }
+                let all: Vec<usize>;
+                let scan: &[usize] = if std::mem::take(&mut scene.bounds_rescan) {
+                    all = (0..scene.instances.len()).collect();
+                    &all
+                } else {
+                    &scene.bounds_users
+                };
+                for &k in scan {
+                    let Some(i) = scene.instances.get_mut(k) else { continue };
                     if scene.bounds_meshes.get(i.mesh).copied().unwrap_or(false) {
                         i.bounds = InstanceBounds::new(&scene.meshes[i.mesh], i.transform);
                         grow(&mut scene.block_bounds[k / CULL_BLOCK], i);
@@ -6763,6 +7002,9 @@ impl Renderer {
         let view = target("hdr", w, h, fmt, 1);
         let mask_msaa = (self.options.msaa > 1).then(|| target("screen mask msaa", w, h, MASK_FORMAT, self.options.msaa));
         let mask = target("screen mask", w, h, MASK_FORMAT, 1);
+        let gbuf = rt_gbuf().then(|| {
+            [GBUF_FORMAT, AUX_FORMAT].map(|f| ((self.options.msaa > 1).then(|| target("rt surfaces msaa", w, h, f, self.options.msaa)), target("rt surfaces", w, h, f, 1)))
+        });
         // the glow: halving until the smallest level is a few dozen pixels across
         let levels = GLOW_LEVELS
             .min((w.min(h).max(16) as f32).log2() as usize - 3)
@@ -6836,6 +7078,7 @@ impl Renderer {
                 view,
                 mask_msaa,
                 mask,
+                gbuf,
                 down,
                 up,
                 ldr,
@@ -6925,10 +7168,46 @@ impl Renderer {
             }
         }
         let input_overcast = input.overcast;
+        // the cumulus over the street: how much of the sun gets through them along the sun's
+        // way from here, a little blurred (a cloud's shadow has a soft edge tens of metres
+        // wide) and followed over a moment as the clouds drift
+        let cloud_t = {
+            let now = if lighting.enhanced && lighting.cloud_density > 0.0 {
+                cloud_sun_transmittance(&self.cloud_shape_cpu, lighting, cam_rel, ro)
+            } else {
+                1.0
+            };
+            let k = if self.instant_exposure || dt <= 0.0 { 1.0 } else { 1.0 - (-dt / 0.7).exp() };
+            if omsi_cfg::env::var_os("OMSI_DEBUG_SKY").is_some() {
+                // (what share of the sky's directions are clear, against the cover asked for)
+                let mut clear = 0;
+                let mut n = 0;
+                for i in 0..64 {
+                    let az = i as f32 * 0.7;
+                    let el = 0.25 + (i % 8) as f32 * 0.09;
+                    let mut l = lighting.clone();
+                    l.sun_dir = Vec3::new(el.cos() * az.cos(), el.cos() * az.sin(), el.sin());
+                    if cloud_sun_transmittance(&self.cloud_shape_cpu, &l, cam_rel, ro) > 0.5 {
+                        clear += 1;
+                    }
+                    n += 1;
+                }
+                log::info!("cloud sun: {now:.3} here, {clear} of {n} directions clear (cover {:.2})", lighting.cloud_density);
+            }
+            let t = self.cloud_sun.map(|c| c + (now - c) * k).unwrap_or(now);
+            self.cloud_sun = Some(t);
+            t
+        };
         let st = self.sky_state.as_ref().expect("sky state");
         // the exposure follows the light over a second or two (in log space); an offscreen
         // picture and the first frame take it at once
-        let target = st.exposure.max(1e-6).ln();
+        // (the eye takes to a cloud's shadow as to any other light: the exposure is for the
+        // sun the street actually gets)
+        // (half of the way in log terms: a camera, and the eye, take a cloud's shadow as
+        // darker - it is darker - only not as much as the light meter says)
+        let full = st.exposure.max(1e-6).ln();
+        let shaded = atmosphere::exposure_for(st.e_sun * cloud_t + st.e_rest).max(1e-6).ln();
+        let target = full + (shaded - full) * CLOUD_SHADE_ADAPT;
         let log_exposure = match self.exposure {
             Some(e) if !self.instant_exposure && dt > 0.0 => {
                 e + (target - e) * (1.0 - (-dt / 1.5).exp())
@@ -6946,9 +7225,10 @@ impl Renderer {
             / 6.0;
         let fog_rgb = avg * 0.9 / std::f32::consts::PI;
         let weather_fog = enhanced_weather_fog(lighting);
-        // (the air near the ground: the Rayleigh part and half the aerosols of the sky
-        // model's, whose layer is thinner where a street is than its average)
-        let clear_air = 1.3e-5 + 2.2e-5 * input.haze;
+        // (the air near the ground: the Rayleigh part and more than the sky model's
+        // average aerosol - a city's air near the ground holds its dust and exhaust, which is what gives a street its depth - the houses a few
+        // hundred metres off a shade paler and bluer than the ones beside the road)
+        let clear_air = 1.8e-5 + 3.6e-5 * input.haze;
         // the fog lies on the ground under the player's vehicle, or just under the camera
         let base = match lighting.fog_base.or(lighting.inside.map(|v| v.0.z)) {
             Some(z) => (z - ro.z) as f32,
@@ -7000,7 +7280,7 @@ impl Renderer {
         let u = EnhancedUniform {
             // (self-lit surfaces at their own brightness after the metering, see ExposureLog)
             exposure: [pre, 2f32.powf(-self.exposure_log.as_ref().map(|l| l.ev).unwrap_or(0.0)).clamp(0.7, 1.6), pre * WINDOW_RADIANCE, 1.6],
-            sun: st.sun.extend(SUN_RADIUS).to_array(),
+            sun: (st.sun * cloud_t).extend(SUN_RADIUS).to_array(),
             sh,
             ground: st.ground.extend(st.lut_scale).to_array(),
             fog: [weather_fog, FOG_FALLOFF, base, clear_air],
@@ -7022,13 +7302,24 @@ impl Renderer {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1.0),
-                0.0,
+                // the tone curve's contrast, which self-lit pictures undo (`display_level`)
+                tone_contrast(log_exposure),
             ],
             eye: eye_off.extend(0.0).to_array(),
             // x how bright an LED panel's dots burn (see `MaterialExtra::led`; the settings'
             // 16 levels give 0 = off .. 3.75), y whether the LED panels' `\S:n` masks keep
             // their mip chain (0: at full resolution, the dots stay visible when small)
             led: [lighting.led_glow, lighting.led_mips, 0.0, 0.0],
+            moon: lighting.moon_dir.normalize_or_zero().extend(MOON_RADIUS).to_array(),
+            // (w of the first: the veil's optical depth, which the sky draws as the high
+            // layer; of the second: how far the veil spreads the sun, which softens shadows)
+            cloud_sun: {
+                let mut c = st.sun_at.map(|c| c.extend(0.0).to_array());
+                c[0][3] = st.input.veil;
+                c[1][3] = 1.0 - (-st.input.veil / st.input.sun_dir.z.max(0.03)).exp();
+                c
+            },
+            moon_disc: st.moon_disc.extend((1.0 - 0.18 * (st.input.haze - 1.0).max(0.0)).clamp(0.2, 1.0) * 0.55).to_array(),
         };
         self.queue
             .write_buffer(&self.enh_buf, 0, bytemuck::bytes_of(&u));
@@ -7315,10 +7606,13 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
+                    // (Enhanced+: the traced lighting, full size, in place of the SSAO)
                     resource: wgpu::BindingResource::TextureView(
-                        self.ao
+                        self.rt
                             .as_ref()
-                            .map(|a| &a.blur_view)
+                            .and_then(|r| r.targets.as_ref())
+                            .map(|t| &t.out)
+                            .or(self.ao.as_ref().map(|a| &a.blur_view))
                             .unwrap_or(&self.white_texture.view),
                     ),
                 },
@@ -7794,6 +8088,21 @@ impl Renderer {
         None
     }
 
+    /// Rebuild without the ray tracing after a GPU error while it was on (see `rt_error`).
+    fn fall_back_without_ray_tracing(&mut self, scene: &mut Scene) {
+        log::error!("ray tracing failed on {}; Enhanced+ draws as Enhanced from now on", self.adapter_name);
+        let options = RenderOptions { ray_tracing: false, ..self.options };
+        RT_BUFFERS.store(false, std::sync::atomic::Ordering::Relaxed);
+        // (the meshes' shared pages stay on, as after the multisampling fallback below)
+        let mesh_pages = self.mesh_pages;
+        *self = Renderer { mesh_pages, ..Self::build(self.device.clone(), self.queue.clone(), self.adapter_name.clone(), self.format, options) };
+        scene.dirty = true;
+        scene.model_buf = None;
+        scene.params_buf = None;
+        scene.camera_bind_group = None;
+        scene.shadow_bind_group = None;
+    }
+
     /// Rebuild the pipelines and targets without multisampling after a GPU error with it.
     /// The scene's materials stay valid (the device hands out the same bind group layout
     /// for identical entries); its per-draw buffers and camera bind group are made anew,
@@ -7808,13 +8117,14 @@ impl Renderer {
             msaa: 1,
             ..self.options
         };
-        *self = Self::build(
+        let mesh_pages = self.mesh_pages;
+        *self = Renderer { mesh_pages, ..Self::build(
             self.device.clone(),
             self.queue.clone(),
             self.adapter_name.clone(),
             self.format,
             options,
-        );
+        ) };
         scene.dirty = true;
         scene.model_buf = None;
         scene.params_buf = None;
@@ -8235,7 +8545,9 @@ impl Renderer {
                 view_formats: &[],
             });
         }
-        if self.gpu_error.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.rt_error.load(std::sync::atomic::Ordering::Relaxed) {
+            self.fall_back_without_ray_tracing(scene);
+        } else if self.gpu_error.load(std::sync::atomic::Ordering::Relaxed) {
             self.fall_back_to_single_sample(scene);
         }
         // OMSI_GPU_TIMERS: GPU time per pass, one frame at a time
@@ -8337,7 +8649,10 @@ impl Renderer {
         self.prepare_coronas(scene, lighting.night, lighting.inside.as_ref().filter(|v| point_in_vehicle_box(camera.position, v)));
         self.prepare_smoke(scene, camera.position);
         // ambient occlusion only for the real picture, not for the mirrors
-        let ao_on = with_overlays && self.options.ssao && self.ssao_pipeline.is_some() && omsi_cfg::env::var_os("OMSI_NO_AO").is_none();
+        // Enhanced+: the window's picture traces its sun shadow and ambient occlusion (not the
+        // mirrors, a headset's eyes or a triple screen's panels: they keep the shadow map)
+        let rt_frame = self.rt.is_some() && enhanced && with_overlays && projection.is_none() && omsi_cfg::env::var_os("OMSI_NO_RT_FRAME").is_none();
+        let ao_on = with_overlays && self.rt.is_none() && self.options.ssao && self.ssao_pipeline.is_some() && omsi_cfg::env::var_os("OMSI_NO_AO").is_none();
         // the enhanced path's shading is costly: the depth prepass keeps it to the visible
         // surface (without multisampling, see `share_depth`)
         // (DLSS reads the prepass's depth, and the prepass writes its motion vectors)
@@ -8347,6 +8662,11 @@ impl Renderer {
             scene.dirty = true;
             scene.model_buf = None;
             self.hdr_targets.clear();
+        }
+        if rt_frame && self.rt.as_mut().is_some_and(|rt| rt.ensure_targets(&self.device, width, height)) {
+            // the camera bind group must point at the new lighting texture
+            scene.dirty = true;
+            scene.model_buf = None;
         }
         if masked_frame {
             self.hdr_targets(width, height);
@@ -8605,7 +8925,8 @@ impl Renderer {
                 lighting.cloud_density,
                 lighting.cloud_offset[0],
                 lighting.cloud_offset[1],
-                if ao_on { 1.0 } else { 0.0 },
+                // (2: the traced lighting, full size, see `ao_at`)
+                if rt_frame { 2.0 } else if ao_on { 1.0 } else { 0.0 },
             ],
             // (w: the heading the sphere maps are laid out by in the headset, see
             // `set_env_heading`; flagged by cam_up.w)
@@ -8657,6 +8978,11 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cu));
+        if rt_frame {
+            let proj = Mat4::perspective_rh(camera.fov_deg.to_radians(), aspect, camera.far, camera.near);
+            self.prepare_ray_tracing(scene, camera, lighting, vp_mat, proj, width, height, dt);
+            stage(self, "ray tracing", "mirror.ray tracing");
+        }
         // (a mirror takes the window's light - its own call would move the exposure on -
         // unless it comes before the window's first frame)
         let probe_redraw = enhanced
@@ -8696,7 +9022,7 @@ impl Renderer {
             .unwrap_or(3.0);
         let casters = |span: std::ops::Range<usize>| -> [Vec<DrawItem>; 3] {
             let mut out: [Vec<DrawItem>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-            let mut ranges: Vec<(u8, u32, u32, usize)> = Vec::new();
+            let mut ranges: Vec<(u8, u32, u32, usize, u32)> = Vec::new();
             for inst in &scene.instances[span] {
                 if !inst.visible || !inst.casts_shadow || (self.options.omsi_shadow_casters && !inst.omsi_caster) {
                     continue;
@@ -8730,7 +9056,13 @@ impl Renderer {
                     if cut_body {
                         kind = PIPE_ALPHA_TEST;
                     }
-                    ranges.push((kind, ri as u32, *slot, mat_id));
+                    // (Enhanced+: what is solid casts its shadow by the traced rays; the
+                    // close and near maps keep the cut-out leaves and fences, whose texels
+                    // the rays cannot see)
+                    if rt_frame && kind == PIPE_OPAQUE {
+                        kind = PIPE_KINDS;
+                    }
+                    ranges.push((kind, ri as u32, *slot, mat_id, mat.look));
                 }
                 for (cascade, &(range, lvp, min_radius)) in boxes.iter().enumerate() {
                     if !active[cascade] {
@@ -8754,12 +9086,23 @@ impl Renderer {
                     if dbg {
                         log::info!("shadow: caster r={r:.1} at {:?} slots {:?}", inst.origin, ranges.iter().map(|x| x.0).collect::<Vec<_>>());
                     }
-                    for &(kind, ri, slot, mat_id) in &ranges {
+                    for &(kind, ri, slot, mat_id, look) in &ranges {
+                        let kind = if kind == PIPE_KINDS {
+                            if cascade != 1 {
+                                continue;
+                            }
+                            PIPE_OPAQUE
+                        } else {
+                            kind
+                        };
+                        // (after the remap: a traced-opaque one is drawn as the opaque it is)
+                        let (material, look) = depth_only_material(kind, mat_id, look);
                         out[cascade].push(DrawItem {
                             pipe: kind,
                             mesh: inst.mesh as u32,
                             range: ri,
-                            material: depth_only_material(kind, mat_id),
+                            material,
+                            look,
                             entry: inst.base + slot,
                         });
                     }
@@ -8878,7 +9221,7 @@ impl Renderer {
                 let m = &scene.meshes[inst.mesh];
                 let (c, _) = Self::bounding_sphere(scene, inst);
                 let v = view.transform_point3(c);
-                log::info!("cull {i}: mesh {} r {:.2} centre {:?} origin {:?} view {:?} visible {} lod {:?} tan ({tan_x:.2}, {tan_y:.2}) fog {fog_far:.0}", inst.mesh, m.bounds_radius, m.bounds_center, inst.origin, v, inst.visible, inst.lod);
+                log::info!("cull {i}: mesh {} r {:.2} centre {:?} origin {:?} view {:?} visible {} lod {:?} tan ({tan_x:.2}, {tan_y:.2}) fog {fog_far:.0} surface {} decal {} casts {} phase {:?} source {:?}", inst.mesh, m.bounds_radius, m.bounds_center, inst.origin, v, inst.visible, inst.lod, inst.surface, inst.decal, inst.casts_shadow, inst.render_phase, m.source);
             }
         }
         let fov_y = camera.fov_deg.to_radians().max(1e-3);
@@ -9133,11 +9476,13 @@ impl Renderer {
                     if let Some(pre_kind) = depth_prepass_kind(kind, mat, inst.presurface) {
                         // plain/alpha-tested materials use their ordinary depth pass;
                         // blended transmaps use the opaque-pixels-only pass.
+                        let (material, look) = depth_only_material(pre_kind, mat_id, mat.look);
                         items.push(DrawItem {
                             pipe: pre_kind * 2 + cull as u8,
                             mesh: inst.mesh as u32,
                             range: ri as u32,
-                            material: depth_only_material(pre_kind, mat_id),
+                            material,
+                            look,
                             entry: inst.base + *slot,
                         });
                     }
@@ -9200,6 +9545,7 @@ impl Renderer {
                                 mesh: inst.mesh as u32,
                                 range: ri as u32,
                                 material: mat_id as u32,
+                                look: mat.look,
                                 entry: inst.base + *slot,
                             });
                         }
@@ -9238,6 +9584,7 @@ impl Renderer {
                             mesh: inst.mesh as u32,
                             range: ri as u32,
                             material: mat_id as u32,
+                            look: mat.look,
                             entry: inst.base + *slot,
                         });
                     }
@@ -9333,7 +9680,12 @@ impl Renderer {
                         } else {
                             0
                         };
-                        let dist = if let Some(sort_origin) = inst.blend_sort_origin {
+                        // A vehicle's shadow blob goes after all the ground: it writes no depth, so
+                        // every road piece nearer than its origin, drawn after it by distance,
+                        // painted the road back over it (OMSI draws it over the road it lies on).
+                        let dist = if inst.blob {
+                            -1.0
+                        } else if let Some(sort_origin) = inst.blend_sort_origin {
                             // Spline surfaces use the C++ handler's placement-origin distance
                             // in the horizontal plane (Rust's world axes are x/y horizontal,
                             // z vertical).
@@ -9391,6 +9743,19 @@ impl Renderer {
                         } else {
                             PIPE_BLEND
                         };
+                        // Only tile painting gets the zero-coverage fast path. Other
+                        // no-write blends (splines, glass, decals) keep their shader.
+                        let kind = if kind == PIPE_BLEND_NO_WRITE
+                            && mat.alpha == AlphaMode::Blend
+                            && inst.ground_layer
+                            && !inst.presurface
+                            && mat.uniform.extra[0] > 0.5
+                            && mat.transmap.is_some_and(|(_, alpha)| alpha)
+                        {
+                            PIPE_TERRAIN_PAINT
+                        } else {
+                            kind
+                        };
                         let item = DrawItem {
                             pipe: pipe_code(
                                 kind,
@@ -9400,6 +9765,7 @@ impl Renderer {
                             mesh: inst.mesh as u32,
                             range: ri as u32,
                             material: mat_id as u32,
+                            look: mat.look,
                             entry: inst.base + *slot,
                         };
                         // the vehicle the camera is in is drawn after everything else
@@ -9431,12 +9797,18 @@ impl Renderer {
             prepass_batches = pre_batches;
         }
         // OMSI_SKIP_PIPE=3,1: leave pipeline kinds out of the main pass (0 opaque, 1 alpha
-        // tested, 2 blended, 3 blended without depth writes, 4 surface depth) - with
+        // tested, 2 blended, 3 blended without depth writes, 4 surface depth, 5 terrain
+        // paint; 3 includes its specialized terrain variant) - with
         // OMSI_GPU_TIMERS_RAW, what each kind costs the GPU
         if let Ok(skip) = omsi_cfg::env::var("OMSI_SKIP_PIPE") {
             let skip: Vec<u8> = skip.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            main_batches.retain(|b| !skip.contains(&(b.pipe / 4)));
-            cab_batches.retain(|b| !skip.contains(&(b.pipe / 4)));
+            let include = |b: &Batch| {
+                let kind = b.pipe / 4;
+                !skip.contains(&kind)
+                    && !(kind == PIPE_TERRAIN_PAINT && skip.contains(&PIPE_BLEND_NO_WRITE))
+            };
+            main_batches.retain(include);
+            cab_batches.retain(include);
         }
         if debug_draws {
             log::info!("  main pass: {} opaque/alpha-tested and {} blended draws in {} batches; prepass {} batches; draw list {} entries", main_draws[0], main_draws[1], main_batches.len(), prepass_batches.len(), list.len());
@@ -9450,6 +9822,7 @@ impl Renderer {
             let mut c = self.counts.borrow_mut();
             *c.entry("scene instances").or_default() += scene.instances.len() as f64;
             *c.entry("visible instances").or_default() += visible.len() as f64;
+            *c.entry("bounds users").or_default() += scene.bounds_users.len() as f64;
             *c.entry("main draws").or_default() += (main_draws[0] + main_draws[1]) as f64;
             *c.entry("opaque draws").or_default() += main_draws[0] as f64;
             *c.entry("blended draws").or_default() += main_draws[1] as f64;
@@ -9679,6 +10052,9 @@ impl Renderer {
                 pass.draw(0..3, 0..1);
             }
         }
+        if rt_frame {
+            self.encode_ray_tracing(&mut prepass_encoder, scene, tset.as_ref(), &mut timed);
+        }
         // --- the enhanced sky cube: a face a frame (all six the first time and for a new
         // sky), drawn in the window's frame only
         if enhanced && (lead_view || probe_redraw) {
@@ -9804,11 +10180,22 @@ impl Renderer {
         // the multisampled buffer first. Without it every wall, tree and car hidden behind
         // the one in front ran the whole enhanced shading (11 ms of a 1080p frame in
         // central Spandau with 4x MSAA).
+        // Apple's hidden-surface removal already handles ordinary opaque draws.
+        // Preserve that fast path. In the measured mixed views, prefilling MSAA
+        // depth before cutouts/blends saved more hidden shading than the pass cost.
+        let needs_msaa_prepass = !cfg!(target_vendor = "apple")
+            || main_batches.iter().chain(&cab_batches).any(|batch| {
+                matches!(
+                    batch.pipe / 4,
+                    PIPE_ALPHA_TEST | PIPE_BLEND | PIPE_BLEND_NO_WRITE
+                )
+            });
         let msaa_prepass = enhanced
             && !has_presurface
             && (with_overlays || xr_view)
             && !single
             && prepass_on
+            && needs_msaa_prepass
             && omsi_cfg::env::var_os("OMSI_NO_MSAA_PREPASS").is_none();
         let parts = if !cfg!(any(target_os = "macos", target_os = "ios")) && main_bundles.len() >= 2 && omsi_cfg::env::var_os("OMSI_NO_MAIN_SPLIT").is_none() {
             main_bundles.len().min(2)
@@ -9916,10 +10303,22 @@ impl Renderer {
                             resolve_target: None,
                             ops: wgpu::Operations { load: if first { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store },
                         }),
+                        hdr.and_then(|h| h.gbuf.as_ref()).map(|g| wgpu::RenderPassColorAttachment {
+                            view: g[0].0.as_ref().unwrap_or(&g[0].1),
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: if first { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store },
+                        }),
+                        hdr.and_then(|h| h.gbuf.as_ref()).map(|g| wgpu::RenderPassColorAttachment {
+                            view: g[1].0.as_ref().unwrap_or(&g[1].1),
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: if first { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store },
+                        }),
                     ];
                     let mut pass = part.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("main part"),
-                        color_attachments: if part_colors[1].is_some() { &part_colors[..] } else { &part_colors[..1] },
+                        color_attachments: if part_colors[2].is_some() { &part_colors[..] } else if part_colors[1].is_some() { &part_colors[..2] } else { &part_colors[..1] },
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                             view: depth_view,
                             depth_ops: Some(wgpu::Operations { load: if first { depth_first } else { wgpu::LoadOp::Load }, store: wgpu::StoreOp::Store }),
@@ -9957,8 +10356,22 @@ impl Renderer {
                         },
                     },
                 });
-            let colors = [main_attachment, mask_attachment];
-            let colors = if colors[1].is_some() { &colors[..] } else { &colors[..1] };
+            let gbuf_attachments = hdr.and_then(|h| h.gbuf.as_ref()).map(|g| {
+                g.each_ref().map(|(msaa, view)| {
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: msaa.as_ref().unwrap_or(view),
+                        depth_slice: None,
+                        resolve_target: msaa.as_ref().map(|_| view),
+                        ops: wgpu::Operations {
+                            load: if parts > 1 { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) },
+                            store: if msaa.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
+                        },
+                    })
+                })
+            });
+            let [g0, g1] = gbuf_attachments.unwrap_or([None, None]);
+            let colors = [main_attachment, mask_attachment, g0, g1];
+            let colors = if colors[2].is_some() { &colors[..] } else if colors[1].is_some() { &colors[..2] } else { &colors[..1] };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 // drawn with MSAA samples and resolved into the real target at the end
@@ -10050,7 +10463,12 @@ impl Renderer {
         }
         // Weather alone is insufficient: leave the allocation and reflection passes out when
         // the visible batches contain no moisture-tagged surface (a showroom, bare terrain).
+        // Enhanced+: the traced reflections (wet roads' too) in place of the puddles' rays
+        if rt_frame {
+            self.encode_rt_reflections(&mut encoder, width, height, tset.as_ref(), &mut timed);
+        }
         let puddles_on = puddles_wanted
+            && !rt_frame
             && main_batches.iter().any(|b| scene.materials[b.material as usize].uniform.params2[2] > 0.0)
             && self.prepare_puddle_reflections(width, height, camera, aspect, projection, &cu, lighting, ro);
         if puddles_on {
@@ -10082,11 +10500,19 @@ impl Renderer {
                     view: &h.mask, depth_slice: None, resolve_target: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 }),
+                hdr.and_then(|h| h.gbuf.as_ref()).map(|g| wgpu::RenderPassColorAttachment {
+                    view: &g[0].1, depth_slice: None, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                }),
+                hdr.and_then(|h| h.gbuf.as_ref()).map(|g| wgpu::RenderPassColorAttachment {
+                    view: &g[1].1, depth_slice: None, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                }),
             ];
             let pipes = &self.main_pass(enhanced, reflection_frame).rain_pipelines;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("rain on current scene"),
-                color_attachments: &colours[..if hdr.is_some() { 2 } else { 1 }],
+                color_attachments: &colours[..if colours[2].is_some() { 4 } else if hdr.is_some() { 2 } else { 1 }],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.ao.as_ref().unwrap().depth_view,
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
@@ -10153,6 +10579,12 @@ impl Renderer {
                 // there instead of being drawn burning: their halo shows, they don't bleach.
                 // `Led glow`, 0 = not at all.)
                 c: [m[0], m[5], self.exposure.map(f32::exp).unwrap_or(1.0), lighting.led_glow * 10.0],
+                // Enhanced+: its grade, the vignette and the sharpening; both: the tone
+                // curve's contrast (post.wgsl `natural_tone`)
+                d: {
+                    let contrast = tone_contrast(self.exposure.unwrap_or(0.0));
+                    if rt_frame && omsi_cfg::env::var_os("OMSI_NO_RT_GRADE").is_none() { [1.0, 0.08, 0.0, contrast] } else { [0.0, 0.0, 0.0, contrast] }
+                },
             };
             self.queue
                 .write_buffer(&self.post_buf, 0, bytemuck::bytes_of(&pu));
@@ -10689,10 +11121,130 @@ fn buffer_init(device: &wgpu::Device, queue: &wgpu::Queue, label: Option<&str>, 
     buf
 }
 
-/// The GPU buffers of a mesh.
-fn make_mesh(device: &wgpu::Device, queue: &wgpu::Queue, data: &MeshData) -> GpuMesh {
-    let verts: Vec<Vertex> = data
-        .positions
+/// Meshes are made for the ray tracer's acceleration structures as well (Enhanced+ on a
+/// device with ray queries: their buffers are its geometry input).
+static RT_BUFFERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Vertex and index buffers holding several meshes; the space a freed mesh leaves is
+/// handed to the next that fits.
+struct MeshPage {
+    vertex: wgpu::Buffer,
+    index: wgpu::Buffer,
+    vertex_top: u64,
+    index_top: u64,
+    vertex_free: Vec<(u64, u64)>,
+    index_free: Vec<(u64, u64)>,
+}
+
+const MESH_PAGE_VERTEX_BYTES: u64 = 32 << 20;
+const MESH_PAGE_INDEX_BYTES: u64 = 16 << 20;
+
+/// First fit of `len` bytes in `free` (offset, length) or at `top` under `cap`.
+fn page_take(free: &mut Vec<(u64, u64)>, top: &mut u64, cap: u64, len: u64) -> Option<u64> {
+    if len == 0 {
+        return Some(0);
+    }
+    if let Some(k) = free.iter().position(|&(_, l)| l >= len) {
+        let (o, l) = free[k];
+        if l == len {
+            free.remove(k);
+        } else {
+            free[k] = (o + len, l - len);
+        }
+        return Some(o);
+    }
+    (*top + len <= cap).then(|| {
+        *top += len;
+        *top - len
+    })
+}
+
+/// Give `len` bytes at `at` back, joined to the free space beside them.
+fn page_give(free: &mut Vec<(u64, u64)>, top: &mut u64, at: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let k = free.partition_point(|&(o, _)| o < at);
+    free.insert(k, (at, len));
+    if k + 1 < free.len() && free[k].0 + free[k].1 == free[k + 1].0 {
+        free[k].1 += free[k + 1].1;
+        free.remove(k + 1);
+    }
+    if k > 0 && free[k - 1].0 + free[k - 1].1 == free[k].0 {
+        free[k - 1].1 += free[k].1;
+        free.remove(k);
+    }
+    if let Some(&(o, l)) = free.last() {
+        if o + l == *top {
+            *top = o;
+            free.pop();
+        }
+    }
+}
+
+impl MeshPage {
+    fn new(device: &wgpu::Device, vertex_bytes: u64, index_bytes: u64) -> MeshPage {
+        let blas = if RT_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) { wgpu::BufferUsages::BLAS_INPUT } else { wgpu::BufferUsages::empty() };
+        let buffer = |size: u64, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some("mesh page"), size: size.max(32), usage: usage | wgpu::BufferUsages::COPY_DST | blas, mapped_at_creation: false });
+        MeshPage {
+            vertex: buffer(vertex_bytes, wgpu::BufferUsages::VERTEX),
+            index: buffer(index_bytes, wgpu::BufferUsages::INDEX),
+            vertex_top: 0,
+            index_top: 0,
+            vertex_free: Vec::new(),
+            index_free: Vec::new(),
+        }
+    }
+
+    /// Room for a mesh of these sizes: its vertex and index offsets.
+    fn take(&mut self, vertex_bytes: u64, index_bytes: u64) -> Option<(u64, u64)> {
+        let v = page_take(&mut self.vertex_free, &mut self.vertex_top, self.vertex.size(), vertex_bytes)?;
+        match page_take(&mut self.index_free, &mut self.index_top, self.index.size(), index_bytes) {
+            Some(i) => Some((v, i)),
+            None => {
+                page_give(&mut self.vertex_free, &mut self.vertex_top, v, vertex_bytes);
+                None
+            }
+        }
+    }
+
+    fn give(&mut self, m: &GpuMesh) {
+        page_give(&mut self.vertex_free, &mut self.vertex_top, m.vertex_offset, m.vertex_bytes);
+        page_give(&mut self.index_free, &mut self.index_top, m.first_index as u64 * 4, m.index_bytes);
+    }
+
+    /// Write the mesh at these offsets.
+    fn place(&self, queue: &wgpu::Queue, data: &MeshData, page: u32, at: (u64, u64)) -> GpuMesh {
+        let verts = mesh_vertices(data);
+        let (vb, ib): (&[u8], &[u8]) = (bytemuck::cast_slice(&verts), bytemuck::cast_slice(&data.indices));
+        if !vb.is_empty() {
+            queue.write_buffer(&self.vertex, at.0, vb);
+        }
+        if !ib.is_empty() {
+            queue.write_buffer(&self.index, at.1, ib);
+        }
+        let (center, radius) = mesh_bounds(data);
+        GpuMesh {
+            vertex_buf: self.vertex.clone(),
+            index_buf: self.index.clone(),
+            page,
+            base_vertex: (at.0 / std::mem::size_of::<Vertex>() as u64) as i32,
+            first_index: (at.1 / 4) as u32,
+            vertex_offset: at.0,
+            vertex_bytes: vb.len() as u64,
+            index_bytes: ib.len() as u64,
+            gen: next_gen(),
+            ranges: data.ranges.clone(),
+            bounds_center: center,
+            bounds_radius: radius,
+            one_sided: data.one_sided,
+            source: None,
+        }
+    }
+}
+
+fn mesh_vertices(data: &MeshData) -> Vec<Vertex> {
+    data.positions
         .iter()
         .zip(&data.normals)
         .zip(&data.uvs)
@@ -10701,9 +11253,15 @@ fn make_mesh(device: &wgpu::Device, queue: &wgpu::Queue, data: &MeshData) -> Gpu
             normal: n.to_array(),
             uv: uv.to_array(),
         })
-        .collect();
-    let vertex_buf = buffer_init(device, queue, None, bytemuck::cast_slice(&verts), wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST);
-    let index_buf = buffer_init(device, queue, None, bytemuck::cast_slice(&data.indices), wgpu::BufferUsages::INDEX);
+        .collect()
+}
+
+fn mesh_page_bytes(data: &MeshData) -> (u64, u64) {
+    let v = data.positions.len().min(data.normals.len()).min(data.uvs.len());
+    ((v * std::mem::size_of::<Vertex>()) as u64, (data.indices.len() * 4) as u64)
+}
+
+fn mesh_bounds(data: &MeshData) -> (Vec3, f32) {
     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     for p in &data.positions {
         lo = lo.min(*p);
@@ -10714,15 +11272,26 @@ fn make_mesh(device: &wgpu::Device, queue: &wgpu::Queue, data: &MeshData) -> Gpu
         hi = Vec3::ZERO;
     }
     let center = (lo + hi) * 0.5;
-    GpuMesh {
-        vertex_buf,
-        index_buf,
-        ranges: data.ranges.clone(),
-        bounds_center: center,
-        bounds_radius: (hi - center).length(),
-        one_sided: data.one_sided,
-        source: None,
+    (center, (hi - center).length())
+}
+
+/// The meshes in one page of their own, sized to them (each in a page of its own where the
+/// adapter cannot draw with a base vertex: `paged` false).
+fn make_meshes(device: &wgpu::Device, queue: &wgpu::Queue, data: &[&MeshData], paged: bool) -> Vec<GpuMesh> {
+    if data.is_empty() {
+        return Vec::new();
     }
+    if !paged {
+        return data.iter().map(|d| make_meshes(device, queue, &[d], true).pop().expect("one mesh")).collect();
+    }
+    let sizes: Vec<(u64, u64)> = data.iter().map(|d| mesh_page_bytes(d)).collect();
+    let page = MeshPage::new(device, sizes.iter().map(|s| s.0).sum(), sizes.iter().map(|s| s.1).sum());
+    let mut at = (0, 0);
+    data.iter().zip(&sizes).map(|(d, s)| {
+        let m = page.place(queue, d, u32::MAX, at);
+        at = (at.0 + s.0, at.1 + s.1);
+        m
+    }).collect()
 }
 
 /// A mesh on the GPU, made on a worker thread; [`Renderer::add_prepared_mesh`] puts it into
@@ -10731,8 +11300,14 @@ pub struct PreparedMesh(GpuMesh);
 
 /// Make a mesh's GPU buffers on any thread (the device takes calls from all of them).
 pub fn prepare_mesh(device: &wgpu::Device, queue: &wgpu::Queue, data: &MeshData) -> PreparedMesh {
+    prepare_meshes(device, queue, &[data], false).pop().expect("one mesh")
+}
+
+/// [`prepare_mesh`] for several meshes at once, which share one page of buffers.
+/// `paged`: [`Renderer::mesh_pages`] of the renderer the meshes are for.
+pub fn prepare_meshes(device: &wgpu::Device, queue: &wgpu::Queue, data: &[&MeshData], paged: bool) -> Vec<PreparedMesh> {
     let _turn = gl_worker_turn();
-    PreparedMesh(make_mesh(device, queue, data))
+    make_meshes(device, queue, data, paged).into_iter().map(PreparedMesh).collect()
 }
 
 /// A texture on the GPU, made on a worker thread; [`Renderer::add_prepared_texture`] puts it
@@ -11014,6 +11589,104 @@ fn meter_tuning() -> [f32; 6] {
     })
 }
 
+/// The tone curve's contrast about mid grey for a pre-exposure (its natural log): a
+/// camera's by day, falling off through the dusk to a little under none at night, where
+/// the eye's own adaptation to the dark between the street lamps lifts it out of black
+/// (a street a few hundred times darker than the pool under a lamp is still seen). `OMSI_TONE_CONTRAST=day,night`
+/// overrides it.
+fn tone_contrast(log_pre: f32) -> f32 {
+    static OVERRIDE: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+    let (day, night) = OVERRIDE
+        .get_or_init(|| {
+            let v = omsi_cfg::env::var("OMSI_TONE_CONTRAST").ok()?;
+            let mut it = v.split(',').map(|x| x.trim().parse::<f32>().ok());
+            Some((it.next()??, it.next().flatten().unwrap_or(1.0)))
+        })
+        .unwrap_or((TONE_CONTRAST_DAY, TONE_CONTRAST_NIGHT));
+    // (the pre-exposure is about 1 by day, 70 in the blue hour and 400-700 at night)
+    let t = atmosphere::smoothstep(2.0, 8.0, log_pre / std::f32::consts::LN_2);
+    day + (night - day) * t
+}
+
+/// How much of the sun the enhanced sky's cumulus lets through to the camera: the same
+/// cloud the sky shader draws (sky_enhanced.wgsl `cloud_base_shape`, `cloud_sigma`: the
+/// shape map's heaps cut by the cover, rounded with height, without the billows), its
+/// extinction integrated along the sun's direction through the layer, over a few rays a
+/// few tens of metres apart (the penumbra of a cloud a kilometre and a half up).
+const CLOUD_SHADOW_EROSION: f32 = 0.15;
+/// How far the exposure follows the light into a cloud's shadow (log terms).
+const CLOUD_SHADE_ADAPT: f32 = 0.5;
+
+fn cloud_sun_transmittance(shape: &[u8], lighting: &Lighting, cam_rel: Vec3, ro: DVec3) -> f32 {
+    const BOTTOM: f32 = 1400.0;
+    const TOP: f32 = 2800.0;
+    const PERIOD: f32 = 13000.0;
+    const SIGMA: f32 = 0.035;
+    let s = lighting.sun_dir.normalize_or_zero();
+    if s.z <= 0.02 || shape.is_empty() {
+        return 1.0;
+    }
+    let size = (clouds::SHAPE_SIZE / 2) as usize;
+    if shape.len() < size * size * 4 {
+        return 1.0;
+    }
+    let texel = |x: i64, y: i64| {
+        let (x, y) = (x.rem_euclid(size as i64) as usize, y.rem_euclid(size as i64) as usize);
+        let i = (y * size + x) * 4;
+        [shape[i] as f32 / 255.0, shape[i + 1] as f32 / 255.0, shape[i + 2] as f32 / 255.0]
+    };
+    let sample = |u: f32, v: f32| {
+        let (x, y) = (u * size as f32 - 0.5, v * size as f32 - 0.5);
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let (x0, y0) = (x0 as i64, y0 as i64);
+        let a = texel(x0, y0);
+        let b = texel(x0 + 1, y0);
+        let c = texel(x0, y0 + 1);
+        let d = texel(x0 + 1, y0 + 1);
+        let mut o = [0.0f32; 3];
+        for k in 0..3 {
+            o[k] = (a[k] * (1.0 - fx) + b[k] * fx) * (1.0 - fy) + (c[k] * (1.0 - fx) + d[k] * fx) * fy;
+        }
+        o
+    };
+    let lin = |a: f32, b: f32, v: f32| ((v - a) / (b - a)).clamp(0.0, 1.0);
+    let cover = lighting.cloud_density.clamp(0.0, 1.0);
+    // (less the billows' erosion, which the sky shader takes off the heaps' edges and this
+    // leaves out: on average about this much of the cover)
+    let coverage = (0.3 + cover * 0.55 - CLOUD_SHADOW_EROSION).clamp(0.0, 1.0);
+    let origin = glam::Vec2::new(ro.x.rem_euclid(CLOUD_ORIGIN_PERIOD) as f32, ro.y.rem_euclid(CLOUD_ORIGIN_PERIOD) as f32);
+    let drift = glam::Vec2::new(lighting.cloud_offset[0], lighting.cloud_offset[1]) * 2500.0;
+    let t0 = (BOTTOM - cam_rel.z).max(0.0) / s.z;
+    let t1 = ((TOP - cam_rel.z).max(0.0) / s.z).min(t0 + 12_000.0);
+    let steps = 24;
+    let ds = (t1 - t0) / steps as f32;
+    let side = glam::Vec2::new(-s.y, s.x).normalize_or_zero();
+    let mut sum = 0.0;
+    let offsets = [glam::Vec2::ZERO, side * 40.0, -side * 40.0, glam::Vec2::new(s.x, s.y).normalize_or_zero() * 40.0, -glam::Vec2::new(s.x, s.y).normalize_or_zero() * 40.0];
+    for off in offsets {
+        let mut od = 0.0;
+        for k in 0..steps {
+            let t = t0 + (k as f32 + 0.5) * ds;
+            let p = cam_rel + s * t;
+            let h = (p.z - BOTTOM) / (TOP - BOTTOM);
+            if !(0.0..1.0).contains(&h) {
+                continue;
+            }
+            let g = glam::Vec2::new(p.x, p.y) + origin + off + drift;
+            let m = sample(g.x / PERIOD, g.y / PERIOD);
+            let lo = m[1] - 1.0;
+            let n = h * h * (0.7 + m[2]) + (1.0 - h).powi(16);
+            let base = (m[0] - n - lo) / (1.0 - lo) * (lin(0.0, 0.1, h) - lin(0.6, 1.0, h));
+            let x = ((base + coverage - 1.0) / 0.12).clamp(0.0, 1.0);
+            let dens = x * x * (3.0 - 2.0 * x) * (h / 0.2).min(1.0);
+            od += dens * SIGMA * ds;
+        }
+        sum += (-od).exp();
+    }
+    sum / offsets.len() as f32
+}
+
 /// How the enhanced picture's weather fog thins out with height (1/m): a 300 m scale height
 /// over the fog's base (`layer_depth` in enhanced_common.wgsl).
 const FOG_FALLOFF: f32 = 1.0 / 300.0;
@@ -11046,7 +11719,13 @@ fn enhanced_sky_input(lighting: &Lighting) -> (atmosphere::SkyInput, f32) {
     let s = lighting.sun_dir.normalize_or_zero();
     // haze: the weather's visibility below a few kilometres thickens the aerosol
     let visibility = 2.3 / lighting.fog_density.max(1e-6);
-    let haze = (8000.0 / visibility).clamp(1.0, 6.0) + 2.0 * lighting.rain;
+    let mut day = day_air(lighting);
+    if let Some([haze, angstrom, height]) = lighting.air {
+        day.haze = haze;
+        day.angstrom = angstrom;
+        day.aerosol_height = height;
+    }
+    let haze = (8000.0 / visibility).clamp(1.0, 6.0) * day.haze + 2.0 * lighting.rain;
     // rain and snow fall from a closed deck: whatever the cloud type says, the sun is
     // gone and the sky is the grey dome (a low sun scattered orange in the snowfall)
     let wet_cover = (lighting.rain * 1.5).clamp(0.0, 1.0);
@@ -11066,8 +11745,85 @@ fn enhanced_sky_input(lighting: &Lighting) -> (atmosphere::SkyInput, f32) {
         rain: lighting.rain.clamp(0.0, 1.0),
         ground_albedo: 0.2 + 0.45 * lighting.snow.clamp(0.0, 1.0),
         tint: lighting.envir_tint,
+        // (rain and mist are water: as grey as the droplets are large)
+        angstrom: day.angstrom * (1.0 - 0.6 * lighting.rain.clamp(0.0, 1.0)) * (1.0 - 0.5 * ((haze - 3.0) / 3.0).clamp(0.0, 1.0)),
+        aerosol_height: day.aerosol_height,
+        strat_aod: day.strat_aod,
+        veil: lighting.veil.clamp(0.0, 3.0),
+        cumulus: if lighting.enhanced { (lighting.cloud_density.min(0.84)) * (1.0 - closed) } else { 0.0 },
+        moon_dir: lighting.moon_dir,
+        moon_illum: lighting.moon_illum,
+        city_glow: 1.0,
     };
-    (input, sun_visibility)
+    // (the disc in the sky: what the veil lets through of it as well)
+    let veil_t = (-input.veil / s.z.max(0.03)).exp();
+    (input, sun_visibility * veil_t)
+}
+
+/// The day's own air: what the sky of one calendar day is made of, as the weather of a
+/// real day leaves it (see `day_air`).
+struct DayAir {
+    /// aerosol amount relative to a clear day
+    haze: f32,
+    /// its Ångström exponent (fine dry particles 1.4-1.6, humid haze down to 0.5)
+    angstrom: f32,
+    /// the depth of the hazy boundary layer (m)
+    aerosol_height: f32,
+    /// the stratospheric aerosol's optical depth
+    strat_aod: f32,
+}
+
+/// The day's own air, drawn from the calendar day so that no two days look quite alike -
+/// and with it no two sunsets: winter's air is mostly clean and dry (a deep blue sky,
+/// crisp distances, a pale yellow low sun) under a shallow inversion, a summer's often
+/// hazy and humid (a milky sky, soft distances) and mixed high by the afternoon's heat,
+/// and the far north cleaner than the middle of the continent. The boundary layer follows
+/// the sun through the day as a real one does: low and dense in the morning (a pastel
+/// sunrise through a thin bright haze), growing with the sun's heat until early afternoon
+/// and left standing as the evening's residual layer (a low sun shining through all of
+/// it). Now and then the stratosphere holds more aerosol than usual, and that evening's
+/// twilight turns purple. `OMSI_DAY_AIR=haze,angstrom[,height,strat]` fixes it.
+fn day_air(lighting: &Lighting) -> DayAir {
+    static FIXED: std::sync::OnceLock<Option<Vec<f32>>> = std::sync::OnceLock::new();
+    let fixed = FIXED.get_or_init(|| {
+        let v = omsi_cfg::env::var("OMSI_DAY_AIR").ok()?;
+        Some(v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect())
+    });
+    let hash = |k: u32| {
+        let mut x = lighting.day_seed.wrapping_mul(0x9E37_79B9) ^ k.wrapping_mul(0x85EB_CA6B);
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7FEB_352D);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846C_A68B);
+        x ^= x >> 16;
+        (x & 0xFF_FFFF) as f32 / 16_777_216.0
+    };
+    // 0 in midwinter, 1 in high summer (half a year later south of the equator)
+    let doy = lighting.day_of_year + if lighting.latitude < 0.0 { 182.0 } else { 0.0 };
+    let summer = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * (doy - 20.0) / 365.0).cos();
+    let north = 1.0 - 0.3 * atmosphere::smoothstep(55.0, 70.0, lighting.latitude.abs());
+    let snow = lighting.snow.clamp(0.0, 1.0);
+    let base = (0.72 + 0.6 * summer) * north * (1.0 - 0.25 * snow);
+    let mut haze = (base * ((hash(1) - 0.5) * 1.1).exp()).clamp(0.35, 3.0);
+    let mut angstrom = (1.45 - 0.65 * summer * hash(2) - 0.15 * hash(3)).clamp(0.5, 1.6);
+    // the day's deepest mixing (m): a few hundred metres in winter, up to two kilometres
+    // on a hot summer afternoon
+    let deepest = (500.0 + 1500.0 * summer) * (0.7 + 0.6 * hash(4));
+    // how far the day has mixed it: by the sun's height in the morning (azimuth east of
+    // south), all of it from the afternoon on (the residual layer stays into the night)
+    let sun_alt = lighting.sun_dir.normalize_or_zero().z.max(0.0).asin().to_degrees();
+    let morning = lighting.sun_azimuth < std::f32::consts::PI;
+    let grown = if morning { 0.35 + 0.65 * atmosphere::smoothstep(0.0, 35.0, sun_alt) } else { 1.0 };
+    let mut aerosol_height = (deepest * grown).max(250.0);
+    // mostly a clean stratosphere; one day in a dozen or so a vivid one
+    let mut strat_aod = 0.002 + 0.004 * hash(5) + 0.03 * hash(6).powi(8);
+    if let Some(f) = fixed {
+        haze = f.first().copied().unwrap_or(haze);
+        angstrom = f.get(1).copied().unwrap_or(angstrom);
+        aerosol_height = f.get(2).copied().unwrap_or(aerosol_height);
+        strat_aod = f.get(3).copied().unwrap_or(strat_aod);
+    }
+    DayAir { haze, angstrom, aerosol_height, strat_aod }
 }
 
 /// Has the sky moved on far enough from `a` to be computed again? The sun by a tenth of a
@@ -11080,6 +11836,14 @@ fn sky_input_differs(a: &atmosphere::SkyInput, b: &atmosphere::SkyInput) -> bool
         || !near(a.haze, b.haze, 0.02)
         || !near(a.rain, b.rain, 0.01)
         || !near(a.ground_albedo, b.ground_albedo, 0.01)
+        || !near(a.angstrom, b.angstrom, 0.02)
+        || !near(a.aerosol_height, b.aerosol_height, 40.0)
+        || !near(a.strat_aod, b.strat_aod, 0.0005)
+        || !near(a.veil, b.veil, 0.01)
+        || !near(a.cumulus, b.cumulus, 0.02)
+        || a.moon_dir.dot(b.moon_dir) < 0.9999
+        || !near(a.moon_illum, b.moon_illum, 0.01)
+        || !near(a.city_glow, b.city_glow, 0.01)
         || a.tint
             .iter()
             .zip(&b.tint)
@@ -11179,6 +11943,8 @@ fn scene_shader_text(gl: bool) -> String {
         include_str!("enhanced.wgsl"),
     ]
     .join("\n");
+    // Enhanced+: the enhanced pass writes the reflections' surfaces as well (`GBUF_FORMAT`)
+    let src = if rt_gbuf() { src.replace("//RT ", "") } else { src };
     if !gl {
         return src;
     }
@@ -11197,7 +11963,7 @@ fn scene_shader_text(gl: bool) -> String {
 
 /// The enhanced clouds' noise textures (clouds.rs), made once: the shape map (2-D RGBA8)
 /// and the detail volume (3-D R8), both with their mip chains, and a repeating sampler.
-fn cloud_noise_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureView, wgpu::TextureView, wgpu::Sampler) {
+fn cloud_noise_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureView, wgpu::TextureView, wgpu::Sampler, Vec<u8>) {
     let t0 = std::time::Instant::now();
     let (shape, detail) = std::thread::scope(|s| {
         let a = s.spawn(clouds::shape_map);
@@ -11241,7 +12007,9 @@ fn cloud_noise_textures(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Te
         ..Default::default()
     });
     log::info!("cloud noise made in {:.2} s", t0.elapsed().as_secs_f32());
-    (shape_view, detail_view, sampler)
+    // (the shape map's second level kept for the clouds' shadow, `cloud_sun_transmittance`)
+    let cpu = shape.get(1).cloned().unwrap_or_default();
+    (shape_view, detail_view, sampler, cpu)
 }
 
 /// The sky dome (both paths) and the enhanced reflection probe.
@@ -11509,10 +12277,12 @@ struct DrawItem {
     mesh: u32,
     range: u32,
     material: u32,
+    /// The material's look: draws of materials that look alike are batched together.
+    look: u32,
     entry: u32,
 }
 
-/// Draws of the same mesh range with the same material and pipeline, made as one instanced
+/// Draws of the same mesh range with materials that look alike and the same pipeline, made as one instanced
 /// draw: `instances` indexes the frame's draw list, which holds each instance's per-draw
 /// entry (the vertex shader looks it up). Thousands of single draws were the biggest CPU
 /// cost of a frame - wgpu validates and records every one - and trees, lamps, fences,
@@ -11528,7 +12298,7 @@ struct Batch {
 }
 
 /// Turn draw items into batches, appending their entries to `list`. `sort`: the order does
-/// not matter (depth-tested opaque and alpha-tested draws), so equal draws are gathered;
+/// not matter (depth-tested opaque and alpha-tested draws), so draws alike are gathered;
 /// otherwise only neighbours are merged (the blended pass keeps its far-to-near order).
 fn batch_items(
     scene: &Scene,
@@ -11537,23 +12307,11 @@ fn batch_items(
     list: &mut Vec<u32>,
     out: &mut Vec<Batch>,
 ) {
-    if sort {
-        items.sort_unstable_by_key(|d| (d.pipe, d.material, d.mesh, d.range));
-    }
-    let mut k = 0;
-    while k < items.len() {
-        let d = items[k];
-        let start = list.len() as u32;
-        while k < items.len()
-            && (
-                items[k].pipe,
-                items[k].mesh,
-                items[k].range,
-                items[k].material,
-            ) == (d.pipe, d.mesh, d.range, d.material)
-        {
-            list.push(items[k].entry);
-            k += 1;
+    // a batch keeps the material of the one before it when they look alike: no rebinding
+    let mut last = (u32::MAX, 0);
+    let mut push = |d: &DrawItem, start: u32, list: &Vec<u32>| {
+        if last.0 != d.look {
+            last = (d.look, d.material);
         }
         let (first, count, _) = scene.meshes[d.mesh as usize].ranges[d.range as usize];
         out.push(Batch {
@@ -11561,20 +12319,75 @@ fn batch_items(
             mesh: d.mesh,
             first,
             count,
-            material: d.material,
+            material: last.1,
             instances: start..list.len() as u32,
         });
+    };
+    if sort {
+        let bits = |n: u32| u32::BITS - n.leading_zeros();
+        let (mut look, mut mesh, mut range) = (0, 0, 0);
+        for d in items.iter() {
+            (look, mesh, range) = (look | d.look, mesh | d.mesh, range | d.range);
+        }
+        let mesh_shift = bits(range);
+        let look_shift = mesh_shift + bits(mesh);
+        let pipe_shift = look_shift + bits(look);
+        if pipe_shift + 8 <= 64 {
+            // one number a draw sorts twice as fast as comparing the four fields
+            let mut keys: Vec<(u64, u32, u32)> = items
+                .iter()
+                .map(|d| {
+                    let key = (d.pipe as u64) << pipe_shift
+                        | (d.look as u64) << look_shift
+                        | (d.mesh as u64) << mesh_shift
+                        | d.range as u64;
+                    (key, d.entry, d.material)
+                })
+                .collect();
+            keys.sort_unstable_by_key(|k| k.0);
+            let field = |key: u64, from: u32, to: u32| ((key >> from) & ((1 << (to - from)) - 1)) as u32;
+            let mut k = 0;
+            while k < keys.len() {
+                let (key, _, material) = keys[k];
+                let start = list.len() as u32;
+                while k < keys.len() && keys[k].0 == key {
+                    list.push(keys[k].1);
+                    k += 1;
+                }
+                let d = DrawItem {
+                    pipe: (key >> pipe_shift) as u8,
+                    mesh: field(key, mesh_shift, look_shift),
+                    range: field(key, 0, mesh_shift),
+                    material,
+                    look: field(key, look_shift, pipe_shift),
+                    entry: 0,
+                };
+                push(&d, start, list);
+            }
+            return;
+        }
+        items.sort_unstable_by_key(|d| (d.pipe, d.look, d.mesh, d.range));
+    }
+    let mut k = 0;
+    while k < items.len() {
+        let d = items[k];
+        let start = list.len() as u32;
+        while k < items.len() && (items[k].pipe, items[k].mesh, items[k].range, items[k].look) == (d.pipe, d.mesh, d.range, d.look) {
+            list.push(items[k].entry);
+            k += 1;
+        }
+        push(&d, start, list);
     }
 }
 
-/// The material a depth-only draw (shadow map, depth prepass) is batched with: an opaque
-/// surface writes its depth whatever its texture, so all of them share the first material
-/// and batch across materials; an alpha-tested one needs its own texture for the cut-out.
-fn depth_only_material(kind: u8, material: MaterialId) -> u32 {
+/// The material and look a depth-only draw (shadow map, depth prepass) is batched with: an
+/// opaque surface writes its depth whatever its texture, so all of them share the first
+/// material and batch across materials; an alpha-tested one needs its own texture for the cut-out.
+fn depth_only_material(kind: u8, material: MaterialId, look: u32) -> (u32, u32) {
     if kind == 0 {
-        0
+        (0, 0)
     } else {
-        material as u32
+        (material as u32, look)
     }
 }
 
@@ -11599,6 +12412,8 @@ fn encode_batches_filtered<'a, E: wgpu::util::RenderEncoder<'a>>(
     pipeline: impl Fn(u8) -> &'a wgpu::RenderPipeline,
 ) {
     let (mut pipe, mut mesh, mut material) = (u8::MAX, u32::MAX, u32::MAX);
+    let mut page: Option<(&wgpu::Buffer, &wgpu::Buffer)> = None;
+    let (mut base_vertex, mut first_index) = (0i32, 0u32);
     for b in batches {
         if !include(b) {
             continue;
@@ -11609,8 +12424,12 @@ fn encode_batches_filtered<'a, E: wgpu::util::RenderEncoder<'a>>(
         }
         if b.mesh != mesh {
             let m = &scene.meshes[b.mesh as usize];
-            pass.set_vertex_buffer(0, m.vertex_buf.slice(..));
-            pass.set_index_buffer(m.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            if page.is_none_or(|(v, i)| *v != m.vertex_buf || *i != m.index_buf) {
+                pass.set_vertex_buffer(0, m.vertex_buf.slice(..));
+                pass.set_index_buffer(m.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                page = Some((&m.vertex_buf, &m.index_buf));
+            }
+            (base_vertex, first_index) = (m.base_vertex, m.first_index);
             mesh = b.mesh;
         }
         if b.material != material {
@@ -11621,18 +12440,19 @@ fn encode_batches_filtered<'a, E: wgpu::util::RenderEncoder<'a>>(
             );
             material = b.material;
         }
-        pass.draw_indexed(b.first..b.first + b.count, 0, b.instances.clone());
+        pass.draw_indexed(first_index + b.first..first_index + b.first + b.count, base_vertex, b.instances.clone());
     }
 }
 
 /// Main pass pipeline kinds (`pipe_code`): opaque, alpha-tested, blended, blended
-/// without depth write, and the depth-only coverage of composed ground surfaces.
+/// without depth write, depth-only surface coverage, and painted terrain without depth write.
 const PIPE_OPAQUE: u8 = 0;
 const PIPE_ALPHA_TEST: u8 = 1;
 const PIPE_BLEND: u8 = 2;
 const PIPE_BLEND_NO_WRITE: u8 = 3;
 const PIPE_SURFACE_DEPTH: u8 = 4;
-const PIPE_KINDS: u8 = 5;
+const PIPE_TERRAIN_PAINT: u8 = 5;
+const PIPE_KINDS: u8 = 6;
 
 fn effective_render_phase(instance: &Instance) -> RenderPhase {
     if instance.presurface {
@@ -11827,12 +12647,12 @@ fn record_bundles(
     format: wgpu::TextureFormat,
     samples: u32,
 ) -> Vec<wgpu::RenderBundle> {
-    let color_formats = [Some(format), Some(MASK_FORMAT)];
+    let color_formats = [Some(format), Some(MASK_FORMAT), Some(GBUF_FORMAT), Some(AUX_FORMAT)];
     let record = |chunk: &[Batch]| -> wgpu::RenderBundle {
         let mut bundle =
             device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
                 label: Some("main pass part"),
-                color_formats: &color_formats[..if format == HDR_FORMAT { 2 } else { 1 }],
+                color_formats: &color_formats[..if format != HDR_FORMAT { 1 } else if rt_gbuf() { 4 } else { 2 }],
                 depth_stencil: Some(wgpu::RenderBundleDepthStencil {
                     format: DEPTH_FORMAT,
                     depth_read_only: false,
@@ -12082,13 +12902,22 @@ impl Renderer {
             let f = self.freed(scene);
             (f.vertex_buf.clone(), f.index_buf.clone())
         };
+        if let Some(page) = scene.mesh_pages.get_mut(scene.meshes[id].page as usize) {
+            page.give(&scene.meshes[id]);
+        }
         let m = &mut scene.meshes[id];
         m.vertex_buf = vertex_buf;
         m.index_buf = index_buf;
+        m.page = u32::MAX;
+        m.base_vertex = 0;
+        m.first_index = 0;
+        m.vertex_offset = 0;
+        m.vertex_bytes = 0;
+        m.index_bytes = 0;
         m.ranges.clear();
         m.bounds_center = Vec3::ZERO;
         m.bounds_radius = 0.0;
-        Self::mesh_bounds_changed(scene, id);
+        Self::mesh_slot_replaced(scene, id);
     }
 
     /// Release a texture (a material still using it keeps it alive until it is freed too).
@@ -12120,6 +12949,7 @@ impl Renderer {
             let f = self.freed(scene);
             (f.bind_group.clone(), f.buf.clone())
         };
+        let look = scene.intern_look(0);
         scene.materials[id] = Material {
             texture: None,
             alpha: AlphaMode::Opaque,
@@ -12140,6 +12970,7 @@ impl Renderer {
             uniform: <MaterialUniform as bytemuck::Zeroable>::zeroed(),
             buf,
             bind_group,
+            look,
         };
     }
 
@@ -12172,11 +13003,13 @@ impl Renderer {
             }
         }
         cut(&mut scene.meshes, meshes);
+        scene.bounds_known.truncate(meshes);
         cut(&mut scene.textures, textures);
         cut(&mut scene.materials, materials);
         // hidden (freed) instances may still name a cut mesh or material: slot 0 instead,
         // they are not drawn and whoever takes them over sets their own
         let (nm, nt) = (scene.meshes.len(), scene.materials.len());
+        scene.bounds_users_stale = true;
         for inst in scene.instances.iter_mut() {
             if inst.mesh >= nm {
                 debug_assert!(!inst.visible, "a drawn instance lost its mesh");
@@ -12204,7 +13037,7 @@ impl Renderer {
         }
         let m = scene.meshes.pop().unwrap();
         scene.meshes[into] = m;
-        Self::mesh_bounds_changed(scene, into);
+        Self::mesh_slot_replaced(scene, into);
         into
     }
 
@@ -12244,6 +13077,7 @@ impl Renderer {
         let mut inst = scene.instances.pop().unwrap();
         inst.base = scene.instances[into].base;
         scene.instances[into] = inst;
+        scene.bounds_users_stale = true;
         Self::mark_changed(scene, into);
         into
     }
@@ -12509,6 +13343,545 @@ mod tests {
             b[0] > b[1] + 30 && b[0] > b[2] + 30,
             "foliage cutout must reveal red: {b:?}"
         );
+    }
+
+    #[test]
+    fn a_mesh_page_hands_freed_space_to_the_next_mesh_and_joins_its_holes() {
+        let (mut free, mut top) = (Vec::new(), 0u64);
+        let a = page_take(&mut free, &mut top, 1000, 100).unwrap();
+        let b = page_take(&mut free, &mut top, 1000, 200).unwrap();
+        let c = page_take(&mut free, &mut top, 1000, 300).unwrap();
+        assert_eq!((a, b, c, top), (0, 100, 300, 600));
+        page_give(&mut free, &mut top, b, 200);
+        assert_eq!(free, vec![(100, 200)]);
+        assert_eq!(page_take(&mut free, &mut top, 1000, 150), Some(100));
+        assert_eq!(free, vec![(250, 50)]);
+        page_give(&mut free, &mut top, a, 100);
+        page_give(&mut free, &mut top, 100, 150);
+        assert_eq!(free, vec![(0, 300)]);
+        page_give(&mut free, &mut top, c, 300);
+        assert_eq!((free.len(), top), (0, 0));
+        assert_eq!(page_take(&mut free, &mut top, 1000, 1001), None);
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn meshes_coming_and_going_tile_by_tile_keep_the_pages_from_growing() {
+        let adapter = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = pollster::block_on(Renderer::new_with(
+            &adapter, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() },
+        )).expect("test renderer");
+        if !renderer.mesh_pages() {
+            return;
+        }
+        let mut scene = renderer.new_scene();
+        let mesh = |n: usize| {
+            let positions: Vec<Vec3> = (0..n).map(|i| Vec3::new(i as f32, (i % 7) as f32, 0.0)).collect();
+            let indices: Vec<u32> = (0..n as u32 / 3 * 3).collect();
+            MeshData { normals: vec![Vec3::Z; n], uvs: vec![glam::Vec2::ZERO; n], ranges: vec![(0, indices.len() as u32, 0)], positions, indices, ..Default::default() }
+        };
+        // tiles of a few thousand meshes of every size, loaded and unloaded in no order, as
+        // a long drive across a map brings them; the scene's pages must not keep growing
+        let mut tiles: Vec<Vec<MeshId>> = Vec::new();
+        let mut seed = 0x1234_5678u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut most = 0;
+        for round in 0..300 {
+            let tile: Vec<MeshId> = (0..400).map(|_| renderer.add_mesh(&mut scene, &mesh(3 + (rand() % 600) as usize))).collect();
+            tiles.push(tile);
+            if tiles.len() > 12 {
+                let gone = tiles.remove((rand() % tiles.len() as u64) as usize);
+                for id in gone {
+                    renderer.free_mesh(&mut scene, id);
+                }
+            }
+            if round == 50 {
+                most = scene.mesh_pages.len();
+            }
+        }
+        assert!(scene.mesh_pages.len() <= most + 1, "the pages grew from {most} to {} over the drive", scene.mesh_pages.len());
+        let held = scene.mesh_page_bytes();
+        let used: u64 = scene.meshes.iter().filter(|m| m.page != u32::MAX).map(|m| m.vertex_bytes + m.index_bytes).sum();
+        assert!(held < used * 3, "{held} bytes of pages held for {used} in use");
+        for t in &tiles {
+            for &id in t {
+                let m = &scene.meshes[id];
+                assert_eq!(m.vertex_offset % std::mem::size_of::<Vertex>() as u64, 0);
+                assert!(m.vertex_offset + m.vertex_bytes <= m.vertex_buf.size());
+                assert!(m.first_index as u64 * 4 + m.index_bytes <= m.index_buf.size());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn msaa_depth_prepass_preserves_layered_surfaces() {
+        fn quad(renderer: &Renderer, scene: &mut Scene, z: f32, mat: MaterialId) -> usize {
+            let mesh = renderer.add_mesh(
+                scene,
+                &MeshData {
+                    positions: vec![
+                        Vec3::new(-4.0, -4.0, z),
+                        Vec3::new(4.0, -4.0, z),
+                        Vec3::new(4.0, 4.0, z),
+                        Vec3::new(-4.0, 4.0, z),
+                    ],
+                    normals: vec![Vec3::Z; 4],
+                    uvs: vec![
+                        glam::Vec2::ZERO,
+                        glam::Vec2::X,
+                        glam::Vec2::ONE,
+                        glam::Vec2::Y,
+                    ],
+                    indices: vec![0, 1, 2, 0, 2, 3],
+                    ranges: vec![(0, 6, 0)],
+                    one_sided: false,
+                },
+            );
+            renderer.add_surface_instance(scene, mesh, DVec3::ZERO, Mat4::IDENTITY, vec![mat])
+        }
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = pollster::block_on(Renderer::new_with(
+            &instance,
+            None,
+            Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions {
+                msaa: 4,
+                ssao: true,
+                fxaa: false,
+                render_scale: 1.0,
+                ..Default::default()
+            },
+        ))
+        .expect("test renderer");
+        if renderer.options.msaa <= 1 {
+            return; // This adapter cannot exercise a multisampled depth buffer.
+        }
+        assert!(renderer.prepass_msaa_pipelines.is_some());
+        let mut scene = renderer.new_scene();
+        let mask = renderer.add_texture(
+            &mut scene,
+            &omsi_texture::Image {
+                width: 7,
+                height: 1,
+                rgba: [0, 0, 112, 128, 160, 255, 255]
+                    .into_iter()
+                    .flat_map(|a| [255, 255, 255, a])
+                    .collect(),
+                has_alpha: true,
+            },
+            false,
+        );
+        let base = renderer.add_terrain_material(&mut scene, None, None, None, 1.0, None, 1.0);
+        let ground = quad(&renderer, &mut scene, 0.0, base);
+        scene.instances[ground].render_phase = RenderPhase::Terrain;
+        let paint =
+            renderer.add_terrain_layer_material(&mut scene, None, mask, None, 1.0, None, 1.0);
+        let layer = quad(&renderer, &mut scene, 0.0, paint);
+        scene.instances[layer].ground_layer = true;
+        scene.instances[layer].render_phase = RenderPhase::Terrain;
+        let road_mat = renderer.add_material(
+            &mut scene,
+            None,
+            AlphaMode::Opaque,
+            [0.0, 0.0, 1.0, 1.0],
+            true,
+        );
+        let road = quad(&renderer, &mut scene, 0.02, road_mat);
+        scene.instances[road].render_phase = RenderPhase::Spline;
+        let cutout = renderer.add_material(
+            &mut scene,
+            Some(mask),
+            AlphaMode::Test,
+            [0.0, 1.0, 0.0, 1.0],
+            false,
+        );
+        let fence = quad(&renderer, &mut scene, 0.3, cutout);
+        scene.instances[fence].render_phase = RenderPhase::Normal;
+        let blend = renderer.add_material(
+            &mut scene,
+            None,
+            AlphaMode::Blend,
+            [1.0, 0.0, 0.0, 0.25],
+            false,
+        );
+        let pane = quad(&renderer, &mut scene, 0.5, blend);
+        scene.instances[pane].render_phase = RenderPhase::Normal;
+        let camera = Camera {
+            position: DVec3::new(0.0, -0.105, 6.0),
+            yaw: 0.0,
+            pitch: -89.0,
+            roll: 0.0,
+            fov_deg: 90.0,
+            near: 0.1,
+            far: 100.0,
+        };
+        for wetness in [0.0, 1.0] {
+            let lighting = Lighting {
+                enhanced: true,
+                shadows: false,
+                fog_density: 0.0,
+                wetness,
+                ..Default::default()
+            };
+            let enabled = renderer
+                .render_to_image(&mut scene, 64, 64, &camera, &lighting)
+                .unwrap();
+            let pipelines = renderer.prepass_msaa_pipelines.take().unwrap();
+            let disabled = renderer
+                .render_to_image(&mut scene, 64, 64, &camera, &lighting)
+                .unwrap();
+            renderer.prepass_msaa_pipelines = Some(pipelines);
+            let delta = enabled
+                .iter()
+                .zip(&disabled)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(
+                delta <= 2,
+                "MSAA prepass changed layered surfaces by {delta}: wetness {wetness}"
+            );
+            let pixel = |x: usize| &enabled[(32 * 64 + x) * 4..(32 * 64 + x) * 4 + 3];
+            assert!(
+                pixel(12)[2] > pixel(12)[1] + 30,
+                "cutout hid the road: {:?}",
+                pixel(12)
+            );
+            assert!(
+                pixel(52)[1] > pixel(52)[2] + 30,
+                "opaque cutout disappeared: {:?}",
+                pixel(52)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn a_reshaped_mesh_moves_the_bounds_of_every_instance_drawing_it() {
+        let adapter = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = pollster::block_on(Renderer::new_with(
+            &adapter, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() },
+        )).expect("test renderer");
+        let mut scene = renderer.new_scene();
+        scene.cache_bounds = true;
+        let material = renderer.add_material(&mut scene, None, AlphaMode::Opaque, [1.0; 4], true);
+        let data = MeshData {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: vec![Vec3::Z; 3], uvs: vec![glam::Vec2::ZERO; 3],
+            indices: vec![0, 1, 2], ranges: vec![(0, 3, 0)], ..Default::default()
+        };
+        let (skinned, plain) = (renderer.add_mesh(&mut scene, &data), renderer.add_mesh(&mut scene, &data));
+        let mut add = |scene: &mut Scene, mesh, x: f64| renderer.add_instance(scene, mesh, DVec3::new(x, 0.0, 0.0), Mat4::IDENTITY, vec![material]);
+        let first = add(&mut scene, skinned, 0.0);
+        let others: Vec<usize> = (0..300).map(|k| add(&mut scene, plain, k as f64 * 10.0)).collect();
+        renderer.prepare(&mut scene);
+        let pose = |scale: f32| -> Vec<Vec3> { data.positions.iter().map(|p| *p * scale).collect() };
+        renderer.update_mesh(&mut scene, skinned, &pose(5.0), &data.normals, &data.uvs);
+        renderer.prepare(&mut scene);
+        // one added after the first pose, one switched to the skinned mesh
+        let late = add(&mut scene, skinned, 50.0);
+        renderer.set_instance_mesh(&mut scene, others[7], skinned);
+        renderer.prepare(&mut scene);
+        renderer.update_mesh(&mut scene, skinned, &pose(9.0), &data.normals, &data.uvs);
+        renderer.prepare(&mut scene);
+        let expected = InstanceBounds::new(&scene.meshes[skinned], Mat4::IDENTITY);
+        for i in [first, late, others[7]] {
+            assert_eq!(scene.instances[i].bounds.radius, expected.radius, "instance {i}");
+        }
+        assert_ne!(scene.instances[others[8]].bounds.radius, expected.radius);
+        assert!(scene.bounds_users.len() <= 4, "{} instances rescanned", scene.bounds_users.len());
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn terrain_paint_fast_path_preserves_composition() {
+        fn quad(
+            renderer: &Renderer,
+            scene: &mut Scene,
+            rect: [f32; 4],
+            z: f32,
+            mat: MaterialId,
+        ) -> usize {
+            let [left, right, bottom, top] = rect;
+            let mesh = renderer.add_mesh(
+                scene,
+                &MeshData {
+                    positions: vec![
+                        Vec3::new(left, bottom, z),
+                        Vec3::new(right, bottom, z),
+                        Vec3::new(right, top, z),
+                        Vec3::new(left, top, z),
+                    ],
+                    normals: vec![Vec3::Z; 4],
+                    uvs: vec![
+                        glam::Vec2::ZERO,
+                        glam::Vec2::X,
+                        glam::Vec2::ONE,
+                        glam::Vec2::Y,
+                    ],
+                    indices: vec![0, 1, 2, 0, 2, 3],
+                    ranges: vec![(0, 6, 0)],
+                    one_sided: false,
+                },
+            );
+            renderer.add_surface_instance(scene, mesh, DVec3::ZERO, Mat4::IDENTITY, vec![mat])
+        }
+        for msaa in [1, 4] {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let mut renderer = pollster::block_on(Renderer::new_with(
+                &instance,
+                None,
+                Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                RenderOptions {
+                    msaa,
+                    ssao: false,
+                    shadow_size: 1024,
+                    fxaa: false,
+                    render_scale: 1.0,
+                    ..Default::default()
+                },
+            ))
+            .expect("test renderer");
+            let mut scene = renderer.new_scene();
+            let base = renderer.add_terrain_material(&mut scene, None, None, None, 1.0, None, 1.0);
+            let ground = quad(&renderer, &mut scene, [-6.0, 6.0, -6.0, 6.0], 0.0, base);
+            scene.instances[ground].render_phase = RenderPhase::Terrain;
+            let mut paint_materials = Vec::new();
+            for (rgb, alphas) in [
+                ([160, 40, 40], [0, 0, 112, 128, 160, 255, 255]),
+                ([40, 160, 40], [255, 255, 160, 128, 112, 0, 0]),
+            ] {
+                let diffuse = renderer.add_texture(
+                    &mut scene,
+                    &omsi_texture::Image {
+                        width: 4,
+                        height: 4,
+                        rgba: (0..16)
+                            .flat_map(|i| {
+                                let c = rgb.map(|v| {
+                                    if (i / 4 + i % 4) % 2 == 0 { v } else { v / 2 }
+                                });
+                                [c[0], c[1], c[2], 255]
+                            })
+                            .collect(),
+                        has_alpha: false,
+                    },
+                    false,
+                );
+                let mask = renderer.add_texture(
+                    &mut scene,
+                    &omsi_texture::Image {
+                        width: 7,
+                        height: 1,
+                        rgba: alphas
+                            .into_iter()
+                            .flat_map(|a| [255, 255, 255, a])
+                            .collect(),
+                        has_alpha: true,
+                    },
+                    false,
+                );
+                // Generated tiled detail exercises sampling beside empty mask pixels.
+                let detail = renderer.add_texture(
+                    &mut scene,
+                    &omsi_texture::Image {
+                        width: 4,
+                        height: 4,
+                        rgba: (0..16)
+                            .flat_map(|i| {
+                                let v = if (i / 4 + i % 4) % 2 == 0 { 160 } else { 255 };
+                                [v, v, v, 255]
+                            })
+                            .collect(),
+                        has_alpha: false,
+                    },
+                    false,
+                );
+                let mat = renderer.add_terrain_layer_material(
+                    &mut scene,
+                    Some(diffuse),
+                    mask,
+                    Some((detail, 12.0)),
+                    8.0,
+                    None,
+                    1.0,
+                );
+                paint_materials.push(mat);
+                let layer = quad(&renderer, &mut scene, [-6.0, 6.0, -6.0, 6.0], 0.0, mat);
+                scene.instances[layer].ground_layer = true;
+                scene.instances[layer].render_phase = RenderPhase::Terrain;
+            }
+            let blue = renderer.add_material(
+                &mut scene,
+                None,
+                AlphaMode::Opaque,
+                [0.0, 0.0, 1.0, 1.0],
+                true,
+            );
+            let road = quad(&renderer, &mut scene, [-6.0, 6.0, -0.7, 0.7], 0.02, blue);
+            scene.instances[road].render_phase = RenderPhase::Spline;
+            let camera = Camera {
+                position: DVec3::new(0.0, -0.105, 6.0),
+                yaw: 0.0,
+                pitch: -89.0,
+                roll: 0.0,
+                fov_deg: 90.0,
+                near: 0.1,
+                far: 100.0,
+            };
+            // Compare identical scene data through the specialized and original no-write
+            // pipelines, including water's opacity and wet-ground reflection coverage.
+            for (wetness, water) in [(0.0, false), (1.0, false), (1.0, true)] {
+                if water {
+                    for &mat in &paint_materials {
+                        scene.materials[mat].uniform.ambient[3] = 2.0;
+                        renderer.queue.write_buffer(
+                            &scene.materials[mat].buf,
+                            0,
+                            bytemuck::bytes_of(&scene.materials[mat].uniform),
+                        );
+                    }
+                }
+                let lighting = Lighting {
+                    enhanced: true,
+                    shadows: false,
+                    fog_density: 0.0,
+                    wetness,
+                    ..Default::default()
+                };
+                let actual = renderer
+                    .render_to_image(&mut scene, 64, 64, &camera, &lighting)
+                    .unwrap();
+                let pp = renderer.hdr_pass.as_mut().unwrap();
+                let mut saved = Vec::new();
+                for variant in 0..4 {
+                    let original = pp.pipelines[PIPE_BLEND_NO_WRITE as usize * 4 + variant].clone();
+                    saved.push(std::mem::replace(
+                        &mut pp.pipelines[PIPE_TERRAIN_PAINT as usize * 4 + variant],
+                        original,
+                    ));
+                }
+                let expected = renderer
+                    .render_to_image(&mut scene, 64, 64, &camera, &lighting)
+                    .unwrap();
+                for (variant, pipeline) in saved.into_iter().enumerate() {
+                    renderer.hdr_pass.as_mut().unwrap().pipelines
+                        [PIPE_TERRAIN_PAINT as usize * 4 + variant] = pipeline;
+                }
+                let delta = actual
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                assert!(
+                    delta <= 2,
+                    "paint composition changed by {delta}: MSAA {msaa}, wet {wetness}, water {water}"
+                );
+                let centre = &actual[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 3];
+                if debug_view() <= 0.5 {
+                    assert!(
+                        centre[2] > centre[0] + 30 && centre[2] > centre[1] + 30,
+                        "paint hid the road: {centre:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn a_freed_and_recycled_mesh_slot_is_no_longer_counted_as_reshaped() {
+        let adapter = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = pollster::block_on(Renderer::new_with(
+            &adapter, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() },
+        )).expect("test renderer");
+        let mut scene = renderer.new_scene();
+        scene.cache_bounds = true;
+        let material = renderer.add_material(&mut scene, None, AlphaMode::Opaque, [1.0; 4], true);
+        let data = MeshData {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: vec![Vec3::Z; 3], uvs: vec![glam::Vec2::ZERO; 3],
+            indices: vec![0, 1, 2], ranges: vec![(0, 3, 0)], ..Default::default()
+        };
+        let pose = |scale: f32| -> Vec<Vec3> { data.positions.iter().map(|p| *p * scale).collect() };
+        let (once_skinned, skinned) = (renderer.add_mesh(&mut scene, &data), renderer.add_mesh(&mut scene, &data));
+        let first = renderer.add_instance(&mut scene, skinned, DVec3::ZERO, Mat4::IDENTITY, vec![material]);
+        renderer.update_mesh(&mut scene, once_skinned, &pose(2.0), &data.normals, &data.uvs);
+        renderer.prepare(&mut scene);
+        // the slot is freed and taken by a plain mesh, which a whole tile then draws
+        renderer.free_mesh(&mut scene, once_skinned);
+        renderer.prepare(&mut scene);
+        let plain = renderer.add_mesh(&mut scene, &data);
+        assert_eq!(renderer.recycle_mesh(&mut scene, plain, once_skinned), once_skinned);
+        let tile: Vec<usize> = (0..200).map(|k| renderer.add_instance(&mut scene, once_skinned, DVec3::new(k as f64, 0.0, 0.0), Mat4::IDENTITY, vec![material])).collect();
+        renderer.prepare(&mut scene);
+        renderer.update_mesh(&mut scene, skinned, &pose(7.0), &data.normals, &data.uvs);
+        renderer.prepare(&mut scene);
+        assert!(scene.bounds_users.len() <= 2, "{} instances rescanned", scene.bounds_users.len());
+        let expected = InstanceBounds::new(&scene.meshes[skinned], Mat4::IDENTITY);
+        assert_eq!(scene.instances[first].bounds.radius, expected.radius);
+        let plain_bounds = InstanceBounds::new(&scene.meshes[once_skinned], Mat4::IDENTITY);
+        assert_eq!(scene.instances[tile[42]].bounds.radius, plain_bounds.radius);
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn materials_that_look_alike_are_batched_together_whenever_they_were_made() {
+        let adapter = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let renderer = pollster::block_on(Renderer::new_with(
+            &adapter, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() },
+        )).expect("test renderer");
+        let mut scene = renderer.new_scene();
+        let image = omsi_texture::Image { width: 1, height: 1, rgba: vec![200, 100, 50, 255], has_alpha: false };
+        let texture = renderer.add_texture(&mut scene, &image, true);
+        let a = renderer.add_material(&mut scene, Some(texture), AlphaMode::Opaque, [1.0; 4], false);
+        renderer.prepare(&mut scene);
+        let b = renderer.add_material(&mut scene, Some(texture), AlphaMode::Opaque, [1.0; 4], false);
+        let c = renderer.add_material(&mut scene, Some(texture), AlphaMode::Opaque, [0.5, 0.5, 0.5, 1.0], false);
+        let other = renderer.add_texture(&mut scene, &image, true);
+        let d = renderer.add_material(&mut scene, Some(other), AlphaMode::Opaque, [1.0; 4], false);
+        let look = |scene: &Scene, m: MaterialId| scene.materials[m].look;
+        assert_ne!(scene.materials[a].bind_group, scene.materials[b].bind_group);
+        assert_eq!(look(&scene, a), look(&scene, b));
+        assert_ne!(look(&scene, a), look(&scene, c));
+        assert_ne!(look(&scene, a), look(&scene, d));
+        let data = MeshData {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: vec![Vec3::Z; 3], uvs: vec![glam::Vec2::ZERO; 3],
+            indices: vec![0, 1, 2], ranges: vec![(0, 3, 0)], ..Default::default()
+        };
+        let mesh = renderer.add_mesh(&mut scene, &data);
+        let instances: Vec<usize> = [a, c, b, d]
+            .iter()
+            .map(|&m| renderer.add_instance(&mut scene, mesh, DVec3::ZERO, Mat4::IDENTITY, vec![m]))
+            .collect();
+        renderer.prepare(&mut scene);
+        let mut items: Vec<DrawItem> = instances
+            .iter()
+            .map(|&i| {
+                let material = scene.instances[i].materials[0];
+                DrawItem { pipe: 0, mesh: mesh as u32, range: 0, material: material as u32, look: look(&scene, material), entry: scene.instances[i].base }
+            })
+            .collect();
+        let (mut list, mut batches) = (Vec::new(), Vec::new());
+        batch_items(&scene, &mut items, true, &mut list, &mut batches);
+        assert_eq!(batches.len(), 3);
+        let shared = batches.iter().find(|b| b.instances.len() == 2).expect("a and b in one batch");
+        assert!(shared.material == a as u32 || shared.material == b as u32);
+        let mut entries: Vec<u32> = list[shared.instances.start as usize..shared.instances.end as usize].to_vec();
+        entries.sort_unstable();
+        assert_eq!(entries, vec![scene.instances[instances[0]].base, scene.instances[instances[2]].base]);
     }
 
     #[test]
@@ -13388,6 +14761,8 @@ mod tests {
         use wgpu::naga;
         let modules = [
             ("scene", scene_shader_source(false)),
+            ("scene opaque", scene_shader_source(false)),
+            ("scene terrain paint", scene_shader_source(false)),
             ("sky", sky_shader_source()),
             ("corona", corona_shader_source()),
             ("post", include_str!("post.wgsl").to_string()),
@@ -13396,6 +14771,11 @@ mod tests {
             ("upscale", include_str!("upscale.wgsl").to_string()),
             ("mip", include_str!("mip.wgsl").to_string()),
             ("xr_ui", include_str!("xr_ui.wgsl").to_string()),
+            // Enhanced+: the scene's pass with its reflection targets, the ray tracing
+            ("scene (Enhanced+)", scene_shader_source(false).replace("//RT ", "")),
+            ("ray-traced lighting", rt::lighting_source()),
+            ("ray-traced reflections", rt::reflect_source()),
+            ("texture means", include_str!("rt_avg.wgsl").to_string()),
         ];
         let sizes: &[(&str, usize)] = &[
             ("Enhanced", std::mem::size_of::<EnhancedUniform>()),
@@ -13405,6 +14785,7 @@ mod tests {
             ("PointLight", std::mem::size_of::<GpuPointLight>()),
             ("Camera", std::mem::size_of::<CameraUniform>()),
             ("MaterialParams", std::mem::size_of::<MaterialUniform>()),
+            ("RtParams", rt::PARAMS_SIZE),
             ("Motion", std::mem::size_of::<MotionUniform>()),
         ];
         let mut checked = std::collections::HashSet::new();
@@ -13417,12 +14798,19 @@ mod tests {
             )
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
-            // the backends take no override: resolved to their defaults as wgpu does
+            // Exercise the painted-ground specialization as well as the default shader.
+            let mut constants = naga::back::PipelineConstants::default();
+            if name.starts_with("scene ") {
+                constants.insert("ALPHA_TEST".into(), 0.0);
+            }
+            if *name == "scene terrain paint" {
+                constants.insert("TERRAIN_PAINT".into(), 1.0);
+            }
             let (module, info) = naga::back::pipeline_constants::process_overrides(
                 &module,
                 &info,
                 None,
-                &Default::default(),
+                &constants,
             )
             .unwrap_or_else(|e| panic!("{name}: overrides: {e:?}"));
             let (module, info) = (module.into_owned(), info.into_owned());
@@ -13492,8 +14880,10 @@ mod tests {
         let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
             .validate(&module)
             .expect("validate");
+        let constants = [("ALPHA_TEST".into(), 0.0), ("TERRAIN_PAINT".into(), 1.0)]
+            .into_iter().collect();
         let (module, info) =
-            naga::back::pipeline_constants::process_overrides(&module, &info, None, &Default::default()).expect("overrides");
+            naga::back::pipeline_constants::process_overrides(&module, &info, None, &constants).expect("overrides");
         for version in [glsl::Version::Embedded { version: 310, is_webgl: false }, glsl::Version::Desktop(430)] {
             let options = glsl::Options { version, ..Default::default() };
             for entry in &module.entry_points {

@@ -185,24 +185,34 @@ impl Hof {
     }
 }
 
-/// The `.hof` files of a folder, sorted by name: every content root's copy of the folder
-/// together (a mod's depot next to the installation's; archives read in place too), a
-/// higher-priority root's file hiding the same name lower down.
+/// The `.hof` files available to a vehicle. Files next to the vehicle come first, merged
+/// over all content roots (a mod's depot beside the installation's; archives read in place
+/// too), followed by the shared top-level `HOFs/` folder. A vehicle-local file hides a
+/// shared file of the same name; within each group files are sorted by name.
 pub fn depot_files(dir: &Path) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
-    let mut files: Vec<PathBuf> = Vec::new();
+    let mut local: Vec<PathBuf> = Vec::new();
     for d in omsi_cfg::mirrored_dirs(dir) {
         for p in omsi_cfg::vfs::read_dir_paths(&d) {
             if !p.extension().map(|e| e.eq_ignore_ascii_case("hof")).unwrap_or(false) {
                 continue;
             }
             if seen.insert(p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase()) {
-                files.push(p);
+                local.push(p);
             }
         }
     }
-    files.sort_by_key(|f| f.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase());
-    files
+    local.sort_by_key(|f| f.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase());
+
+    let mut shared: Vec<PathBuf> = omsi_cfg::read_dir_merged("HOFs")
+        .into_iter()
+        .filter(|p| p.extension().map(|e| e.eq_ignore_ascii_case("hof")).unwrap_or(false))
+        .filter(|p| seen.insert(p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase()))
+        .collect();
+    shared.sort_by_key(|f| f.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase());
+
+    local.extend(shared);
+    local
 }
 
 /// The depot file of `dir` called `name`: by its file name (without `.hof`) or its `[name]`.
@@ -272,7 +282,7 @@ pub fn depot_like(dir: &Path, hints: &[&str]) -> Option<Hof> {
     closest_name(&refs, hints).and_then(|i| Hof::load(&files[i]).ok())
 }
 
-/// The depot file called `name` in any vehicle folder of any content root (`Vehicles/*/`).
+/// The depot file called `name` in the shared `HOFs/` folder or any vehicle folder of any content root (`Vehicles/*/`).
 ///
 /// A depot file belongs to a map, not to a bus model: it lists the map's termini, stops and
 /// IBIS codes. A mod bus brings only the depot of the map it was made on (the O530 Citaro
@@ -320,6 +330,40 @@ mod tests {
         assert_eq!(closest_name(&names, &["Thüringer Wald"]), None);
         assert_eq!(closest_name(&["Berlin X10", "Spandau"], &["Berlin-Spandau"]), Some(1));
         assert_eq!(closest_name(&["Linie 20"], &["Linie 7"]), None);
+    }
+
+    #[test]
+    fn shared_depots_are_available_but_vehicle_copy_wins() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("openomsi-shared-hof-{stamp}"));
+        let bus = root.join("Vehicles/TestBus");
+        let shared = root.join("HOFs");
+        std::fs::create_dir_all(&bus).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+
+        let local_name = format!("local-{stamp}.hof");
+        let shared_name = format!("shared-{stamp}.hof");
+        let same_name = format!("same-{stamp}.hof");
+        std::fs::write(bus.join(&local_name), "[name]\nLocal\n").unwrap();
+        std::fs::write(shared.join(&shared_name), "[name]\nShared\n").unwrap();
+        std::fs::write(bus.join(&same_name), "[name]\nLocal duplicate\n").unwrap();
+        std::fs::write(shared.join(&same_name), "[name]\nShared duplicate\n").unwrap();
+
+        omsi_cfg::add_content_root(root.clone());
+        let files = depot_files(&bus);
+        let named = |p: &Path, name: &str| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == name);
+        let local_i = files.iter().position(|p| named(p, &local_name)).unwrap();
+        let shared_i = files.iter().position(|p| named(p, &shared_name)).unwrap();
+        let duplicate = files.iter().find(|p| named(p, &same_name)).unwrap();
+        assert!(local_i < shared_i);
+        assert_eq!(duplicate, &bus.join(&same_name));
+        assert_eq!(depot_in(&bus, "Shared").map(|h| h.name), Some("Shared".into()));
+
+        omsi_cfg::remove_content_root(&root);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

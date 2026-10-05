@@ -26,13 +26,21 @@ struct Enhanced {
     lights: vec4<f32>,
     // rgb the sun disc's irradiance before the clouds, w frame time (s)
     sun_disc: vec4<f32>,
-    // x which term the main pass shows alone (OMSI_DEBUG_ENHANCED, 0 = the picture)
+    // x which term the main pass shows alone (OMSI_DEBUG_ENHANCED, 0 = the picture),
+    // y the puddles' F0, z the envmap photo's strength, w the tone curve's contrast
     debug: vec4<f32>,
     // xyz where the sky cube is drawn from, relative to the camera
     eye: vec4<f32>,
     // x how bright an LED panel's dots burn (0 = off), y whether the LED panels' `\S:n`
     // masks keep their mip chain (0: at full resolution, the dots stay visible when small)
     led: vec4<f32>,
+    // xyz towards the moon, w its angular radius (rad)
+    moon: vec4<f32>,
+    // rgb the moon disc's irradiance before the clouds, w how much of the starry sky shows
+    moon_disc: vec4<f32>,
+    // rgb the sun's irradiance at 1400, 2100 and 2800 m (the cumulus layer) and 7000 m
+    // (the high thin layer), through the atmosphere from up there
+    cloud_sun: array<vec4<f32>, 4>,
 };
 @group(0) @binding(11) var<uniform> enh: Enhanced;
 @group(0) @binding(13) var s_lin: sampler;

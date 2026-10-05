@@ -114,6 +114,14 @@ pub(crate) fn custom_weather(text:Option<&str>)->Option<CustomWeather>{text.and_
 
 /// Weather from `--weather`, else the clear-sky default.
 pub(crate) fn load_weather(args: &Args) -> omsi_content::weather::Weather {
+    // no weather chosen, or `natural`: the physical model (weather_model.rs)
+    if crate::weather_model::is_natural(args.weather.as_deref()) {
+        let w = crate::weather_model::start(&crate::situation::start_clock(args));
+        scene::SNOW_WEATHER.store(w.snow, std::sync::atomic::Ordering::Relaxed);
+        omsi_sim::host::set_ambient_weather(w.temp.0, w.temp.1);
+        return w;
+    }
+    crate::weather_model::stop();
     let rel = args
         .weather
         .clone()
@@ -431,6 +439,7 @@ pub(crate) fn weather_lighting(
     let (density, offset) = clouds_of(w, cloud_drift);
     lighting.cloud_density = density;
     lighting.cloud_offset = offset;
+    let model_sky = *crate::weather_model::CURRENT.lock().unwrap_or_else(|e| e.into_inner());
     let (kind, rate) = precip_of(w);
     lights::apply_weather(
         &mut lighting,
@@ -458,6 +467,19 @@ pub(crate) fn weather_lighting(
     // draws no sun shadows below 350 m visibility
     let overcast = w.clouds.0.trim().to_ascii_lowercase().starts_with("overcast");
     lighting.shadows = shadows && !overcast && w.fog.0 > 350.0;
+    // the physical model: how much of which cloud there is and what the air holds, which
+    // the enhanced atmosphere turns into light (the `.owt` values above stay for the rest)
+    if let Some(m) = model_sky.filter(|_| lighting.enhanced) {
+        let closed = ((m.deck - 0.85) / 0.15).clamp(0.0, 1.0);
+        if CLOUDS.load(std::sync::atomic::Ordering::Relaxed) {
+            lighting.cloud_density = m.cumulus.max(m.deck * 0.95);
+        }
+        lighting.overcast = m.deck;
+        lighting.sun_intensity = 1.0 - closed;
+        lighting.veil = m.veil;
+        lighting.air = Some([m.haze, m.angstrom, m.aerosol_height]);
+        lighting.shadows = shadows && closed < 0.5 && w.fog.0 > 350.0;
+    }
     lighting
 }
 

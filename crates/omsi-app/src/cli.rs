@@ -120,7 +120,8 @@ pub(crate) struct Args {
     /// Set script string variables after spawning: name=value[,name=value…].
     #[arg(long)]
     pub(crate) setstr: Option<String>,
-    /// Weather file (relative to root), e.g. Weather/Bodennebel.owt.
+    /// Weather file (relative to root), e.g. Weather/Bodennebel.owt; `natural` (or none) is
+    /// the physical weather model, `cycle` the weather cycle.
     #[arg(long)]
     pub(crate) weather: Option<String>,
     /// Passengers at bus stops (window and offscreen).
@@ -229,6 +230,11 @@ pub(crate) struct Args {
     /// automatic exposure, a glow around real highlights and the PBR Neutral tone curve).
     #[arg(long)]
     pub(crate) enhanced: bool,
+    /// Enhanced+ graphics, as the settings' `graphics=enhanced_plus`: Enhanced with
+    /// ray-traced sun shadows, ambient occlusion and reflections (where the graphics card
+    /// can trace rays).
+    #[arg(long)]
+    pub(crate) enhanced_plus: bool,
     /// Open the launcher (the default when the program is started without arguments).
     #[arg(long)]
     pub(crate) launcher: bool,

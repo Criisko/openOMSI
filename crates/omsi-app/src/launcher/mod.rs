@@ -1022,12 +1022,13 @@ impl Launcher {
         // the storage browser (or the update dialog) lies over the page: the page sees no
         // finger meanwhile
         let dialog = self.update_dialog_open();
-        let crash = !dialog && self.state.crash.is_some();
-        let reset = !dialog && !crash && self.pages.confirm_reset;
-        if self.browser.is_some() || dialog || crash || reset {
+        let disconnected = !dialog && self.state.disconnected.is_some();
+        let crash = !dialog && !disconnected && self.state.crash.is_some();
+        let reset = !dialog && !crash && !disconnected && self.pages.confirm_reset;
+        if self.browser.is_some() || dialog || crash || reset || disconnected {
             self.pages.pads.cancel_feedback_test();
         }
-        let saved = (self.browser.is_some() || dialog || crash || reset).then(|| {
+        let saved = (self.browser.is_some() || dialog || crash || reset || disconnected).then(|| {
             let i = self.ui.input.clone();
             self.ui.input.mouse = Vec2::new(-1e4, -1e4);
             self.ui.input.pressed = false;
@@ -1081,6 +1082,8 @@ impl Launcher {
             self.ui.input = i;
             if dialog {
                 self.draw_update_dialog();
+            } else if disconnected {
+                self.draw_disconnect_dialog();
             } else if crash {
                 self.draw_crash_dialog();
             } else if reset {

@@ -227,6 +227,7 @@ pub struct AiCar {
     /// A rail vehicle: the track it has come along, (odometer, point), oldest first -
     /// where its rear bogie and its coupled cars and sections run (see `rail_behind`).
     pub rail_trail: std::collections::VecDeque<(f64, DVec3)>,
+    /// Seconds its body and script took last frame (heavy ones get an AI job of their own).
     pub ai_secs: f32,
     /// A train turned round as a whole (its last car leads now): what a trip's
     /// `[trainreverse]` is compared with (Omsi.exe's vehicle +0x4e1).
@@ -699,18 +700,13 @@ pub fn vehicle_bodies(v: &VehicleInstance) -> Vec<omsi_sim::collision::Obb> {
     let mut out = vec![omsi_sim::collision::Obb::from_box(
         v.ty.def.bounding_box.unwrap_or(DEFAULT_BOX),
         v.position,
-        v.heading,
+        v.body_heading(),
     )];
     for t in &v.trailers {
-        let heading = if t.reversed {
-            t.heading + 180.0
-        } else {
-            t.heading
-        };
         out.push(omsi_sim::collision::Obb::from_box(
             t.ty.def.bounding_box.unwrap_or(DEFAULT_BOX),
             t.position,
-            heading,
+            t.body_heading(),
         ));
     }
     out
@@ -871,7 +867,7 @@ fn open_trace() -> Option<std::io::BufWriter<std::fs::File>> {
 /// The vehicle's extent from its origin: (to the front bumper, to the rear bumper, half
 /// the width) from its `[boundingbox]`.
 fn extents(ty: &VehicleType, length: f32) -> (f32, f32, f32) {
-    match ty.def.bounding_box {
+    let (front, rear, width) = match ty.def.bounding_box {
         Some(bb) if bb[1] > 1.0 => (
             bb[1] * 0.5 + bb[4],
             bb[1] * 0.5 - bb[4],
@@ -883,6 +879,11 @@ fn extents(ty: &VehicleType, length: f32) -> (f32, f32, f32) {
             Some((lo, hi)) if hi.y - lo.y > 1.0 => (hi.y.max(0.5), (-lo.y).max(0.5), (hi.x.max(-lo.x)).max(0.5)),
             _ => (length * 0.5, length * 0.5, 0.9),
         },
+    };
+    if omsi_sim::vehicle::body_reversed(&ty.def, false) {
+        (rear, front, width)
+    } else {
+        (front, rear, width)
     }
 }
 
@@ -3479,6 +3480,10 @@ impl Traffic {
         feet: &[Footprint],
     ) {
         let car = &self.cars[i];
+        // Rail vehicles must never use the road-vehicle passing manoeuvre.
+        if car.is_rail() {
+            return;
+        }
         let st = &car.state;
         // a parked car is known from afar: the driver pulls out while still rolling up to
         // it; anything else is waited behind for a moment first
@@ -4804,7 +4809,7 @@ impl Traffic {
                 if let Some(bb) = t.ty.def.bounding_box {
                     out.push(Footprint::from_obb(
                         i,
-                        &omsi_sim::collision::Obb::from_box(bb, t.position, t.heading),
+                        &omsi_sim::collision::Obb::from_box(bb, t.position, t.body_heading()),
                         st.speed,
                     ));
                 }
@@ -6589,33 +6594,20 @@ impl Traffic {
         let mut bodies = vec![grown(omsi_sim::collision::Obb::from_box(
             ty.def.bounding_box.unwrap_or(DEFAULT_BOX),
             pos,
-            heading,
+            omsi_sim::vehicle::body_heading(&ty.def, heading, false),
         ))];
         let (mut origin, mut lead, mut lead_rev) = (pos, ty.clone(), false);
         for (t, rev) in self.trailer_chain(ty) {
-            let (back, front) = match omsi_sim::vehicle::coupling_offsets(&lead, lead_rev, &t, rev) {
-                Some((back, front)) => (back, front),
-                None => {
-                    // the declared joint, each end the one the part's own way names (as
-                    // `TrailerPart::new_ex` takes it): a part turned round couples by its
-                    // `[coupling_front]`, not by its `[coupling_back]`
-                    let cb = if lead_rev { lead.def.coupling_front.as_ref() } else { lead.def.coupling_back.as_ref() };
-                    let cf = if rev { t.def.coupling_back.as_ref() } else { t.def.coupling_front.as_ref() };
-                    (
-                        cb.map(|c| c.pos[1]).unwrap_or(if lead_rev { 4.0 } else { -4.0 }),
-                        cf.map(|c| c.pos[1]).unwrap_or(if rev { -4.0 } else { 4.0 }),
-                    )
-                }
-            };
+            let (back, front) = omsi_sim::vehicle::coupling_points(&lead, lead_rev, &t, rev);
             // each car stands along the consist's heading, turned round by its own
             // (absolute) orientation - never by the car in front of it
             let (center, car_heading) = omsi_sim::vehicle::coupling_placement(
                 origin,
                 heading,
-                lead_rev,
-                back,
-                rev,
-                front,
+                omsi_sim::vehicle::body_reversed(&lead.def, lead_rev),
+                back.y,
+                omsi_sim::vehicle::body_reversed(&t.def, rev),
+                front.y,
             );
             bodies.push(grown(omsi_sim::collision::Obb::from_box(
                 t.def.bounding_box.unwrap_or(DEFAULT_BOX),
@@ -6819,12 +6811,12 @@ impl Traffic {
                 let (mass, id) = (c.vehicle.physics.mass_kg, c.id);
                 let rear = c.vehicle.trailers.iter().filter_map(move |t| {
                     t.ty.def.bounding_box.map(|bb| {
-                        omsi_sim::collision::Obb::from_box(bb, t.position, t.heading)
+                        omsi_sim::collision::Obb::from_box(bb, t.position, t.body_heading())
                             .moving(v, mass, id)
                     })
                 });
                 std::iter::once(
-                    omsi_sim::collision::Obb::from_box(bb, c.vehicle.position, c.vehicle.heading)
+                    omsi_sim::collision::Obb::from_box(bb, c.vehicle.position, c.vehicle.body_heading())
                         .moving(v, mass, id),
                 )
                 .chain(rear)
@@ -7414,6 +7406,12 @@ impl Traffic {
             return;
         }
         self.mirror = on;
+        if !on {
+            let day_time = self.day_time;
+            for ctl in &mut self.lights {
+                reset_light_runtime(ctl, day_time);
+            }
+        }
         let ids: Vec<u64> = self.cars.iter().map(|c| c.id).collect();
         for id in ids {
             self.remove_car(world, renderer, scene, id);
@@ -7429,17 +7427,15 @@ impl Traffic {
         );
     }
 
-    /// A client's frame: the clock and the light programs run on (the host corrects them
-    /// every second, `set_light_state`); the cars are moved by `lan_world`.
+    /// A client's frame: interpolate the host's light clocks, without re-evaluating its
+    /// stop and jump points from the client's incomplete traffic requests.
     fn mirror_tick(&mut self, dt: f32) {
         self.time += dt;
         self.day_time += dt as f64 * self.time_scale;
         self.last_dt = dt;
         let day_time = self.day_time;
         for c in self.lights.iter_mut() {
-            c.request.iter_mut().for_each(|r| *r = false);
-            c.start(day_time);
-            c.advance(dt);
+            mirror_light_tick(c, dt, day_time);
         }
         self.log_lights();
     }
@@ -7575,9 +7571,174 @@ impl Traffic {
             .get(&object)
             .and_then(|c| self.lights.get_mut(*c))
         {
-            ctl.time = time;
-            ctl.held = held;
+            set_mirror_light_clock(ctl, time, held);
         }
+    }
+}
+
+fn mirror_light_tick(ctl: &mut TrafficLightController, dt: f32, day_time: f64) {
+    ctl.request.fill(false);
+    ctl.start(day_time);
+    if !ctl.held {
+        ctl.time = (ctl.time + dt.max(0.0) as f64).rem_euclid(ctl.cycle_len());
+    }
+}
+
+fn set_mirror_light_clock(ctl: &mut TrafficLightController, time: f64, held: bool) {
+    // A crossing may receive its first snapshot before its first tick. Mark its clock
+    // started now, so the time-of-day seed cannot replace the host's position later.
+    ctl.start(time - ctl.offset as f64);
+    ctl.time = time.rem_euclid(ctl.cycle_len());
+    ctl.held = held;
+}
+
+fn reset_light_runtime(ctl: &mut TrafficLightController, day_time: f64) {
+    // Stop/jump bookkeeping belongs to the clock's previous owner. Keep the program
+    // and current position, but discard its old requests and visited points.
+    ctl.start(day_time);
+    let mut fresh = TrafficLightController::new(ctl.lights.clone(), ctl.cycle);
+    fresh.offset = ctl.offset;
+    fresh.approach = ctl.approach.clone();
+    fresh.stops = ctl.stops.clone();
+    fresh.start(ctl.time - ctl.offset as f64);
+    *ctl = fresh;
+}
+
+#[cfg(test)]
+mod mirror_light_tests {
+    use super::{mirror_light_tick, reset_light_runtime, set_mirror_light_clock};
+    use omsi_sim::traffic::TrafficLightController;
+
+    fn program() -> TrafficLightController {
+        TrafficLightController::from_program(
+            vec![(vec![(0, 4.0), (6, 4.0)], Some(25.0))],
+            Some(8.0),
+            &[[0.0, 4.0, 1.0]],
+            &[[0.0, 6.0, 1.0, 1.0]],
+        )
+    }
+
+    #[test]
+    fn host_hold_survives_missing_local_requests() {
+        let mut ctl = program();
+        ctl.stops[0].if_request = false;
+        ctl.start(4.0);
+        set_mirror_light_clock(&mut ctl, 4.0, true);
+        for _ in 0..60 {
+            mirror_light_tick(&mut ctl, 0.1, 20_000.0);
+        }
+        assert_eq!(ctl.time, 4.0);
+        assert!(ctl.held);
+        assert_eq!(ctl.state(0), 6);
+    }
+
+    #[test]
+    fn unheld_host_clock_crosses_local_stop_and_jump_points() {
+        let mut ctl = program();
+        ctl.start(3.5);
+        set_mirror_light_clock(&mut ctl, 3.5, false);
+        mirror_light_tick(&mut ctl, 1.0, 20_000.0);
+        assert_eq!(ctl.time, 4.5);
+        assert_eq!(ctl.state(0), 6);
+        mirror_light_tick(&mut ctl, 2.0, 20_000.0);
+        assert_eq!(ctl.time, 6.5);
+        assert!(!ctl.held);
+    }
+
+    #[test]
+    fn first_snapshot_is_not_replaced_by_the_day_time_seed() {
+        let mut ctl = program();
+        ctl.offset = 0.75;
+        set_mirror_light_clock(&mut ctl, 6.5, false);
+        mirror_light_tick(&mut ctl, 0.0, 20_000.0);
+        assert_eq!(ctl.time, 6.5);
+        assert_eq!(ctl.state(0), 6);
+    }
+
+    #[test]
+    fn a_new_crossing_uses_the_day_clock_until_its_first_snapshot() {
+        let mut ctl = program();
+        ctl.offset = 0.75;
+        mirror_light_tick(&mut ctl, 0.0, 10.0);
+        assert_eq!(ctl.time, 2.75);
+        set_mirror_light_clock(&mut ctl, 6.5, true);
+        mirror_light_tick(&mut ctl, 1.0, 10.0);
+        assert_eq!(ctl.time, 6.5);
+        assert!(ctl.held);
+    }
+
+    #[test]
+    fn host_seek_release_and_cycle_wrap_replace_interpolation() {
+        let mut ctl = program();
+        set_mirror_light_clock(&mut ctl, 7.75, false);
+        mirror_light_tick(&mut ctl, 0.5, 0.0);
+        assert_eq!(ctl.time, 0.25);
+        assert_eq!(ctl.state(0), 0);
+        set_mirror_light_clock(&mut ctl, 10.5, true);
+        mirror_light_tick(&mut ctl, 2.0, 0.0);
+        assert_eq!(ctl.time, 2.5);
+        set_mirror_light_clock(&mut ctl, 1.5, false);
+        mirror_light_tick(&mut ctl, 1.0, 0.0);
+        assert_eq!(ctl.time, 2.5);
+        assert!(!ctl.held);
+        mirror_light_tick(&mut ctl, -1.0, 0.0);
+        assert_eq!(ctl.time, 2.5);
+    }
+
+    #[test]
+    fn returning_to_local_simulation_discards_a_previously_passed_stop() {
+        let mut ctl = program();
+        ctl.offset = 0.75;
+        ctl.start(3.25);
+        ctl.request[0] = true;
+        ctl.advance(0.0);
+        assert!(!ctl.held);
+        set_mirror_light_clock(&mut ctl, 4.0, false);
+        reset_light_runtime(&mut ctl, 20_000.0);
+        assert_eq!(ctl.lights, vec![vec![(0, 4.0), (6, 4.0)]]);
+        assert_eq!(ctl.approach, vec![Some(25.0)]);
+        assert_eq!(ctl.offset, 0.75);
+        assert_eq!(ctl.stops.len(), 2);
+        assert_eq!(ctl.request, vec![false]);
+        ctl.advance(0.0);
+        assert!(ctl.held);
+        assert_eq!(ctl.time, 4.0);
+    }
+
+    #[test]
+    fn returning_to_local_simulation_discards_a_previous_backward_jump() {
+        let mut ctl = program();
+        ctl.start(5.5);
+        ctl.advance(0.5);
+        assert_eq!(ctl.time, 1.0);
+        set_mirror_light_clock(&mut ctl, 6.0, false);
+        reset_light_runtime(&mut ctl, 20_000.0);
+        ctl.advance(0.0);
+        assert_eq!(ctl.time, 1.0);
+        assert!(!ctl.held);
+    }
+
+    #[test]
+    fn returning_to_local_simulation_rechecks_a_host_hold() {
+        let mut ctl = program();
+        ctl.stops[0].if_request = false;
+        set_mirror_light_clock(&mut ctl, 4.0, true);
+        reset_light_runtime(&mut ctl, 20_000.0);
+        assert!(!ctl.held);
+        ctl.advance(0.5);
+        assert!(!ctl.held);
+        assert_eq!(ctl.time, 4.5);
+    }
+
+    #[test]
+    fn a_new_crossing_keeps_its_first_seed_when_returning_to_local_simulation() {
+        let mut ctl = program();
+        ctl.offset = 0.75;
+        reset_light_runtime(&mut ctl, 10.0);
+        assert_eq!(ctl.time, 2.75);
+        ctl.start(20_000.0);
+        ctl.advance(0.5);
+        assert_eq!(ctl.time, 3.25);
     }
 }
 

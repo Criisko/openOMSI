@@ -1136,6 +1136,18 @@ impl App {
             if self.view == "outside" {
                 let k = (1.0 + (y0 - y) / 500.0).max(0.05);
                 self.orbit = (v0 * k).clamp(ORBIT_MIN, ORBIT_MAX);
+            } else if self.settings.precision_zoom {
+                // precision zoom from the press anchor (drag down zooms in):
+                // the FOV-multiplier curve instead of the linear way, same
+                // floor. Past the authored field of view it stays linear.
+                let intent = if self.view == "driver" { ZOOM_INTENT_F1 } else { ZOOM_INTENT };
+                let dy = y - y0;
+                let m = if v0 > 1.0 {
+                    (v0 - dy / 500.0).clamp(0.2, v0.max(1.0))
+                } else {
+                    precision_zoom_step(v0, dy, intent).clamp(0.2, 1.0)
+                };
+                self.view_zoom.insert(self.view.clone(), m);
             } else {
                 self.view_zoom.insert(self.view.clone(), (v0 + (y0 - y) / 500.0).clamp(0.2, 1.0_f32.max(v0)));
             }
@@ -1795,6 +1807,7 @@ impl App {
     }
 
     pub(crate) fn close_game_menu(&mut self) {
+        self.key_capture = None;
         if self.menu_edit_icao {
             if let Some(w)=self.window.as_ref(){w.set_ime_allowed(false);}
             self.menu_edit_icao=false; self.menu_edit=None;
@@ -2041,11 +2054,12 @@ impl App {
     /// A settings window (options, vehicle, world) is open.
     fn settings_list(&self) -> bool {
         use crate::game_lists::ListKind;
-        self.chooser.is_some() && matches!(self.list_kind, Some(ListKind::Options(_) | ListKind::Vehicle(_) | ListKind::World(_)))
+        self.chooser.is_some() && matches!(self.list_kind, Some(ListKind::Options(_) | ListKind::Vehicle(_) | ListKind::World(_) | ListKind::Controls | ListKind::Keyboard(_) | ListKind::ControllerDevices(_) | ListKind::Controller(..) | ListKind::ControllerAxis(..) | ListKind::ControllerButtonSettings(..)))
     }
 
     /// The open list is closed: back to the game menu.
     pub(crate) fn close_list(&mut self) {
+        self.key_capture = None;
         self.dropdown = None;
         if self.menu_edit_icao { if let Some(w)=self.window.as_ref(){w.set_ime_allowed(false);} }
         self.menu_edit_icao=false;
@@ -2059,14 +2073,18 @@ impl App {
     /// Show page `i` of the open settings window.
     pub(crate) fn settings_tab(&mut self, i: usize) {
         use crate::game_lists::ListKind;
-        let next = match self.list_kind {
+        let next = match self.list_kind.as_ref() {
             Some(ListKind::Options(_)) => ListKind::Options(i),
             Some(ListKind::Vehicle(_)) => ListKind::Vehicle(i),
             Some(ListKind::World(_)) => ListKind::World(i),
+            Some(ListKind::Keyboard(_)) => ListKind::Keyboard(i.min(1)),
+            Some(ListKind::ControllerDevices(_)) => ListKind::ControllerDevices(i.min(2)),
+            Some(ListKind::Controller(name, _)) => ListKind::Controller(name.clone(), i.min(3)),
             _ => return,
         };
         self.menu_top = None;
         self.menu_edit = None;
+        self.key_capture = None;
         self.open_list(next);
     }
 
@@ -2085,7 +2103,13 @@ impl App {
         if i < n {
             self.settings_tab(i);
         } else {
-            self.close_list();
+            self.key_capture = None;
+            if let Some(parent) = crate::game_lists::run(self, &kind, "back") {
+                self.menu_top = None;
+                self.open_list(parent);
+            } else {
+                self.close_list();
+            }
         }
     }
 
@@ -2093,7 +2117,7 @@ impl App {
     pub(crate) fn list_adjust(&mut self, k: usize, mv: crate::game_lists::Move) {
         use crate::game_lists::ListKind;
         let Some(kind) = self.list_kind.clone() else { return };
-        if !matches!(kind, ListKind::Options(_) | ListKind::World(_)) {
+        if !matches!(kind, ListKind::Options(_) | ListKind::World(_) | ListKind::ControllerDevices(_) | ListKind::Controller(..) | ListKind::ControllerAxis(..) | ListKind::ControllerButtonSettings(..)) {
             return;
         }
         let Some(action) = self.admin_list.as_ref().and_then(|l| l.get(k)).map(|x| x.1.clone()) else { return };
@@ -2150,6 +2174,13 @@ impl App {
         let sel = self.chooser.unwrap_or(0);
         self.menu_top = None;
         match code {
+            KeyCode::Escape if crate::game_controller_menu::is_controller_list(self.list_kind.as_ref()) || matches!(self.list_kind, Some(crate::game_lists::ListKind::Events | crate::game_lists::ListKind::Keyboard(_))) => {
+                if let Some(kind) = self.list_kind.clone() {
+                    if let Some(back) = crate::game_lists::run(self, &kind, "back") {
+                        self.open_list(back);
+                    }
+                }
+            }
             KeyCode::Escape => {
                 if self.tours_list() {
                     self.open_list(crate::game_lists::ListKind::Lines);
@@ -2691,6 +2722,25 @@ impl App {
 
     pub(crate) fn menu_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode) {
         self.menu_kbd = true;
+        if self.key_capture.is_some() {
+            match code {
+                KeyCode::ShiftLeft | KeyCode::ShiftRight | KeyCode::ControlLeft | KeyCode::ControlRight | KeyCode::AltLeft | KeyCode::AltRight => {}
+                KeyCode::Escape => self.cancel_key_capture(),
+                KeyCode::Delete | KeyCode::Backspace => self.apply_key_capture(None, 0),
+                _ => match crate::keys::dik_code(code) {
+                    Some(scan) => {
+                        let chord = omsi_content::input::chord(
+                            self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight),
+                            self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight),
+                            self.keys.contains(&KeyCode::AltLeft) || self.keys.contains(&KeyCode::AltRight),
+                        );
+                        self.apply_key_capture(Some(scan), chord);
+                    }
+                    None => self.service_msg = Some(("That key has no DirectInput scan code".into(), 3.0)),
+                },
+            }
+            return;
+        }
         if self.chooser.is_some() {
             self.chooser_key(code);
             return;
@@ -2795,6 +2845,7 @@ impl App {
         match id {
             "resume" => self.close_game_menu(),
             "options" => self.open_list(crate::game_lists::ListKind::Options(0)),
+            "controls" => self.open_list(crate::game_lists::ListKind::Controls),
             "camera" => {
                 let tab = crate::game_lists::options_tab(self, "Camera");
                 self.open_list(crate::game_lists::ListKind::Options(tab));
@@ -3074,6 +3125,18 @@ impl App {
             if clouds_changed {
                 if let (Some(r), Some(scene)) = (self.renderer.as_ref(), self.scene.as_mut()) {
                     crate::weather_setup::setup_sky(&self.args, r, scene, self.envir.as_ref(), self.weather.as_ref());
+                }
+            }
+        }
+        // the physical model goes on with the clock (unless a change is coming in)
+        if self.weather_blend.is_none() {
+            if let Some(w) = crate::weather_model::refresh(&self.clock) {
+                let kind_changed = self.weather.as_ref().is_none_or(|old| old.clouds.0 != w.clouds.0);
+                self.weather = Some(w);
+                if kind_changed {
+                    if let (Some(r), Some(scene)) = (self.renderer.as_ref(), self.scene.as_mut()) {
+                        crate::weather_setup::setup_sky(&self.args, r, scene, self.envir.as_ref(), self.weather.as_ref());
+                    }
                 }
             }
         }
@@ -4044,7 +4107,17 @@ impl App {
         // (steering with the mouse: a cross, as OMSI shows it; turning the view with the
         // right button held: the four arrows OMSI shows then, #185)
         // (zooming with the mouse: the up-down arrows, Omsi's crSizeNS)
+        // SIZENS only while the right button really zooms (with `alt_view`
+        // it turns the view instead, and keeps the four arrows).
+        let rmb_zoom = self.buttons_held.1
+            && !self.mmb_held
+            && !self.settings.alt_view
+            && self.player.is_some()
+            && self.both_drag.is_none()
+            && matches!(self.view.as_str(), "driver" | "outside" | "pax" | "free");
         let kind: u8 = if self.both_drag.is_some() && self.game_menu.is_none() {
+            4
+        } else if rmb_zoom && self.game_menu.is_none() {
             4
         } else if self.mouse_look && self.game_menu.is_none() {
             3
@@ -4171,6 +4244,24 @@ pub(crate) fn chase_orbit_step(yaw: f32, pitch: f32, dx_px: f32, dy_px: f32) -> 
     )
 }
 
+/// Precision zoom step from a vertical drag: the zoom state `z` (0 wide ..
+/// 1 full zoom) travels at `intent` per 364 px, and the FOV multiplier is
+/// `1/(1+5.5*z)` — full zoom ~6.5x in. Drag down (`dy > 0`) zooms in.
+/// Never past 1.0 (never wider than the bus's own field of view); the floor
+/// is the caller's clamp. Pure (tested below).
+pub(crate) fn precision_zoom_step(mult: f32, dy_px: f32, intent: f32) -> f32 {
+    const RANGE: f32 = 5.5;
+    const FULL_DRAG_PX: f32 = 364.0;
+    let z = ((1.0 / mult.max(0.154) - 1.0) / RANGE).clamp(0.0, 1.0);
+    let z2 = (z + dy_px * intent / FULL_DRAG_PX).clamp(0.0, 1.0);
+    1.0 / (1.0 + RANGE * z2)
+}
+
+/// F1 zoom intent: the head zoom runs 20% slower than outside/free.
+pub(crate) const ZOOM_INTENT_F1: f32 = 0.56;
+/// Outside/free zoom intent: a full 364 px drag takes `z` 0 to 0.70.
+pub(crate) const ZOOM_INTENT: f32 = 0.70;
+
 /// Eased Space return for the F1 head: look and zoom glide home on the same
 /// ease-out as the viewpoint switch instead of teleporting. `t` seconds in;
 /// returns the current look, zoom and done. Pure (tested below).
@@ -4263,6 +4354,21 @@ mod look_tests {
         let (look, zoom, done) = super::reset_blend((30.0, -10.0), 0.5, 0.54);
         assert_eq!((look, zoom, done), ((0.0, 0.0), 1.0, true));
         assert!(super::reset_blend((30.0, -10.0), 0.5, 5.0).2);
+    }
+
+    #[test]
+    fn precision_zoom_follows_the_fov_curve_and_never_widens() {
+        // a full 364 px drag down takes z 0 to 0.70: m = 1/(1+5.5*0.70).
+        let m = super::precision_zoom_step(1.0, 364.0, super::ZOOM_INTENT);
+        assert!((m - 1.0 / (1.0 + 5.5 * 0.70)).abs() < 1e-4, "{m}");
+        // drag down zooms in, drag up undoes it, never past 1.0.
+        let mid = super::precision_zoom_step(1.0, 100.0, super::ZOOM_INTENT);
+        assert!(mid < 1.0 && mid > 0.45, "{mid}");
+        assert!((super::precision_zoom_step(mid, -100.0, super::ZOOM_INTENT) - 1.0).abs() < 1e-4);
+        assert_eq!(super::precision_zoom_step(1.0, -50.0, super::ZOOM_INTENT), 1.0);
+        // F1 runs the same curve 20% slower.
+        let slow = super::precision_zoom_step(1.0, 100.0, super::ZOOM_INTENT_F1);
+        assert!(slow > mid && slow < 1.0, "{slow} vs {mid}");
     }
 }
 
@@ -4443,9 +4549,10 @@ pub(crate) const SAVES: &str = "Saves";
 
 /// The lines of the game menu: (what, label). What can be set is on the pages behind
 /// "Options", "Vehicle options" and "World options" (see `game_lists`).
-pub(crate) const GAME_MENU: [(&str, &str); 14] = [
+pub(crate) const GAME_MENU: [(&str, &str); 15] = [
     ("resume", "Resume"),
     ("options", "Options..."),
+    ("controls", "Controls..."),
     // (the driver's view - seat, field of view, head movement - straight from the pause
     // menu: it is what is changed most while driving, #908)
     ("camera", "Camera..."),

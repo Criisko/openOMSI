@@ -378,6 +378,9 @@ pub(crate) fn window_icon() -> Option<winit::window::Icon> {
 
 /// Enhanced graphics wanted (from the settings, `--enhanced`, or OMSI_ENHANCED=1).
 pub(crate) static ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Enhanced+ (ray tracing) asked for by `--enhanced-plus` or OMSI_ENHANCED_PLUS=1 whatever
+/// the settings say (see `Settings::render_options`).
+pub(crate) static ENHANCED_PLUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Vanilla graphics: the picture as OMSI 2 draws it (no Vanilla+ extras, see
 /// `omsi_render::Lighting::classic`).
 pub(crate) static CLASSIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

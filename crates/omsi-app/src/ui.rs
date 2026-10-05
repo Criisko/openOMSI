@@ -423,6 +423,8 @@ pub struct Frame<'a> {
     pub tooltip: Option<String>,
     /// The chat, when a LAN session runs and the chat is not switched off.
     pub chat: Option<ChatView<'a>>,
+    /// The chat's own size on top of `ui_scale` (`Settings::chat_size`).
+    pub chat_size: f32,
     /// What the driver has to act on (why the bus does not move, a passenger's wish, the
     /// change due, a service done), top left.
     pub notes: &'a [String],
@@ -655,11 +657,13 @@ impl Ui {
         // --- the chat, top left under the notes, as Roblox has it (from the fourth note
         // on they ran into it)
         if let Some(c) = f.chat.as_ref().filter(|_| !self.chat.hidden) {
+            // (its own size on top of the interface's: Ctrl + the wheel over it)
+            let s = s * f.chat_size.clamp(0.5, 3.0);
             let px = (17.0 * s) as u32;
             let lh = px as f32 * 1.35;
             let x0 = 14.0 * s;
             let y0 = (96.0 * s).max(notes_bottom + 10.0 * s);
-            let width = (460.0 * s).min(f.width * 0.5);
+            let width = (460.0 * s).min(f.width * 0.6);
             let open = c.typing.is_some();
             let n = c.lines.len();
             let end = n.saturating_sub(if open || self.chat.hovered { self.chat.scroll } else { 0 });

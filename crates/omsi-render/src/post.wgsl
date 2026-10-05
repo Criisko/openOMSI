@@ -2,8 +2,8 @@
 // the screen - nothing that paints over it. A glow that only real highlights produce
 // (a wide blur of the picture mixed in at a few per cent: a lamp a hundred times brighter
 // than white spreads, a white wall does not), automatic exposure that meters the picture
-// and follows it slowly within a narrow range, the shoulder of the Khronos PBR Neutral
-// tone curve (it leaves colours below it as they are), dithering against banding, FXAA.
+// and follows it slowly within a narrow range, a photographic tone curve (a camera's
+// contrast in the middle tones, a soft shoulder), dithering against banding, FXAA.
 // The vanilla path never runs this.
 struct PostParams {
     // x glow strength, y how far the metering may darken (EV), z brighten (EV),
@@ -18,6 +18,9 @@ struct PostParams {
     // pre-exposure (for absolute luminance), w how much an LED panel's dots count for in
     // the glow's source (0 = not at all, `Led glow`)
     c: vec4<f32>,
+    // x Enhanced+'s grade (0/1), y the vignette's strength, z sharpening, w the tone
+    // curve's contrast about mid grey (1 = none; a camera's by day, less at night)
+    d: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> p: PostParams;
 @group(0) @binding(1) var t_src: texture_2d<f32>;
@@ -163,28 +166,6 @@ fn fs_adapt(in: VsOut) -> @location(0) vec4<f32> {
 
 // --- the picture
 
-// Khronos PBR Neutral's shoulder: colours below it pass unchanged, highlights roll off
-// towards white and lose saturation only as much as they must. Its toe is left out: it
-// takes the smallest channel almost entirely off anything darker than 0.08 (x -> 6.25 x²),
-// which crushed shade, cabins and the night to black and turned what was left of them
-// into strong colour casts.
-fn pbr_neutral(color: vec3<f32>) -> vec3<f32> {
-    let start = 0.8;
-    // (more than Khronos' 0.15: a sky many times brighter than white next to a low sun
-    // turns white, as on film, instead of a flat peach)
-    let desat = 0.45;
-    var c = color;
-    let peak = max(c.r, max(c.g, c.b));
-    if (peak < start) {
-        return c;
-    }
-    let d = 1.0 - start;
-    let new_peak = 1.0 - d * d / (peak + d - start);
-    c = c * (new_peak / peak);
-    let g = 1.0 - 1.0 / (desat * (peak - new_peak) + 1.0);
-    return mix(c, vec3<f32>(new_peak), g);
-}
-
 // Night vision: where the scene is darker than a lit street (about a candela per square
 // metre) the eye's rods take over from its cones: colours fade and what is left of them
 // shifts towards blue-green (the Purkinje shift). A lamp's pool keeps its colour, the
@@ -214,6 +195,41 @@ fn from_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, c <= vec3<f32>(0.04045));
 }
 
+// The shoulder of `natural_tone` for one value: identity up to the knee, then an
+// exponential approach to white with the slope kept at the knee.
+const KNEE: f32 = 0.66;
+fn soft_shoulder(x: vec3<f32>) -> vec3<f32> {
+    let d = 1.0 - KNEE;
+    let over = vec3<f32>(KNEE) + d * (vec3<f32>(1.0) - exp(-(x - vec3<f32>(KNEE)) / d));
+    return select(x, over, x > vec3<f32>(KNEE));
+}
+
+// The tone curve of a photograph rather than of a renderer: a camera's curve gives the
+// middle tones some contrast (about mid grey, per channel in log space - colours gain a
+// little with it, as they do on film and on a phone's picture) where a plain linear
+// mapping leaves a sunny street grey and flat, with lifted shadows and no white in it;
+// above the knee the highlights roll off softly, partly per channel (a low sun's sky
+// near the disc runs to a warm white, as on film) and partly by the brightest channel
+// (a lit yellow bus stays yellow), and what lies far above white bleaches out.
+fn natural_tone(color: vec3<f32>, contrast: f32) -> vec3<f32> {
+    let x = max(color, vec3<f32>(0.0));
+    let y = 0.18 * pow(x / 0.18 + vec3<f32>(1e-7), vec3<f32>(contrast));
+    let peak = max(y.r, max(y.g, y.b));
+    if (peak <= KNEE) {
+        return y;
+    }
+    let np = soft_shoulder(vec3<f32>(peak)).x;
+    let by_peak = y * (np / peak);
+    let o = mix(by_peak, soft_shoulder(y), 0.4);
+    let g = 1.0 - 1.0 / (0.3 * (peak - np) + 1.0);
+    return mix(o, vec3<f32>(np), g);
+}
+
+// Enhanced+'s grade: the natural curve, the light a shade warmer.
+fn filmic_grade(c: vec3<f32>) -> vec3<f32> {
+    return natural_tone(c * vec3<f32>(1.015, 1.0, 0.985), max(p.d.w, 1.0));
+}
+
 // The tone-mapped picture, encoded for the display (gamma), dithered.
 fn graded(in: VsOut) -> vec3<f32> {
     let hdr = clean(textureSampleLevel(t_src, s_lin, in.uv, 0.0).rgb);
@@ -225,7 +241,14 @@ fn graded(in: VsOut) -> vec3<f32> {
     if (p.c.y > 0.0) {
         c = night_vision(c, p.c.y, p.c.z);
     }
-    c = pbr_neutral(c * pow(2.0, ev));
+    if (p.d.x > 0.5) {
+        c = filmic_grade(c * pow(2.0, ev));
+        // the lens: the corners a little darker
+        let q = in.uv * 2.0 - vec2<f32>(1.0);
+        c = c * (1.0 - p.d.y * pow(clamp(dot(q, q) * 0.5, 0.0, 1.0), 1.6));
+    } else {
+        c = natural_tone(c * pow(2.0, ev), max(p.d.w, 1.0));
+    }
     var e = to_srgb(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
     // triangular dither of one code value: no bands in the sky's gradient
     let px = in.clip.xy;
@@ -246,6 +269,25 @@ fn fs_tonemap(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_tonemap_encoded(in: VsOut) -> @location(0) vec4<f32> {
     let e = clamp(graded(in), vec3<f32>(0.0), vec3<f32>(1.0));
     return vec4<f32>(e, dot(e, vec3<f32>(0.299, 0.587, 0.114)));
+}
+
+// Enhanced+: contrast-adaptive sharpening of the anti-aliased picture (in its gamma
+// encoding): a pixel is pushed away from its four neighbours' mean by as much as their
+// spread leaves room for, so that flat areas stay calm and fine detail comes out.
+fn sharpened(uv: vec2<f32>, c: vec3<f32>) -> vec3<f32> {
+    if (p.d.z <= 0.0) {
+        return c;
+    }
+    let texel = 1.0 / vec2<f32>(textureDimensions(t_src));
+    let n = textureSampleLevel(t_src, s_lin, uv + vec2<f32>(0.0, -texel.y), 0.0).rgb;
+    let s = textureSampleLevel(t_src, s_lin, uv + vec2<f32>(0.0, texel.y), 0.0).rgb;
+    let e = textureSampleLevel(t_src, s_lin, uv + vec2<f32>(texel.x, 0.0), 0.0).rgb;
+    let w = textureSampleLevel(t_src, s_lin, uv + vec2<f32>(-texel.x, 0.0), 0.0).rgb;
+    let lo = min(c, min(min(n, s), min(e, w)));
+    let hi = max(c, max(max(n, s), max(e, w)));
+    let room = clamp(min(lo, vec3<f32>(1.0) - hi) / max(hi, vec3<f32>(1e-4)), vec3<f32>(0.0), vec3<f32>(1.0));
+    let k = sqrt(room) * p.d.z * 0.25;
+    return clamp(c + (c * 4.0 - (n + s + e + w)) * k, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 // --- FXAA 3.11 (quality, 12 search steps) over the tone-mapped picture
@@ -273,7 +315,7 @@ fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
     let lo = min(m, min(min(n, s), min(e, w)));
     let range = hi - lo;
     if (range < max(0.0312, hi * 0.125)) {
-        return vec4<f32>(from_srgb(rgbm.rgb), 1.0);
+        return vec4<f32>(from_srgb(sharpened(uv, rgbm.rgb)), 1.0);
     }
     let nw = lum_at(uv + vec2<f32>(-1.0, -1.0) * texel);
     let ne = lum_at(uv + vec2<f32>(1.0, -1.0) * texel);
