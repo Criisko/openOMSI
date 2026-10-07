@@ -46,9 +46,11 @@ no release at all.
 
 ## What this fork adds, file by file
 
-`git diff --stat origin/main...HEAD` is the whole answer - 23 files in October 2026 - and this
+`git diff --stat origin/main...HEAD` is the whole answer - 24 files in October 2026 - and this
 is what each of them is for. Anything not on this list is the project's own code, so a merge
-that turns up a difference somewhere else has found something to read rather than to keep.
+that turns up a difference somewhere else has found something to read rather than to keep. The
+tables are the list; the number is only there to tell you at a glance whether something new has
+appeared.
 
 **DLSS**, kept here on purpose (`FORK-DLSS.md` says what it is and where it touches the
 project):
