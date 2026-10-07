@@ -3018,6 +3018,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-game-controller"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1962c1882c5abcedb18e5f01acffeaad7b3cbd0a9d4cd8f5ca259ba8a64cb9a3"
+dependencies = [
+ "block2 0.6.2",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+]
+
+[[package]]
 name = "objc2-io-kit"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3187,6 +3198,7 @@ dependencies = [
  "android_logger",
  "anyhow",
  "arboard",
+ "block2 0.6.2",
  "clap",
  "ct2rs",
  "env_logger",
@@ -3198,7 +3210,10 @@ dependencies = [
  "libc",
  "log",
  "ndk-context",
+ "objc2 0.6.4",
  "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "objc2-game-controller",
  "objc2-io-kit",
  "omsi-audio",
  "omsi-cfg",

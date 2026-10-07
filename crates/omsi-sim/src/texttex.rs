@@ -193,6 +193,7 @@ fn color_at_alpha_pixels(color: &[u8], cw: u32, ch: u32, aw: u32, ah: u32) -> Ve
 }
 
 /// Runtime state of one `[texttexture]`.
+#[derive(Clone)]
 pub struct TextTextureState {
     pub def: TextTexture,
     pub atlas: Option<Arc<FontAtlas>>,

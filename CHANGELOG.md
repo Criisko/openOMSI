@@ -11,6 +11,139 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
   Anti-aliasing → DLSS / DLAA, with its quality (DLAA, Quality, Balanced, Performance,
   Ultra performance) in the row below. NVIDIA's Streamline DLLs go beside the game (see the
   user guide); without them, or on another card, the game draws as before.
+## 0.2.16 - 2026-10-07
+
+### New
+- Lua plugins can show panels (texts, icons, progress bars, buttons) and sliding notifications of their own in the game's look (`omsi.ui`); F10 gives the mouse to the panels, Esc back to the bus. See `docs/PLUGINS.md` and the `trip_panel.lua` example [#1788](https://github.com/openOMSI-Project/openOMSI/pull/1788).
+- Native TrackIR head tracking on Windows (NaturalPoint's NPClient), with sensitivity and inversion per axis in the launcher; opentrack keeps working as before [#1763](https://github.com/openOMSI-Project/openOMSI/pull/1763).
+- Night brightness (Settings → Graphics): brightens the Enhanced picture after sunset only, Off by default [#1799](https://github.com/openOMSI-Project/openOMSI/pull/1799).
+- Plugins: `trip_done` in `omsi.info()` [#1810](https://github.com/openOMSI-Project/openOMSI/pull/1810).
+
+### Fixes
+- Refuelling and the bus wash take their time, litre by litre, and stop when the bus drives off [#1785](https://github.com/openOMSI-Project/openOMSI/issues/1785).
+- Pedestrians run over are counted once each, within the bus's real box [#1805](https://github.com/openOMSI-Project/openOMSI/issues/1805).
+- Enhanced+: the buildings of a depot or other surface object cast their shadow up close too [#1783](https://github.com/openOMSI-Project/openOMSI/issues/1783).
+- Smoke, exhaust and other particles drift with the wind [#1798](https://github.com/openOMSI-Project/openOMSI/issues/1798).
+- The automated manual gearbox can be switched on in the launcher's driving settings [#1780](https://github.com/openOMSI-Project/openOMSI/issues/1780).
+- A traffic light no longer reacts to a bus on the neighbouring road or bay: the depot-gate request applies only off the lanes [#1790](https://github.com/openOMSI-Project/openOMSI/issues/1790).
+- A duty started at the real time keeps the clock instead of jumping to ten minutes before its first trip [#1792](https://github.com/openOMSI-Project/openOMSI/pull/1792).
+- Puddles are smaller, with sharp irregular edges [#1804](https://github.com/openOMSI-Project/openOMSI/pull/1804).
+- Dedicated server: AI traffic and pedestrians move smoothly on the players' screens and at their real speed; the server's clock keeps to real time [#1807](https://github.com/openOMSI-Project/openOMSI/pull/1807).
+- Hong Kong maps: AI buses of a plain `[aigroup_2]` group show their destination again [#1757](https://github.com/openOMSI-Project/openOMSI/pull/1757), and bus stop signs show their route numbers and pictures [#1765](https://github.com/openOMSI-Project/openOMSI/pull/1765).
+- AI vehicles wait before a junction when a queue on the short road pieces beyond it leaves no room, instead of blocking it [#1761](https://github.com/openOMSI-Project/openOMSI/pull/1761).
+
+## 0.2.15 - 2026-10-07
+
+### Bug Fixes & Improvements
+
+## 0.2.14 - 2026-10-07
+
+### Bug Fixes & Improvements
+
+## 0.2.13 - 2026-10-07
+
+### Bug Fixes & Improvements
+
+## 0.2.12 - 2026-10-07
+
+### Bug Fixes & Improvements
+
+## 0.2.11 - 2026-10-07
+
+### Bug Fixes & Improvements
+
+## 0.2.10 - 2026-10-07
+
+### Bug Fixes & Improvements
+
+## 0.2.9 - 2026-10-06
+
+### Bug Fixes & Improvements
+
+## 0.2.8 - 2026-10-06
+
+### Bug Fixes & Improvements
+
+## 0.2.7 - 2026-10-06
+
+### Bug Fixes & Improvements
+
+## 0.2.6 - 2026-10-06
+
+### Bug Fixes & Improvements
+
+## 0.2.5 - 2026-10-06
+
+### Bug Fixes & Improvements
+
+## 0.2.4 - 2026-10-06
+
+### Bug Fixes & Improvements
+
+## 0.2.3 - 2026-10-06
+
+### Bug Fixes & Improvements
+
+## 0.2.2 - 2026-10-06
+
+### Bug Fixes & Improvements
+
+## 0.2.1 - 2026-10-06
+
+### Bug Fixes & Improvements
+- Android: a black screen instead of the game since 0.2.0 (#1633, #1597) on phones whose graphics driver cannot compile one of 0.2's new shaders (the snowfall, the lamps in the fog, the street lamps' shadow maps): the driver's error lost the whole graphics device. The game now notices this while it starts, opens the device again without those three and draws as before (snow then falls without flakes). The log names the shaders it was compiling when the device was lost.
+
+## 0.2.0 - 2026-10-06
+
+A release about light and weather: the Enhanced and Enhanced+ pictures worked out from the physics of the eye, the air and the lamps, and a new snowfall for every graphics mode.
+
+### Night (Enhanced, Enhanced+)
+- The night is dark again: the eye's adaptation follows a lightness-perception model (Krawczyk et al. 2005) instead of nearly full adaptation, the automatic metering no longer brightens a night, and the eye adapts to the lamps and headlights actually in view (their log-average) rather than to a fixed city level.
+- Street lamps cast real shadows: shadow maps for the four lamps lighting the camera's surroundings most (the bus, poles, signs and trees throw their shadows on the street).
+- A street lamp's light goes down and out, not into the sky: tree crowns and upper floors above the lamps stay dark.
+- The lit ground throws light back up: a bus's flank or a facade beside a lit street is no longer black; much more so over snow.
+- Moonlit nights: the moon is a directional light with its own shadows; on a dark country road under a full moon the eye takes to the moonlight.
+- The night sky's glow comes from the lamps round the camera (Walker's law): a village keeps its stars, a city glows orange-grey.
+
+### Weather (Enhanced, Enhanced+)
+- Fog and mist light up round every lamp and in front of every headlight (single scattering by the droplets, a forward peak and back-scatter): halos, cones under the lamps, the glow of a bus's own beams in the fog. Rain does not do this (its drops scatter too narrowly), so headlights keep a single glow in a drizzle.
+- Shafts of sunlight between the shadows of houses and trees in haze, mist and fog.
+- Falling snow takes the view as a real snowfall does (heavy snow: some 400 m).
+- Wet porous surfaces (soil, paving, plaster, bark) turn darker and deeper in colour in the rain, not only the asphalt.
+- An overcast deck lets through light by its thickness: a raining nimbostratus is darker, a grey day over snow brighter.
+- Raindrops and snowflakes are lit by what is round them - the sky, the sun, the lamps - instead of glowing at one level in the dark.
+
+### Light and the eye (Enhanced, Enhanced+)
+- Looking at the sun blinds: the eye's scattered light round it (CIE 146 glare function) with a faint ciliary corona and lenticular halo.
+- Eye adaptation: the picture darkens when the sun comes into view and brightens in a dark cab or an underpass, quickly towards the light and slowly towards the dark.
+- Lit windows and lights have a light glow; only what is brighter than the screen's white glows.
+
+### Snowfall (all graphics modes)
+- A new snowfall: up to 150 000 flakes worked out on the graphics card (nothing per flake on the processor), fixed in the world so the bus drives through the snow, falling gently at about a metre a second, swaying and drifting with the wind; a light fall is fewer, smaller crystals. No snow falls inside the player's bus.
+
+## 0.1.1740 - 2026-10-05
+
+### Merged pull requests
+- Headlamps: the grass and hedges beside the road are no longer washed out at night, the beam keeps to the lane, and a full beam reaches far down the road [#1563](https://github.com/openOMSI-Project/openOMSI/pull/1563); a spot declared ahead of the bus's lamps shines from both headlamps, not from the middle [#1565](https://github.com/openOMSI-Project/openOMSI/pull/1565).
+- Enhanced lighting uses a material's own ambient colour: depot interiors with black diffuse and white ambient (Thüringer Wald, OVR Lichtentanne) are no longer black [#1556](https://github.com/openOMSI-Project/openOMSI/pull/1556).
+- Raised floors, markings and rails stay visible above the road surfaces at a distance, without a depth bias that moved with the camera angle [#1557](https://github.com/openOMSI-Project/openOMSI/pull/1557).
+- Linux: wheels such as the Logitech G29 are no longer taken for gamepads: linear steering and native force feedback again [#1566](https://github.com/openOMSI-Project/openOMSI/pull/1566).
+- Performance: no more regular 30-45 ms hitches near heavy collision meshes (Grand Paris-Moulon's street lamps) [#1561](https://github.com/openOMSI-Project/openOMSI/pull/1561).
+
+## 0.1.1727 - 2026-10-05
+
+### Fixes
+- The Linux build of the release no longer runs out of disk space after the workspace tests (the release of 0.1.1726 did not build).
+
+## 0.1.1726 - 2026-10-05
+
+### Merged pull requests
+- Controllers: a gilrs panic on a controller's first event no longer ends the game on Windows [#1537](https://github.com/openOMSI-Project/openOMSI/pull/1537); an idle joystick nobody set up no longer takes the arrow keys for looking [#1548](https://github.com/openOMSI-Project/openOMSI/pull/1548).
+- Czech and Slovak content is read as Windows-1250, so stop names keep their ř, ě and ů [#1542](https://github.com/openOMSI-Project/openOMSI/pull/1542).
+- A `.owt` weather's second `[temp]` value is read as the dew point: winter weathers give the scripts a real humidity (exhaust steam in the frost, the heating's misted panes) [#1533](https://github.com/openOMSI-Project/openOMSI/pull/1533).
+- Destinations of legacy depot files show their names in the menu and on the displays, and a destination picked by hand runs the scripts' own trigger, as in OMSI 2 [#1535](https://github.com/openOMSI-Project/openOMSI/pull/1535).
+- Vulkan: running out of graphics memory on a demanding map frees the old render targets before falling back, and far textures are reduced right after streaming [#1551](https://github.com/openOMSI-Project/openOMSI/pull/1551).
+
 ## 0.1.1711 - 2026-10-05
 
 ### Fixes

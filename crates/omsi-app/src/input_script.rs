@@ -9,7 +9,12 @@ pub(crate) fn is_game_action(name: &str) -> bool {
     name.starts_with("view_")
         || matches!(
             name.as_str(),
-            "sim_pause" | "screenshot" | "quicksave" | "toggel_mouse_ctrl" | "toggel_ctrler"
+            "sim_pause"
+                | "screenshot"
+                | "quicksave"
+                | "toggel_mouse_ctrl"
+                | "toggel_ctrler"
+                | "voice_radio"
         )
 }
 
@@ -144,6 +149,10 @@ impl App {
         if pressed && code == KeyCode::Escape {
             if let Some(n) = self.navigator.as_mut().filter(|n| n.map_open()) {
                 n.toggle_map();
+                return;
+            }
+            // and gives the mouse back to the bus when the plugins' panels have it
+            if self.release_plugin_focus() {
                 return;
             }
         }
@@ -303,7 +312,14 @@ impl App {
             // driving layout uses keeps that meaning (with the OMSI layout, every binding
             // counts)
             if pressed && !repeat {
-                let m = omsi_content::input::chord(shift_now, ctrl, alt);
+                // (a modifier key pressed is a key of its own, not its own modifier: Shift
+                // bound to gear_up in keyboard.cfg came as Shift+Shift and matched nothing,
+                // #1477; OMSI fires it)
+                let m = omsi_content::input::chord(
+                    shift_now && !matches!(code, KeyCode::ShiftLeft | KeyCode::ShiftRight),
+                    ctrl && !matches!(code, KeyCode::ControlLeft | KeyCode::ControlRight),
+                    alt && !matches!(code, KeyCode::AltLeft | KeyCode::AltRight),
+                );
                 let own = keys::dik_code(code).is_some_and(|s| self.own_keys.contains(&s));
                 let ours = self.args.drive_keys != "omsi"
                     && m == 0
@@ -313,7 +329,9 @@ impl App {
                 // plain Left/Right are OMSI's view_interiorcam_minus/plus, except when a wheel
                 // steers: then the arrows glance (held, the head turns) and only Ctrl+Left/Right
                 // switch the interior camera, below. (Where the arrows drive, `ours` skips this.)
+                // (unless the settings ask for the cameras on them all the same, #1345)
                 let plain_arrow = matches!(code, KeyCode::ArrowLeft | KeyCode::ArrowRight) && !ctrl
+                    && !self.settings.arrows_switch_cams
                     && self.controllers.as_ref().is_some_and(|c| c.wheel_steering());
                 // (the keys that fly the camera are the camera's, unmodified: S, OMSI's
                 // view_toggle_viewpoint, threw the free camera back to the driver's view,
@@ -406,8 +424,11 @@ impl App {
                         self.set_info_bar(!self.info_bar);
                         return;
                     }
-                    // OMSI's `view_set_schedule` (Insert: 210 / 1, the key's state every frame)
-                    KeyCode::Insert if !shift_now && !ctrl => {
+                    // OMSI's `view_set_schedule` (Insert: 210 / 1, the key's state every frame),
+                    // only where keyboard.cfg has no entry for it: an entry is the player's
+                    // binding, handled above, and one with scan code 0 is unbound - Insert opened
+                    // the timetable all the same (#1245)
+                    KeyCode::Insert if !shift_now && !ctrl && !self.game_keys.iter().any(|b| b.action.eq_ignore_ascii_case("view_set_schedule")) => {
                         self.timetable = !self.timetable;
                         return;
                     }
@@ -610,10 +631,13 @@ impl App {
                     let m = if covers_vehicle_key {
                         0
                     } else {
+                        // (a modifier key is a key of its own here, not its own modifier, #1477)
                         omsi_content::input::chord(
-                            shift,
-                            self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight),
-                            self.keys.contains(&KeyCode::AltLeft) || self.keys.contains(&KeyCode::AltRight),
+                            shift && !matches!(code, KeyCode::ShiftLeft | KeyCode::ShiftRight),
+                            (self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight))
+                                && !matches!(code, KeyCode::ControlLeft | KeyCode::ControlRight),
+                            (self.keys.contains(&KeyCode::AltLeft) || self.keys.contains(&KeyCode::AltRight))
+                                && !matches!(code, KeyCode::AltLeft | KeyCode::AltRight),
                         )
                     };
                     p.key(scan, m, pressed);
@@ -626,6 +650,7 @@ impl App {
     /// vehicle for each of them.
     pub(crate) fn tick_lan(&mut self, dt: f32) {
         let walker = self.walker_pose();
+        let radio_keyed = self.voice_radio_held();
         let Some(lan) = self.lan.as_mut() else {
             // (the session is over: the plugin is told so)
             self.voice = None;
@@ -645,6 +670,7 @@ impl App {
             tour: self.duty.as_ref().map(|d| format!("{}/{}", d.line, d.tour)),
             walker,
             inside_of: self.inside_remote,
+            radio_keyed,
         };
         let updates = lan::tick(
             lan,
@@ -739,11 +765,40 @@ impl App {
         let my_bus = self.player.as_ref().map(|p| p.vehicle.position);
         let others = crate::voice::speakers(lan, &self.remotes, my_bus);
         let inside = if self.in_cab { Some(lan.my_id) } else { self.inside_remote };
-        let listener = self.camera.as_ref().map(|c| crate::voice::Listener { at: c.position, yaw: c.yaw, inside });
+        // driving a bus (not on foot): on the company radio automatically
+        let on_radio = self.player.is_some() && !self.ego;
+        let radio_keyed = on_radio && self.voice_radio_held();
+        let listener = self.camera.as_ref().map(|c| crate::voice::Listener {
+            at: c.position,
+            yaw: c.yaw,
+            inside,
+            on_radio,
+            radio_keyed,
+        });
         let me = (lan.my_name.clone(), lan.my_id);
         if let Some(v) = self.voice.as_mut() {
             v.tick(dt, (&me.0, me.1), listener, &others);
         }
+    }
+
+    /// Is the bindable bus radio key (`voice_radio` in Controls) held right now?
+    /// Keyboard chord or a controller button bound to the same action (held while down).
+    fn voice_radio_held(&self) -> bool {
+        if self.pad_voice_radio {
+            return true;
+        }
+        let held = |a: KeyCode, b: KeyCode| self.keys.contains(&a) || self.keys.contains(&b);
+        let chord = omsi_content::input::chord(
+            held(KeyCode::ShiftLeft, KeyCode::ShiftRight),
+            held(KeyCode::ControlLeft, KeyCode::ControlRight),
+            held(KeyCode::AltLeft, KeyCode::AltRight),
+        );
+        self.game_keys.iter().any(|b| {
+            b.action.eq_ignore_ascii_case("voice_radio")
+                && b.scan_code != 0
+                && b.matches(chord)
+                && self.keys.iter().any(|k| crate::keys::dik_code(*k) == Some(b.scan_code))
+        })
     }
 
     /// The host's world as LAN play asks for it: its clock (set or caught up with) and its
@@ -1341,13 +1396,20 @@ impl App {
             self.player.as_mut(),
             ray,
         ) {
-            self.drag_delta = (0.0, 0.0);
+            let (dx, dy) = std::mem::take(&mut self.drag_delta);
             p.occlude_controls = self.view == "outside";
             if pressed {
                 if let Some((page, u, v)) = p.html_hit(o, d) {
                     p.release();
                     p.html_pointer(page, u, v, omsi_sim::htmltex::PointerKind::Down);
                     self.html_pressed = Some((page, u, v));
+                    self.dragging = false;
+                    return;
+                }
+                // a tear-off ticket block: a ticket of its type torn off for the passenger
+                if let Some(n) = self.humans.as_ref().and_then(|h| h.ticket_blocks.as_ref()).and_then(|b| b.hit(o, d, &p.vehicle)) {
+                    log::info!("ticket block {n}: a ticket torn off");
+                    p.vehicle.set_engine_var("GivenTicket", n as f32);
                     self.dragging = false;
                     return;
                 }
@@ -1360,6 +1422,12 @@ impl App {
                     p.html_pointer(page, u, v, omsi_sim::htmltex::PointerKind::Up);
                     self.dragging = false;
                     return;
+                }
+                // CursorMoved and the release can arrive between redraws. Deliver the
+                // last movement before `_off`, so a short adjustment is not lost or
+                // mistaken for a stationary click on a drag-only control.
+                if self.dragging && (dx != 0.0 || dy != 0.0) {
+                    p.drag(dx, dy);
                 }
                 if self.dragging && self.buttons_held.1 {
                     p.release_keeping();
@@ -1419,6 +1487,10 @@ impl App {
     /// from the last two positions, and fired only on movement it kept the speed of the last
     /// small move through a pause and swung shut when let go; the door scripts set their
     /// push once per trigger.
+    ///
+    /// The redraw path may inline this after `Player::tick` (field borrow of `player`); keep
+    /// the helper for any call site that does not already hold `self.player`.
+    #[allow(dead_code)] // inlined in `app_events` redraw while `player` is borrowed
     pub(crate) fn drag_frame(&mut self) {
         if !self.dragging {
             return;
@@ -1948,7 +2020,7 @@ impl App {
             }
             _ => {
                 if let (Some(c), Some(t)) = (route_char(code), self.menu_edit.as_mut()) {
-                    if t.chars().count() < 8 {
+                    if t.chars().count() < ROUTE_NUMBER_MAX {
                         t.push(c);
                     }
                 }
@@ -1965,7 +2037,7 @@ impl App {
         }
         if let Some(t) = self.menu_edit.as_mut() {
             for c in text.chars().filter(|c| !c.is_control()) {
-                if t.chars().count() >= 8 {
+                if t.chars().count() >= ROUTE_NUMBER_MAX {
                     break;
                 }
                 t.push(c);
@@ -2440,6 +2512,7 @@ impl App {
             spawn: Some(format!("{x},{y},{heading}")),
             situation_vars: Vec::new(),
             situation_strvars: Vec::new(),
+            situation_odometer_km: None,
             situation_others: Vec::new(),
             line: None,
             tour: None,
@@ -2526,6 +2599,7 @@ impl App {
             spawn: Some(format!("{},{},{},{}", t.position.x, t.position.y, t.heading, t.position.z)),
             situation_vars: Vec::new(),
             situation_strvars: Vec::new(),
+            situation_odometer_km: None,
             situation_others: Vec::new(),
             line: None,
             tour: None,
@@ -2884,8 +2958,7 @@ impl App {
             }
             // the route ends here: free drive, as the list of lines has it
             "endduty" => {
-                self.duty = None;
-                self.service_msg = Some(("Free drive: no duty".into(), 4.0));
+                crate::game_lists::end_duty(self);
                 self.close_game_menu();
             }
             "tobus" => {
@@ -3384,6 +3457,24 @@ impl App {
         }
         let h = (t / 3600.0) as u32;
         self.service_msg = Some((format!("Clock: {h:02}:{:02}", ((t / 60.0) as u32) % 60), 3.0));
+        self.clock_jump += secs;
+        // (held Page Up/Down: once they are let go)
+        if self.clock_hold == 0.0 {
+            self.timetable_after_clock_jump();
+        }
+    }
+
+    /// After the clock was set by more than two minutes: the timetable's buses put out again
+    /// for the new time (`Schedule::restart`).
+    pub(crate) fn timetable_after_clock_jump(&mut self) {
+        let jump = std::mem::take(&mut self.clock_jump);
+        if jump.abs() < 120.0 {
+            return;
+        }
+        if let (Some(s), Some(w), Some(t), Some(r), Some(scene)) = (self.schedule.as_mut(), self.world.as_ref(), self.traffic.as_mut(), self.renderer.as_ref(), self.scene.as_mut()) {
+            let day_time = t.day_time;
+            s.restart(w, t, r, scene, day_time);
+        }
     }
 
     /// Start the game again on the quicksave (`Situations/quicksave.osn` of the content
@@ -3391,7 +3482,14 @@ impl App {
     /// there is none.
     pub(crate) fn load_quicksave(&mut self) -> bool {
         let dir = crate::startup::content_dir().unwrap_or_else(|| self.args.root.clone()).join("Situations");
-        let file = dir.join("quicksave.osn");
+        let mut file = dir.join("quicksave.osn");
+        // (the newer of the content folder's and the fallback folder's, see `save_or_fallback`)
+        if let Some(f) = crate::startup::save_fallback_dir().map(|f| f.join("Situations").join("quicksave.osn")) {
+            let age = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            if f.exists() && (!file.exists() || age(&f) > age(&file)) {
+                file = f;
+            }
+        }
         if !file.exists() {
             self.service_msg = Some(("No quicksave yet (Ctrl+S saves one)".into(), 4.0));
             return false;
@@ -3415,10 +3513,60 @@ impl App {
         }
     }
 
+    /// The running fuel pump or bus wash, one frame of it: its trigger with the frame's
+    /// time; done once the tank (the dirt) has not changed for `SERVICE_SETTLE` seconds, and
+    /// stopped by driving off.
+    pub(crate) fn tick_service(&mut self, dt: f32) {
+        const SERVICE_SETTLE: f32 = 1.5;
+        let Some((kind, idle)) = self.pumping else { return };
+        let Some(p) = self.player.as_mut() else {
+            self.pumping = None;
+            return;
+        };
+        let (name, var) = if kind == "refuel" { ("veh_tank", "engine_tank_content") } else { ("veh_wash", "Dirt_Wiped") };
+        if p.vehicle.physics.velocity_kmh().abs() > 2.0 {
+            self.pumping = None;
+            self.service_msg = Some((if kind == "refuel" { "Refuelling stopped" } else { "Washing stopped" }.into(), 4.0));
+            return;
+        }
+        let before = p.vehicle.var(var).unwrap_or(0.0);
+        p.vehicle.service(name, dt);
+        let now = p.vehicle.var(var).unwrap_or(0.0);
+        let idle = if (now - before).abs() > 1e-4 { 0.0 } else { idle + dt };
+        if idle > SERVICE_SETTLE {
+            self.pumping = None;
+            let line = if kind == "refuel" { format!("refuelled: {now:.0} l in the tank") } else { format!("washed: dirt {:.0}%", now * 100.0) };
+            log::info!("{line}");
+            self.service_msg = Some((line, 6.0));
+        } else {
+            self.pumping = Some((kind, idle));
+            if kind == "refuel" {
+                self.service_msg = Some((format!("Refuelling: {now:.0} l"), 1.0));
+            }
+        }
+    }
+
     /// One of the depot services of the game menu: "refuel", "wash" or "repair".
     pub(crate) fn run_service(&mut self, kind: &str) {
         let Some(w) = self.world.clone() else { return };
         let Some(p) = self.player.as_mut() else { return };
+        // The pump and the wash run as OMSI's do, `veh_tank` / `veh_wash` every frame
+        // while they are on, the tank filling litre by litre (`tick_service`); it had been
+        // full the moment the menu was clicked (#1785). (Off a station: the message below.)
+        if matches!(kind, "refuel" | "wash") && at_petrol_station(&w, &p.vehicle) {
+            let name = if kind == "refuel" { "veh_tank" } else { "veh_wash" };
+            if !p.vehicle.service(name, 0.0) {
+                self.service_msg = Some((format!("this vehicle has no {} handling ({name})", if kind == "refuel" { "fuel pump" } else { "bus wash" }), 6.0));
+                return;
+            }
+            if kind == "wash" {
+                p.vehicle.dirt = 0.0;
+                p.vehicle.set_engine_var("Dirt_Norm", 0.0);
+            }
+            self.pumping = Some((if kind == "refuel" { "refuel" } else { "wash" }, 0.0));
+            self.service_msg = Some((if kind == "refuel" { "Refuelling... (drive off to stop)" } else { "Washing..." }.into(), 4.0));
+            return;
+        }
         let one = Args {
             refuel: kind == "refuel",
             wash: kind == "wash",
@@ -3895,11 +4043,10 @@ impl App {
         // into openOMSI's content folder, never the original installation (the menu and
         // --situation find it there as they find a mod's files)
         let dir = crate::startup::content_dir().unwrap_or_else(|| self.args.root.clone()).join("Situations");
-        let _ = std::fs::create_dir_all(&dir);
         let out = dir.join("quicksave.osn");
         let sit = build_situation(&self.args, w, &self.clock, self.args.weather.as_deref(), self.player.as_ref(), &self.placed, cam, self.duty.as_ref(), "Quicksave");
-        match sit.save(&out) {
-            Ok(()) => {
+        match save_or_fallback(&sit, &out, Path::new("Situations").join("quicksave.osn").as_path()) {
+            Ok(out) => {
                 log::info!("saved situation {} ({} vehicles)", out.display(), sit.vehicles.len());
                 self.service_msg = Some(("Situation saved (quicksave)".into(), 3.0));
             }
@@ -3921,7 +4068,11 @@ impl App {
             return;
         };
         let _ = std::fs::create_dir_all(&dir);
-        let Some(n) = (1..10_000).find(|n| !dir.join(format!("Slot {n}.osn")).exists()) else { return };
+        // (the slots of the fallback folder count too: a number is never given twice)
+        let rel_dir = std::path::Path::new(&self.args.map.replace('\\', "/")).parent().map(|d| d.join(SAVES)).unwrap_or_default();
+        let fallback = crate::startup::save_fallback_dir().map(|f| f.join(&rel_dir));
+        let taken = |n: usize| dir.join(format!("Slot {n}.osn")).exists() || fallback.as_ref().is_some_and(|f| f.join(format!("Slot {n}.osn")).exists());
+        let Some(n) = (1..10_000).find(|n| !taken(*n)) else { return };
         let out = dir.join(format!("Slot {n}.osn"));
         let bus = self.player.as_ref().map(|p| {
             let d = &p.vehicle.ty.def;
@@ -3935,8 +4086,8 @@ impl App {
         };
         let name = format!("Slot {n}: {what}, {:02}:{:02}", (t / 3600.0) as i32 % 24, ((t % 3600.0) / 60.0) as i32);
         let sit = build_situation(&self.args, w, &self.clock, self.args.weather.as_deref(), self.player.as_ref(), &self.placed, cam, self.duty.as_ref(), &name);
-        match sit.save(&out) {
-            Ok(()) => {
+        match save_or_fallback(&sit, &out, rel_dir.join(format!("Slot {n}.osn")).as_path()) {
+            Ok(out) => {
                 log::info!("saved situation {} ({} vehicles)", out.display(), sit.vehicles.len());
                 self.service_msg = Some((format!("Saved as slot {n}: the launcher continues from it"), 4.0));
             }
@@ -4546,6 +4697,27 @@ impl crate::App {
 /// The folder of a map's save slots, inside the map's folder in the content folder (the
 /// launcher reads it as well: `omsi_launcher_lib::saved_situations`).
 pub(crate) const SAVES: &str = "Saves";
+
+/// How long a route number typed by hand may be. Eight characters were too few: Hong Kong
+/// buses take commands through it (`paper_sign_1_name=ABC.png`, `adddept_sign=1`, #1518).
+const ROUTE_NUMBER_MAX: usize = 64;
+
+/// Save `sit` to `out`; where that folder takes no file, to `rel` under the fallback folder
+/// (`startup::save_fallback_dir`) instead (#1673). The file written.
+fn save_or_fallback(sit: &omsi_content::situation::Situation, out: &Path, rel: &Path) -> std::io::Result<PathBuf> {
+    let first = out.parent().map(std::fs::create_dir_all).unwrap_or(Ok(())).and_then(|_| sit.save(out));
+    let e = match first {
+        Ok(()) => return Ok(out.to_path_buf()),
+        Err(e) => e,
+    };
+    let Some(alt) = crate::startup::save_fallback_dir().map(|f| f.join(rel)).filter(|a| a != out) else { return Err(e) };
+    log::warn!("saving {}: {e}; saved into {} instead", out.display(), alt.display());
+    if let Some(d) = alt.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    sit.save(&alt)?;
+    Ok(alt)
+}
 
 /// The lines of the game menu: (what, label). What can be set is on the pages behind
 /// "Options", "Vehicle options" and "World options" (see `game_lists`).

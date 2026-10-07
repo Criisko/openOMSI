@@ -899,6 +899,8 @@ pub struct Pose {
     /// The sender's clock when the state left (ms, wrapping), for drawing the others'
     /// buses between two states as they were sent rather than as they arrived; 0 unknown.
     pub sent_ms: u32,
+    /// The driver is keying the map-wide bus radio (GreenTeaSpeak voice); see `voice`.
+    pub radio_keyed: bool,
 }
 
 /// A player on foot: where, facing where, how fast, and whether sitting in some bus.

@@ -1,4 +1,4 @@
-//! Artificial junctions whose road entrance extends beyond their deformation field.
+//! Artificial road and scenery fixtures.
 use super::*;
 
 struct Fixture(PathBuf);
@@ -271,5 +271,70 @@ fn ai_lane_heights_are_independent_of_visual_vertex_coverage() {
                     "covered_vertices={covered_vertices}, field_sign={field_sign}, y={y}: lane height {}", point.z);
             }
         }
+    }
+}
+
+// A scenery backdrop can cover several distant areas in separate meshes. Splitting
+// one object into parts must not change the source tiles from which it is visible.
+#[test]
+fn split_backdrop_keeps_whole_object_visibility_bounds() {
+    let fixture = Fixture::new();
+    fixture.write("global.cfg", "[name]\nArtificial background\n");
+    fixture.write(
+        "split.sco",
+        "[rendertype]\nsurface\n[absheight]\n[mesh]\nsouth.x\n[mesh]\nnorth.x\n",
+    );
+    fixture.write(
+        "single.sco",
+        "[rendertype]\nsurface\n[absheight]\n[mesh]\nwhole.x\n",
+    );
+    fixture.write("south.x", &strip(&[(-1400.0, 0.0), (-1000.0, 0.0)]));
+    fixture.write("north.x", &strip(&[(300.0, 0.2), (1100.0, 0.2)]));
+    fixture.write(
+        "whole.x",
+        &strip(&[(-1400.0, 0.0), (-1000.0, 0.0), (300.0, 0.2), (1100.0, 0.2)]),
+    );
+    let world = World::open(&fixture.0, &fixture.0.join("global.cfg"), 20261001).unwrap();
+    let split = world.object_type("split.sco").unwrap();
+    let single = world.object_type("single.sco").unwrap();
+    assert_eq!(split.meshes.len(), 2);
+    let tile = (-3, 4);
+    let ts = tile_size();
+    let expected = Some([-4.0 * ts, 3.0 * ts, -1.0 * ts, 6.0 * ts]);
+    for heading in [0.0, 37.0, 90.0] {
+        let xf = object_rotation([heading, 0.0, 0.0]);
+        let pos = DVec3::new(-770.0, 1450.0, 20.0);
+        assert_eq!(stand_in_area(&single, &xf, pos, tile), expected);
+        assert_eq!(stand_in_area(&split, &xf, pos, tile), expected,
+            "splitting a large backdrop into meshes must preserve its visibility at heading {heading}");
+        // Placement scale still controls the footprint, just as for a single mesh.
+        let small = xf * Mat4::from_scale(glam::Vec3::splat(0.5));
+        assert_eq!(stand_in_area(&split, &small, pos, tile), None);
+    }
+}
+
+#[test]
+fn ordinary_split_object_keeps_full_view_distance() {
+    let fixture = Fixture::new();
+    fixture.write("global.cfg", "[name]\nArtificial road structure\n");
+    fixture.write(
+        "road.sco",
+        "[surface]\n[absheight]\n[mesh]\nwest.x\n[mesh]\neast.x\n",
+    );
+    // Even a sizeable road structure remains below the existing whole-object cutoff.
+    fixture.write("west.x", &strip(&[(-750.0, 0.1), (0.0, 0.1)]));
+    fixture.write("east.x", &strip(&[(0.0, 0.1), (750.0, 0.1)]));
+    let world = World::open(&fixture.0, &fixture.0.join("global.cfg"), 20261001).unwrap();
+    let road = world.object_type("road.sco").unwrap();
+    for heading in [0.0, 37.0, 90.0] {
+        assert_eq!(
+            stand_in_area(
+                &road,
+                &object_rotation([heading, 0.0, 0.0]),
+                DVec3::ZERO,
+                (0, 0)
+            ),
+            None
+        );
     }
 }

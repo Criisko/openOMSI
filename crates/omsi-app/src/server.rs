@@ -115,11 +115,13 @@ share_positions = 0
 # openOMSI plugin (as SaltyChat does for FiveM). voice_server_uid is the voice server's unique
 # id (its info panel; needed: without it there is no voice chat), voice_channel the in-game
 # channel's id or name (empty: no voice chat), voice_range how far a player is heard (m).
+# voice_radio (1/0): drivers get a bindable map-wide bus radio on top of proximity voice.
 # The channel and its password are sent to every player who joins
 voice_server_uid =
 voice_channel =
 voice_channel_password =
 voice_range = 20
+voice_radio = 1
 ";
 
 impl ServerCfg {
@@ -151,7 +153,7 @@ impl ServerCfg {
             date: kv.get("date").cloned().filter(|v| !v.is_empty()),
             time: get("time", "08:00"),
             weather: kv.get("weather").cloned().filter(|v| !v.is_empty()),
-            traffic: num("traffic", 30).clamp(0, 200) as usize,
+            traffic: (num("traffic", 30).max(0) as usize).min(crate::game_lists::TRAFFIC_MAX),
             timetable: flag("timetable", true),
             passengers: flag("passengers", true),
             port: num("port", 27015).clamp(1, 65535) as u16,

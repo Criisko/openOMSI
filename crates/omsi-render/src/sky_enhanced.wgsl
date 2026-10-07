@@ -247,6 +247,10 @@ fn sky_radiance(d: vec3<f32>, pix: f32) -> vec3<f32> {
 
 @fragment
 fn fs_enhanced(in: VsOut) -> @location(0) vec4<f32> {
+    return enhanced_sky(in);
+}
+
+fn enhanced_sky(in: VsOut) -> vec4<f32> {
     let d = normalize(in.dir);
     let pre = enh.exposure.x;
     // the cube is drawn from its own eye (lib.rs Probe::cube_eye): look the clouds' base up
@@ -258,6 +262,7 @@ fn fs_enhanced(in: VsOut) -> @location(0) vec4<f32> {
     }
     let cube = textureSampleLevel(t_sky_cube, s_lin, vec3<f32>(ld.x, ld.z, ld.y), 0.0);
     var col = cube.rgb * enh.ground.w;
+    var sun_px = vec3<f32>(0.0);
     // the sun: a limb-darkened disc as bright as its irradiance spread over its size,
     // behind whatever cloud there is
     let sd = normalize(camera.sun_dir.xyz);
@@ -271,12 +276,41 @@ fn fs_enhanced(in: VsOut) -> @location(0) vec4<f32> {
         let h0 = camera.cam_pos.z - enh.fog.z;
         let t = air_of(d, 30000.0, h0, h0 + 30000.0 * max(d.z, 0.0), 0.0).a;
         let l = enh.sun_disc.rgb / (PI * r * r) * disc * limb * (1.0 - cover) * enh.lights.w * t;
-        col = col + l;
+        sun_px = l;
     }
     col = col + night_sky(d, cube.a, fwidth(d));
-    // the dome is drawn pre-exposed; the disc is kept within what the target and the glow
-    // filter handle
-    return vec4<f32>(min(col * pre, vec3<f32>(4000.0)), 1.0);
+    // the dome is drawn pre-exposed; the disc only a little over white: the eye's glare round
+    // it is drawn from its light (fog_lamps.wgsl `sun_glare`), and from the disc's pixels
+    // as well the glow would have counted it twice
+    return vec4<f32>(min(col * pre, vec3<f32>(4000.0)) + min(sun_px * pre, vec3<f32>(24.0)), 1.0);
+}
+
+// The mirrors of an Enhanced picture are drawn with the plain shading (lib.rs, the cost of
+// the enhanced shader in a small picture), but their sky is this one, tone-mapped here
+// with the window's curve (post.wgsl `natural_tone`): the plain envir.cfg sky showed a blue
+// dusk in the mirrors over the window's grey one, or the other way round (#1754, #1449).
+// The meter's correction is left out (by day a few tenths of a stop at most).
+fn mirror_tone(color: vec3<f32>, contrast: f32) -> vec3<f32> {
+    let knee = 0.66;
+    let x = max(color, vec3<f32>(0.0));
+    let y = 0.18 * pow(x / 0.18 + vec3<f32>(1e-7), vec3<f32>(contrast));
+    let peak = max(y.r, max(y.g, y.b));
+    if (peak <= knee) {
+        return y;
+    }
+    let d = 1.0 - knee;
+    let shoulder = vec3<f32>(knee) + d * (vec3<f32>(1.0) - exp(-(y - vec3<f32>(knee)) / d));
+    let soft = select(y, shoulder, y > vec3<f32>(knee));
+    let np = knee + d * (1.0 - exp(-(peak - knee) / d));
+    let o = mix(y * (np / peak), soft, 0.4);
+    let g = 1.0 - 1.0 / (0.3 * (peak - np) + 1.0);
+    return mix(o, vec3<f32>(np), g);
+}
+
+@fragment
+fn fs_enhanced_mirror(in: VsOut) -> @location(0) vec4<f32> {
+    let hdr = enhanced_sky(in).rgb;
+    return vec4<f32>(clamp(mirror_tone(hdr, max(enh.debug.w, 1.0)), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 
 fn star_hash(c: vec3<i32>) -> vec4<f32> {

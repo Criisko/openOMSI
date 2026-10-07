@@ -448,6 +448,7 @@ pub(crate) fn weather_lighting(
         rate,
         if w.snow { 1.0 } else { 0.0 },
     );
+    lighting.roads_clear = w.snow && !w.snow_on_road;
     if let Some(custom)=CustomWeather::parse(&w.path.to_string_lossy()){
         let k=custom.brightness;
         lighting.sun_intensity*=k;
@@ -463,10 +464,15 @@ pub(crate) fn weather_lighting(
         }
     }
     lighting.wetness = wetness;
+    // [wind] direction (deg) and speed (m/s): the snowfall drifts with it
+    lighting.wind = glam::Vec3::new(w.wind.0.to_radians().sin() * w.wind.1, w.wind.0.to_radians().cos() * w.wind.1, 0.0);
+    omsi_sim::particles::set_wind(lighting.wind);
     // Omsi.exe hides the sun under an 'ovc' cloud type (the Overcast ones in clouds.cfg) and
     // draws no sun shadows below 350 m visibility
     let overcast = w.clouds.0.trim().to_ascii_lowercase().starts_with("overcast");
     lighting.shadows = shadows && !overcast && w.fog.0 > 350.0;
+    // (a street lamp casts its shadow in any weather)
+    lighting.lamp_shadows = shadows;
     // the physical model: how much of which cloud there is and what the air holds, which
     // the enhanced atmosphere turns into light (the `.owt` values above stay for the rest)
     if let Some(m) = model_sky.filter(|_| lighting.enhanced) {

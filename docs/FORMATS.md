@@ -82,7 +82,7 @@ trunc ! /-/` (negate); `d` duplicates. `pi` pushes π, `random` replaces `st[0]`
 whole number in `[0, n)` with `n = |round(st[0])|` (the exe calls `Random(Abs(Round(x)))`). A reached `{else}` jumps to the next `{endif}` even when a stray `{endif}` has already closed its
 `{if}` (the Procity's dashboard script has one; ignoring that `{else}` blanked its odometer every
 frame). `$SetLengthL n` keeps the left n characters or pads on the right, `$SetLengthR n` keeps the
-right n or pads on the left (read off the exe's `str_SetLengthL/R`); re-checked Sept 24 2026 in `TXPC_calcblock_func` op 0x25 at 0x5d584a: `Copy(s, len-n+1, n)`). Mod scripts that cannot show what they were written for under these semantics are patched before compiling by `omsi_script::compat` (recognised by their text: the LiAZ 5292's 4-character line matrix pads the line to `4 $SetLengthL` and then keeps `3 $SetLengthR`, which left lines 1-9 blank and 5E as `   E`; its number is now written `"03" $IntToStrEnh` → `005E`). `{if}` does **not** pop its condition (28 spots in the stock scripts
+right n or pads on the left (read off the exe's `str_SetLengthL/R`); re-checked Sept 24 2026 in `TXPC_calcblock_func` op 0x25 at 0x5d584a: `Copy(s, len-n+1, n)`). Mod scripts that cannot show what they were written for under these semantics are patched before compiling by `omsi_script::compat` (recognised by their text: the LiAZ 5292's 4-character line matrix pads the line to `4 $SetLengthL` and then keeps `3 $SetLengthR`, which left lines 1-9 blank and 5E as `   E`; its number is now written `"03" $IntToStrEnh` → `005E`. Aachen's ibox keeps route digits in float `ibox_eingabe` and blanks the display at 0, so leading zeros never appeared; mode-10 route entry uses a string digit buffer on `ibox_Zahleingabe` (empty until typed — no `"00"` / `"02" $IntToStrEnh` auto-pad): typed `0` then `1` shows `01`, typed `1` alone shows `1`; mode-7 line entry stays empty for free typing with no auto leading zeros). `{if}` does **not** pop its condition (28 spots in the stock scripts
 work on it: `(L.L.bremse_feststell) {if} ! (S.L.bremse_feststell)` releases the parking brake,
 `cond {if} (L.L.IBIS_busstop) 0 > &&` in the IBIS; the chura matrix writes `x d -1 = ! {if} *`).
 Tokens found in the executable's operator table: `/-/ <= >= && || sin arcsin arctan min max exp
@@ -357,7 +357,9 @@ whole spline at that offset; lanes of consecutive splines meet at the ends.
 
 12 lines (`path_2`: 14): start x, y, z in the object frame (x right, y forward, z up),
 heading (degrees, clockwise, relative to the object), radius (0 straight, > 0 right turn),
-length, 0, height change, kind (0 street, 1 sidewalk, 2 rail), width, direction (0/1/2 as
+length, gradient at the start and at the end (rise per metre: the height runs as their
+integral along the path - checked on the stock objects, where 50 of 53 linked paths meet
+the next one's start height that way, #1617), kind (0 street, 1 sidewalk, 2 rail), width, direction (0/1/2 as
 above), turn indicator (0 none, 2 left, 3 right; used for the AI blinkers); `path_2` adds two
 zero fields. Verified on `Einm_Spandauer_Koelner_1990.sco`: the arc `(1.5,-7.75) h0 r6.248
 l4.635` ends exactly at the start of the next path `(3.142,-3.529) h42.5`.
@@ -844,10 +846,15 @@ index), `GetRouteTerminusIndex(route)`, `GetTerminusCode(idx)`, `GetTerminusInde
 `[addterminus]`/`[addterminus_allexit]` records are code, ident, then `stringcount_terminus`
 strings (no separate station line in any shipped file). AI buses get their destination the
 original way: string `SetLineTo` + `AI_target_index` (terminus index) and the
-`ai_scheduled_settarget` trigger. Depot callbacks with index -1 (what the lookups answer for an
-unknown code) return "" / -1, never entry 0. A depot file belongs to a map: when the bus folder
-has none of the name the map's `ailists.cfg` wants (a mod bus brings only its own map's), the
-openOMSI takes it from another vehicle folder (`omsi_vehicle::hof::depot_anywhere`). The FloFix
+`ai_scheduled_settarget` trigger - and, as every trip a bus starts calls
+`TRoadVehicleInst.virtual_10`, also when the depot file has no row for the trip's terminus or
+the group names no depot file at all (`AI_target_index` stays as it was). Depot callbacks with
+index -1 (what the lookups answer for an unknown code) return "" / -1, never entry 0. A depot
+file belongs to a map: when the bus folder has none of the name the map's `ailists.cfg` wants
+(a mod bus brings only its own map's), the openOMSI takes it from another vehicle folder
+(`omsi_vehicle::hof::depot_anywhere`); a bus of a plain `[aigroup_2]` pool, whose group names
+no depot, takes the map's depot of its folder where it has one, else the folder's first
+(`schedule::pool_depot`, Omsi.exe's selected-hof index 0). The FloFix
 "Atron" IBIS of many mods starts in a PIN mode (`IBIS_mode` 10) and wants the `PIN` constant
 of its constfile typed and confirmed before the mode keys work.
 

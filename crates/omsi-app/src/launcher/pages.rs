@@ -3,7 +3,7 @@
 
 use super::state::{fmt_bytes, hhmm, short_map};
 use super::theme::*;
-use super::ui::{id_of, ButtonKind, Ui};
+use super::ui::{id_of, matches, ButtonKind, Ui};
 use super::{Launcher, Page};
 use glam::Vec2;
 use omsi_launcher_lib as core;
@@ -121,6 +121,9 @@ pub fn profile(l: &mut Launcher, area: Rect) {
             let name = l.state.config.profile.clone();
             match core::delete_profile(&name) {
                 Ok(()) => {
+                    l.state.profile = None;
+                    l.state.config.profile.clear();
+                    let _ = core::save_config(&l.state.config);
                     l.state.set_status(format!("Personnel file of {name} deleted."), false);
                     l.state.load_profiles();
                 }
@@ -608,6 +611,11 @@ fn graphics_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) ->
         }
         sel_setting(ui, s, dirty, "s-casters", c.row(), "Shadows cast by", "shadow_casters", &[("all", "Every solid mesh"), ("omsi", "[shadow] meshes, as OMSI")]);
         toggle_setting(ui, s, dirty, c.row(), "Detail texturing up close", "detail_textures");
+        let mut night = get(s, "night_brightness").as_f64().unwrap_or(0.0) as f32;
+        if ui.slider("s-night", c.row(), &mut night, 0.0, 3.0, 0.25, "Night brightness", &|v| if v < 0.01 { "Off".to_string() } else { format!("+{v:.2}") }) {
+            s["night_brightness"] = json!((night / 0.25).round() * 0.25);
+            *dirty = 0.3;
+        }
         // (an LED panel's dots are its own light: how bright they burn, and how much of the
         // mip chain the panel's picture and its mask are held at - 0 point-samples them,
         // the sharpest dots and the worst shimmer; higher holds them at the level the
@@ -630,6 +638,7 @@ fn graphics_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) ->
         toggle_setting(ui, s, dirty, c.row(), "Reflection maps (paint, chrome, glass)", "reflections");
     }
     toggle_setting(ui, s, dirty, c.row(), "Clouds", "clouds");
+    toggle_setting(ui, s, dirty, c.row(), "Windy trees", "windy_trees");
     let left = c.used();
     let mut c = Col::new(ui, cols[1], "Display");
     toggle_setting(ui, s, dirty, c.row(), "Fullscreen", "fullscreen");
@@ -686,6 +695,8 @@ fn driving_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, c
     toggle_setting(ui, s, dirty, c.row(), "Indicators cancel themselves (as the bus's script does)", "blinker_cancel");
     toggle_setting(ui, s, dirty, c.row(), "The keyboard brake stays on until the throttle (as in OMSI)", "brake_hold");
     toggle_setting(ui, s, dirty, c.row(), "Automatic clutch (manual gearboxes)", "auto_clutch");
+    // (it was in the game's menu only, #1780)
+    toggle_setting(ui, s, dirty, c.row(), "Automated manual gearbox (shifts a manual gearbox for you by the engine speed)", "auto_shift");
     if ui.button("s-go-keys", c.row(), "Change the keys", Some("keyboard"), ButtonKind::Normal) {
         out.controls = Some(0);
     }
@@ -704,6 +715,14 @@ fn driving_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, c
         s["wheel_lock"] = json!(if lock < 45.0 { 0.0 } else { lock.round() });
         *dirty = 0.3;
     }
+    // a gamepad stick's steering, eased onto where the stick points (0: as it reads)
+    let mut pad_smooth = get(s, "pad_steer_smooth").as_f64().unwrap_or(120.0) as f32;
+    if ui.slider("s-pad-steer-smooth", c.row(), &mut pad_smooth, 0.0, 300.0, 10.0, "Stick steering smoothing", &|v| if v <= 0.0 { "Off".to_string() } else { format!("{v:.0} ms") }) {
+        s["pad_steer_smooth"] = json!(pad_smooth.round());
+        *dirty = 0.3;
+    }
+    toggle_setting(ui, s, dirty, c.row(), "Stick steers like a wheel (a wheel seen as a gamepad)", "pad_steer_linear");
+    toggle_setting(ui, s, dirty, c.row(), "Arrow keys switch the cameras with a wheel too (no glance)", "arrows_switch_cams");
     // the pedals' response: softer (below 1) or stronger (above 1) than the pedal reads
     for (key, label, id) in [("pedal_throttle", "Throttle pedal strength", "s-pedt"), ("pedal_brake", "Brake pedal strength", "s-pedb")] {
         let mut v = get(s, key).as_f64().unwrap_or(1.0) as f32;
@@ -825,7 +844,61 @@ fn camera_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, co
     toggle_setting(ui, s, dirty, c.row(), "Camera collisions (outside view)", "camera_collision");
     toggle_setting(ui, s, dirty, c.row(), "Driver at the wheel (outside views)", "driver");
     c.section(ui, "Head tracking");
-    toggle_setting(ui, s, dirty, c.row(), "Head tracking (TrackIR and others through opentrack, UDP 4242)", "head_tracking");
+    toggle_setting(ui, s, dirty, c.row(), "Head tracking (native TrackIR / OpenTrack)", "head_tracking");
+
+    // TrackIR axis controls. Values are stored as user-facing percentages:
+    // 0% disables an axis; 100% (the default) is 1:1.
+    c.section(ui, "Rotation");
+    for (key, id, label) in [
+        ("head_tracking_yaw_sens", "s-trackir-yaw", "Yaw sensitivity (left / right)"),
+        ("head_tracking_pitch_sens", "s-trackir-pitch", "Pitch sensitivity (up / down)"),
+        ("head_tracking_roll_sens", "s-trackir-roll", "Roll sensitivity"),
+    ] {
+        let mut v = get(s, key).as_f64().unwrap_or(100.0) as f32;
+        if ui.slider(id, c.row(), &mut v, 0.0, 100.0, 1.0, label, &|v| {
+            if v <= 0.0 { "Off".to_string() } else { format!("{v:.0}%") }
+        }) {
+            s[key] = json!(v.round().clamp(0.0, 100.0));
+            *dirty = 0.3;
+        }
+    }
+    toggle_setting(ui, s, dirty, c.row(), "Invert yaw", "head_tracking_invert_yaw");
+    toggle_setting(ui, s, dirty, c.row(), "Invert pitch", "head_tracking_invert_pitch");
+    toggle_setting(ui, s, dirty, c.row(), "Invert roll", "head_tracking_invert_roll");
+
+    c.section(ui, "Position");
+    for (key, id, label) in [
+        ("head_tracking_x_sens", "s-trackir-x", "X sensitivity (left / right)"),
+        ("head_tracking_y_sens", "s-trackir-y", "Y sensitivity (up / down)"),
+        ("head_tracking_z_sens", "s-trackir-z", "Z sensitivity (forward / back)"),
+    ] {
+        let mut v = get(s, key).as_f64().unwrap_or(100.0) as f32;
+        if ui.slider(id, c.row(), &mut v, 0.0, 100.0, 1.0, label, &|v| {
+            if v <= 0.0 { "Off".to_string() } else { format!("{v:.0}%") }
+        }) {
+            s[key] = json!(v.round().clamp(0.0, 100.0));
+            *dirty = 0.3;
+        }
+    }
+    toggle_setting(ui, s, dirty, c.row(), "Invert X", "head_tracking_invert_x");
+    toggle_setting(ui, s, dirty, c.row(), "Invert Y", "head_tracking_invert_y");
+    toggle_setting(ui, s, dirty, c.row(), "Invert Z", "head_tracking_invert_z");
+
+    if ui.button("s-trackir-reset", c.row(), "Reset head-tracking axes", Some("restart_alt"), ButtonKind::Normal) {
+        for key in [
+            "head_tracking_yaw_sens", "head_tracking_pitch_sens", "head_tracking_roll_sens",
+            "head_tracking_x_sens", "head_tracking_y_sens", "head_tracking_z_sens",
+        ] {
+            s[key] = json!(15.0);
+        }
+        for key in [
+            "head_tracking_invert_yaw", "head_tracking_invert_pitch", "head_tracking_invert_roll",
+            "head_tracking_invert_x", "head_tracking_invert_y", "head_tracking_invert_z",
+        ] {
+            s[key] = json!(false);
+        }
+        *dirty = 0.3;
+    }
     c.section(ui, "Triple screen");
     toggle_setting(
         ui,
@@ -1196,10 +1269,10 @@ fn mb(v: i64) -> String {
 // --- controls ---------------------------------------------------------------------------------
 
 /// The game's own actions a controller's button can be given, besides the bus's: the doors
-/// and gears of any bus, looking round while held, the cameras and the views - both of
-/// OMSI's view resets, the one view's (C) and every view's (Space), which a controller
-/// could not bring back to the first camera (#1167).
-const PAD_GAME_ACTIONS: [&str; 25] = ["doors_all", "door_4", "door_3", "door_2", "door_1", "gear_up", "gear_down", "view_look_left", "view_look_right", "view_look_up", "view_look_down", "view_reset_direction", "view_reset_all_directions", "view_interiorcam_plus", "view_interiorcam_minus", "view_toggle_viewpoint", "view_toggle_interior", "view_set_driver", "view_set_passenger", "view_set_outside", "sim_pause", "screenshot", "quicksave", "toggel_mouse_ctrl", "toggel_ctrler"];
+/// and gears of any bus, looking round while held, the bus radio while held, the cameras
+/// and the views - both of OMSI's view resets, the one view's (C) and every view's (Space),
+/// which a controller could not bring back to the first camera (#1167).
+const PAD_GAME_ACTIONS: [&str; 26] = ["doors_all", "door_4", "door_3", "door_2", "door_1", "gear_up", "gear_down", "view_look_left", "view_look_right", "view_look_up", "view_look_down", "view_reset_direction", "view_reset_all_directions", "view_interiorcam_plus", "view_interiorcam_minus", "view_toggle_viewpoint", "view_toggle_interior", "view_set_driver", "view_set_passenger", "view_set_outside", "sim_pause", "screenshot", "quicksave", "toggel_mouse_ctrl", "toggel_ctrler", "voice_radio"];
 
 fn action_text(names: &crate::describe::ControlNames, a: &str) -> String {
     known_action(a).unwrap_or_else(|| names.control(a))
@@ -1262,6 +1335,7 @@ fn known_action(a: &str) -> Option<String> {
         ("exit", "Quit"),
         ("chat_open", "Multiplayer: write in the chat"),
         ("chat_toggle", "Multiplayer: show / hide the chat"),
+        ("voice_radio", "Multiplayer: bus radio (hold)"),
         ("sim_pause", "Pause"),
         ("screenshot", "Screenshot"),
         ("quicksave", "Quicksave"),
@@ -1366,7 +1440,7 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         if sec == 0 && l.pages.kb_events[sec] {
             let mut events = names.events();
             if !q.is_empty() {
-                events.retain(|(action, label)| action.to_lowercase().contains(&q) || label.to_lowercase().contains(&q));
+                events.retain(|(action, label)| action.to_lowercase().contains(&q) || matches(label, &q));
             }
             let mut picked: Option<String> = None;
             l.ui.scroll_area(&format!("kb-events-{sec}"), Rect::new(inner.x - 6.0, inner.y + 62.0, inner.w + 12.0, inner.bottom() - (inner.y + 62.0)), &mut |ui, v| {
@@ -1395,7 +1469,7 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         let list: Vec<(usize, String, i64, i64)> = l.state.keybindings.get(*key).and_then(|a| a.as_array()).map(|a| a.iter().enumerate().map(|(i, b)| (i, b.get("action").and_then(|x| x.as_str()).unwrap_or("").to_string(), b.get("scan_code").and_then(|x| x.as_i64()).unwrap_or(0), b.get("modifier").and_then(|x| x.as_i64()).unwrap_or(0))).collect()).unwrap_or_default();
         let mut shown: Vec<(usize, String, String, bool)> = list
             .iter()
-            .filter(|(_, a, s, m)| q.is_empty() || action_text(names, a).to_lowercase().contains(&q) || a.to_lowercase().contains(&q) || crate::keys::key_name(*s, *m).to_lowercase().contains(&q))
+            .filter(|(_, a, s, m)| q.is_empty() || matches(&action_text(names, a), &q) || a.to_lowercase().contains(&q) || crate::keys::key_name(*s, *m).to_lowercase().contains(&q))
             .map(|(i, a, s, m)| {
                 let clash = *s != 0 && list.iter().any(|(j, _, s2, m2)| j != i && s2 == s && m2 == m);
                 (*i, action_text(names, a), crate::keys::key_name(*s, *m), clash)
@@ -1618,7 +1692,7 @@ fn game_controllers(l: &mut Launcher, body: Rect) {
     l.ui.panel(right);
     let Some(d) = devices.get_mut(pv.selected) else { return };
     let inner = l.ui.heading(Rect::new(right.x + 18.0, right.y + 14.0, right.w - 36.0, right.h - 28.0), &d.name.clone(), Some("tune"));
-    let live_dev = connected.iter().find(|c| crate::controllers::names_match(&d.name, &c.name));
+    let live_dev = crate::controllers::find_connected(&connected, &d.name);
     let live: Vec<(usize, f32)> = live_dev.map(|c| c.axes.clone()).unwrap_or_default();
     // every button the device has gets its line (DirectInput says how many)
     if let Some(n) = live_dev.map(|c| c.buttons).filter(|n| *n > d.buttons.len()) {
@@ -2509,20 +2583,40 @@ pub fn setup(l: &mut Launcher, area: Rect) {
     }
     y += 12.0;
     if l.ui.button("cfg-save", Rect::new(inner.x, y, 180.0, 42.0), "Save", Some("save"), ButtonKind::Primary) {
-        l.state.config.root = root.trim().to_string();
-        l.state.config.game = game.trim().to_string();
-        match core::save_config(&l.state.config) {
-            Ok(()) => {
-                // (what was read of the folders before is forgotten: a folder copied or
-                // changed while the launcher ran is read as it is now)
-                omsi_cfg::content_changed();
-                l.state.config = core::load_config();
-                l.pages.setup_root = None;
-                l.pages.setup_game = None;
-                l.state.set_status("Saved. Reading the content again…", false);
-                l.state.load_content();
+        let chosen = root.trim().to_string();
+        // A folder that is no complete installation is said so, with what it lacks, and
+        // nothing is saved: it was saved, then quietly replaced by the installation found
+        // before, while the page said "Saved" (#1656).
+        let missing = if chosen.is_empty() { Vec::new() } else { omsi_cfg::missing_original_essentials(std::path::Path::new(&chosen)) };
+        if !missing.is_empty() {
+            let shown: Vec<&str> = missing.iter().map(String::as_str).take(6).collect();
+            let more = if missing.len() > shown.len() { format!(" and {} more", missing.len() - shown.len()) } else { String::new() };
+            l.state.set_status(format!("Not saved: {chosen} is not a complete OMSI 2 installation - it lacks {}{more}", shown.join(", ")), true);
+        } else {
+            l.state.config.root = chosen.clone();
+            l.state.config.game = game.trim().to_string();
+            match core::save_config(&l.state.config) {
+                Ok(()) => {
+                    // (what was read of the folders before is forgotten: a folder copied or
+                    // changed while the launcher ran is read as it is now)
+                    omsi_cfg::content_changed();
+                    l.state.config = core::load_config();
+                    l.pages.setup_root = None;
+                    l.pages.setup_game = None;
+                    let same = chosen.is_empty() || std::path::Path::new(&chosen) == std::path::Path::new(&l.state.config.root);
+                    if same {
+                        l.state.set_status("Saved. Reading the content again…", false);
+                    } else {
+                        l.state.set_status(format!("Saved, but the OMSI 2 folder used is {}", l.state.config.root), true);
+                    }
+                    // (a phone: the gallery is kept out of the folder chosen at once, before
+                    // its media scanner lists its textures as photos, #1632)
+                    #[cfg(target_os = "android")]
+                    crate::android::hide_content_from_gallery();
+                    l.state.load_content();
+                }
+                Err(e) => l.state.set_status(format!("{e:#}"), true),
             }
-            Err(e) => l.state.set_status(format!("{e:#}"), true),
         }
     }
 }
@@ -2689,15 +2783,15 @@ mod settings_tests {
     fn by_tab() -> Vec<Vec<&'static str>> {
         let mut graphics = vec![
             "s-gp-sel", "s-gp-load", "s-gp-del", "s-gp-name", "s-gp-save",
-            "s-preset", "s-graphics", "s-msaa", "s-scale", "s-af", "s-shadow", "set-ssao", "set-shadows", "s-casters", "set-detail_textures", "s-led", "s-led-mip", "set-shadow_blobs", "set-reflections", "set-clouds",
+            "s-preset", "s-graphics", "s-msaa", "s-scale", "s-af", "s-shadow", "set-ssao", "set-shadows", "s-casters", "set-detail_textures", "s-night", "s-led", "s-led-mip", "set-shadow_blobs", "set-reflections", "set-clouds", "set-windy_trees",
             "set-fullscreen", "s-res", "set-vsync", "s-fps", "s-view", "s-maxobj", "s-minobj", "s-mirror", "s-mirror-refresh", "s-texmem", "set-texture_compression",
         ];
         if !cfg!(target_os = "macos") {
             graphics.push("s-api");
         }
         let driving = vec![
-            "s-keys", "set-steering_linear", "set-old_steering", "set-red_steer_spd", "s-mouse", "set-mouse_smooth", "set-mouse_right_off", "set-blinker_cancel", "set-brake_hold", "set-auto_clutch", "set-momentary_gears", "s-go-keys",
-            "s-wrange", "s-wlock", "s-pedt", "s-pedb", "set-ff_enabled", "set-ff_invert", "s-ffroad", "s-ffeng", "s-fffade", "s-wreset", "s-go-pads",
+            "s-keys", "set-steering_linear", "set-old_steering", "set-red_steer_spd", "s-mouse", "set-mouse_smooth", "set-mouse_right_off", "set-blinker_cancel", "set-brake_hold", "set-auto_clutch", "set-auto_shift", "set-momentary_gears", "s-go-keys",
+            "s-wrange", "s-wlock", "s-pad-steer-smooth", "set-pad_steer_linear", "set-arrows_switch_cams", "s-pedt", "s-pedb", "set-ff_enabled", "set-ff_invert", "s-ffroad", "s-ffeng", "s-fffade", "s-wreset", "s-go-pads",
         ];
         let mut camera = vec![
             "s-seaty",
@@ -2722,6 +2816,11 @@ mod settings_tests {
             "set-camera_collision",
             "set-driver",
             "set-head_tracking",
+            "s-trackir-yaw", "s-trackir-pitch", "s-trackir-roll",
+            "set-head_tracking_invert_yaw", "set-head_tracking_invert_pitch", "set-head_tracking_invert_roll",
+            "s-trackir-x", "s-trackir-y", "s-trackir-z",
+            "set-head_tracking_invert_x", "set-head_tracking_invert_y", "set-head_tracking_invert_z",
+            "s-trackir-reset",
             "set-triple_screen",
             "set-triple_span",
             "set-triple_hud_center",
@@ -2859,16 +2958,25 @@ mod settings_tests {
 #[cfg(test)]
 mod pad_action_tests {
     /// Every game action a button can be given is one the game carries out from a
-    /// controller (app_events: `view_look_*` and the gears by name, the rest through
-    /// `is_game_action`, the doors through `Player::action`) - Space's reset of every view
-    /// among them (#1167).
+    /// controller (app_events: `view_look_*` / `voice_radio` while held, the gears by name,
+    /// the rest through `is_game_action`, the doors through `Player::action`) - Space's
+    /// reset of every view among them (#1167).
     #[test]
     fn a_button_can_reset_every_view() {
         assert!(super::PAD_GAME_ACTIONS.contains(&"view_reset_all_directions"));
+        assert!(super::PAD_GAME_ACTIONS.contains(&"voice_radio"));
+        assert_eq!(super::known_action("voice_radio").as_deref(), Some("Multiplayer: bus radio (hold)"));
         for a in super::PAD_GAME_ACTIONS {
-            let handled = crate::input_script::is_game_action(a) || a.starts_with("gear_") || crate::player::door_action(a).is_some();
+            let held = a.starts_with("view_look_") || a == "voice_radio";
+            let handled = held
+                || crate::input_script::is_game_action(a)
+                || a.starts_with("gear_")
+                || crate::player::door_action(a).is_some();
             assert!(handled, "{a}");
         }
+        // held pad actions are game actions so they never reach the bus script
+        assert!(crate::input_script::is_game_action("voice_radio"));
+        assert!(crate::input_script::is_game_action("view_look_left"));
     }
 }
 

@@ -20,6 +20,8 @@ mod headtrack;
 mod openxr;
 #[cfg(target_os = "macos")]
 mod mac_hid;
+#[cfg(target_os = "macos")]
+mod mac_game_controller;
 #[cfg(target_os = "android")]
 mod android;
 mod platform;
@@ -56,6 +58,7 @@ mod radio;
 
 mod puddles;
 mod quit;
+mod condensation;
 mod rain;
 mod scene;
 mod schedule;
@@ -95,6 +98,7 @@ mod on_foot;
 mod route_arrows;
 mod server;
 mod player;
+mod plugin_ui;
 mod plugins;
 mod services;
 mod situation;
@@ -470,6 +474,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         ui: ui::Ui::new(),
         fps: 0.0,
         rain: rain::Rain::new(),
+        cabin_air: crate::condensation::CabinAir::new(),
         spray: puddles::Spray::new(),
         lamps_on: None,
         menu: None,
@@ -524,8 +529,12 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         pane_scroll: None,
         plugin_keys: Vec::new(),
         plugin_events: Vec::new(),
+        plugin_panels: Default::default(),
         clock_hold: 0.0,
+        clock_jump: 0.0,
+        seat_bus: String::new(),
         pad_look: [false; 4],
+        pad_voice_radio: false,
         arrow_glance: false,
         teleport_pick: false,
         discord: None,
@@ -535,6 +544,9 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         voice: None,
         headtrack: None,
         headtrack_failed: None,
+        headtrack_scale_last: None,
+        headtrack_scale_bias: [0.0; 6],
+        headtrack_invert_last: None,
         controllers: None,
         mouse_drive: false,
         mouse_steer: (0.0, 0.0),
@@ -545,6 +557,8 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         last_ctl_steer: None,
         mouse_pedals: (0.0, 0.0),
         mouse_kmh: 0.0,
+        pad_kmh: 0.0,
+        pad_steer_target: 0.0,
         tutorial: None,
         ego: false,
         on_foot: None,
@@ -586,6 +600,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         frames: 0,
         fps_t: Instant::now(),
         service_msg: clock_note.map(|m| (m, 10.0)),
+        pumping: None,
         notices: Vec::new(),
         update_watch: crate::update_watch::UpdateWatch::new(),
         // (a server counts its players by their own games, not itself)
