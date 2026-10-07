@@ -33,9 +33,20 @@ into it** - what is ours is the list in `FORK-DLSS.md` and nothing else.
 `crates/omsi-app/src/settings.rs` is the fiddly one. Both sides rewrite the same `Self { ... }`
 defaults line, which is a single line of two thousand characters, so by hand it is not
 practical: take the project's line and insert the pieces DLSS needs (`dlss: "off".into(), `
-before `render_scale: 0.0, `, and the two further down the file). A script is better than an
-editor here; `_kopie-lokalne/rozwiaz-konflikty.py` did exactly that for the October 2026 merge
-and is the shape to copy.
+before `render_scale: 0.0, `, and the others down the file).
+
+Two tools in `C:\Users\Desktop\Desktop\_kopie-lokalne` do this, and both are written in Python
+rather than PowerShell - PowerShell cannot even parse `'<<<<<<< HEAD'`, and a two-thousand
+character line wants a script rather than an editor:
+
+- `pokaz-konflikty.py` prints, for every conflict block, only the part where the two sides
+  differ (`pelne` as an argument prints the blocks whole). This is what makes a conflict in
+  `settings.rs` readable at all.
+- `rozwiaz-konflikty.py` resolves every block by a rule that names a fragment of the *project's*
+  side and says what to do with it, and it stops if a block matches no rule, so nothing is
+  settled in silence. **The rules are different every time** - they say what moved around our
+  code since the last merge - so it is a template rather than a tool: read it, then rewrite the
+  rules for the merge at hand. The one it replaced is kept beside it with the date in its name.
 
 Then:
 
@@ -63,11 +74,16 @@ cargo test --release --workspace --no-fail-fast
 - **Two failures are the machine's, not the code's**, and are worth saying so rather than
   chasing: `a_picked_trip_starts_the_rest_of_the_tour` and `a_duty_passes_its_fleet_number` in
   `omsi-launcher-core` need an OMSI installation to be present.
-- **`update-and-build.ps1` is a local file**, and one thing in it has already gone wrong once:
-  it used to ask only whether a `[patch.crates-io]` section existed, and once the project had
-  one of its own (for `gpu-allocator`) that check started passing while our entry was missing -
-  a release built locally would have crashed under ReShade for everybody. It now looks for our
-  entry and puts it inside the section that is there, the way the release workflow does.
+- **`update-and-build.ps1` is a local file**, and two things in it have gone wrong once. It
+  used to ask only whether a `[patch.crates-io]` section existed, and once the project had one
+  of its own (for `gpu-allocator`) that check started passing while our entry was missing - a
+  release built locally would have crashed under ReShade for everybody; it now looks for our
+  entry and puts it inside the section that is there, the way the release workflow does. And its
+  `cargo build` wants a local `$ErrorActionPreference = 'Continue'`: with `Stop` PowerShell turns
+  cargo's progress on stderr into a terminating error, which ended the script before it copied
+  anything into the game folder - the build itself had gone through, and the command line looked
+  as if it had failed. The same holds for calling the script from a longer command: let it be
+  the last thing in one, or redirect its output to a file rather than through `Select-Object`.
 
 ## How to know it went right
 
