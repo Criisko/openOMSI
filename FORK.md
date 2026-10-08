@@ -22,6 +22,14 @@ composition swapchain, so that factory is not needed at all, and wgpu itself tre
 optional (it is wrapped in `.ok()` upstream). The step leaves it out; see
 `.github/workflows/windows.yml`, "The ReShade workaround".
 
+Which copy of that crate is patched matters. The project patches `wgpu-hal` to the org's own
+wgpu fork (`Cargo.toml`), and the whole set of wgpu crates then comes from that one source: a
+patched copy standing beside it is a second `wgpu-hal` in the same build, and the fork's `wgpu`
+does not recognise its types. So the line is taken out of the source cargo itself fetched,
+before the build, and a step after the build checks that it is still out. A project that ever
+stops patching that crate is the case the registry copy and the `[patch.crates-io]` entry are
+still kept for.
+
 It is a bug in ReShade rather than in wgpu or openOMSI: `CreateDXGIFactory1` with the
 `IDXGIFactory1` IID works fine under ReShade, while the same call with the `IDXGIFactoryMedia`
 IID does not. Most engines never call the legacy entry point, which is why ReShade works in most

@@ -7,13 +7,18 @@ ever released. This is the same merge by hand, with the traps written down.
 
 ## Before the merge
 
-Two files in the working tree belong to this machine and not to the repository: `Cargo.toml`
-carries the `wgpu-hal` entry that makes the ReShade workaround possible, and `Cargo.lock`
-follows it (see "The workaround" in `FORK.md`). Neither is ever committed. A merge refuses to
-start while they are modified, so take them aside first:
+Nothing of this machine's own is written into the repository's files any more, so a merge
+normally starts on a clean tree: the ReShade workaround is applied by `update-and-build.ps1`
+(and by the release workflow) to the `wgpu-hal` source cargo itself fetched, and no
+`[patch.crates-io]` entry for it is written into `Cargo.toml` any more (see "The workaround"
+in `FORK.md`).
+
+A tree that still carries one, from a build made before this changed, wants a
+`git diff Cargo.toml Cargo.lock` first: a merge refuses to start while either file is
+modified, and a build can leave `Cargo.lock` looking modified when its contents are the same,
+because cargo writes its line endings its own way.
 
 ```powershell
-Copy-Item Cargo.toml, Cargo.lock C:\Users\Desktop\Desktop\_kopie-lokalne\
 git checkout -- Cargo.toml Cargo.lock
 ```
 
@@ -88,16 +93,22 @@ cargo test --release --workspace --no-fail-fast
 - **Two failures are the machine's, not the code's**, and are worth saying so rather than
   chasing: `a_picked_trip_starts_the_rest_of_the_tour` and `a_duty_passes_its_fleet_number` in
   `omsi-launcher-core` need an OMSI installation to be present.
-- **`update-and-build.ps1` is a local file**, and two things in it have gone wrong once. It
-  used to ask only whether a `[patch.crates-io]` section existed, and once the project had one
-  of its own (for `gpu-allocator`) that check started passing while our entry was missing - a
-  release built locally would have crashed under ReShade for everybody; it now looks for our
-  entry and puts it inside the section that is there, the way the release workflow does. And its
-  `cargo build` wants a local `$ErrorActionPreference = 'Continue'`: with `Stop` PowerShell turns
-  cargo's progress on stderr into a terminating error, which ended the script before it copied
-  anything into the game folder - the build itself had gone through, and the command line looked
-  as if it had failed. The same holds for calling the script from a longer command: let it be
-  the last thing in one, or redirect its output to a file rather than through `Select-Object`.
+- **`update-and-build.ps1` is a local file**, and its `cargo build` wants a local
+  `$ErrorActionPreference = 'Continue'`: with `Stop` PowerShell turns cargo's progress on
+  stderr into a terminating error, which ended the script before it copied anything into the
+  game folder - the build itself had gone through, and the command line looked as if it had
+  failed. The same holds for calling the script from a longer command: let it be the last
+  thing in one, or redirect its output to a file rather than through `Select-Object`.
+- **Where the workaround is applied depends on where `wgpu-hal` comes from, and the wrong
+  place is worse than no workaround.** The October 2026 merge met a project that patches that
+  crate to the org's own wgpu fork, and the whole set of wgpu crates then comes from that one
+  source: a patched copy of the crate standing beside it is a *second* `wgpu-hal` in the same
+  build, and the fork's `wgpu` does not recognise its types (`the trait bound
+  wgpu_hal::dx12::Api: wgpu::wgpu_hal::Api is not satisfied`, and one missing method after
+  another); a copy of the fork's whole repository put inside this workspace is worse still,
+  because it inherits from *this* workspace and stops at `error inheriting authors`. The line
+  is taken out of the checkout cargo fetched now, and a step after the build checks that it is
+  still out - a build that put it back is a red run, not a release.
 
 ## How to know it went right
 

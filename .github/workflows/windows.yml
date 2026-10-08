@@ -19,8 +19,12 @@
 #
 #   Keeping it in the workflow (instead of vendoring wgpu-hal into the repository) means the
 #   only thing to keep up with upstream is this file: the step reads the wgpu-hal version out
-#   of Cargo.lock itself. If that version ever stops containing the line, the step fails and
-#   says so, so a stale workaround cannot slip into a release unnoticed.
+#   of Cargo.lock itself, and when the project patches that crate to its own wgpu fork - the
+#   whole set of wgpu crates then comes from that one source, so a copy standing beside it
+#   would be a second wgpu-hal, of the wrong kind for the fork's wgpu - it takes the line out
+#   of the source cargo itself fetched. If that source ever stops containing the line, the
+#   step fails and says so, and the step after the build checks that the line is still out,
+#   so a stale or lost workaround cannot slip into a release unnoticed.
 
 name: Windows release
 
@@ -77,12 +81,35 @@ jobs:
           $ver = $Matches[1]
           Write-Host "wgpu-hal $ver"
 
-          Invoke-WebRequest "https://static.crates.io/crates/wgpu-hal/wgpu-hal-$ver.crate" -OutFile wgpu-hal.crate
-          tar -xzf wgpu-hal.crate
-          New-Item -ItemType Directory -Force vendor | Out-Null
-          Move-Item "wgpu-hal-$ver" vendor/wgpu-hal
+          # Where the crate comes from decides how the line comes out of it. The project
+          # patches wgpu-hal to the org's own wgpu fork, and there the whole set of wgpu
+          # crates comes from that one source, so that case takes the line out of the source
+          # cargo fetched. Without such a patch the crate is the registry's, on its own, and
+          # a vendored copy is the one built - which is what [patch.crates-io] below is for.
+          $toml = Get-Content Cargo.toml -Raw
+          $vendored = $false
+          if ($toml -match '(?m)^wgpu-hal = \{ git = "([^"]+)", rev = "([^"]+)" \}') {
+            Write-Host "the project's own wgpu-hal, from $($Matches[1]) at $($Matches[2])"
+            $short = $Matches[2].Substring(0, 7)
+            cargo fetch
+            if ($LASTEXITCODE -ne 0) { throw 'cargo fetch failed' }
+            $checkout = Get-ChildItem "$env:USERPROFILE\.cargo\git\checkouts" -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like '*wgpu-openomsi*' } |
+              ForEach-Object { Join-Path $_.FullName $short } |
+              Where-Object { Test-Path (Join-Path $_ 'wgpu-hal\Cargo.toml') } |
+              Select-Object -First 1
+            if (-not $checkout) { throw "the wgpu fork at $short is not in the cargo cache, even after cargo fetch" }
+            $file = Join-Path $checkout 'wgpu-hal\src\dx12\instance.rs'
+          }
+          else {
+            Invoke-WebRequest "https://static.crates.io/crates/wgpu-hal/wgpu-hal-$ver.crate" -OutFile wgpu-hal.crate
+            tar -xzf wgpu-hal.crate
+            New-Item -ItemType Directory -Force vendor | Out-Null
+            Move-Item "wgpu-hal-$ver" vendor/wgpu-hal
+            $file = 'vendor/wgpu-hal/src/dx12/instance.rs'
+            $vendored = $true
+          }
 
-          $file = 'vendor/wgpu-hal/src/dx12/instance.rs'
           $text = Get-Content $file -Raw
           $note = @(
             '        // IDXGIFactoryMedia is made through the legacy CreateDXGIFactory1. ReShade hooks',
@@ -99,18 +126,28 @@ jobs:
             throw 'the line to patch is not in wgpu-hal any more - look at the workaround before releasing'
           }
           Set-Content $file $patched -NoNewline
+          Write-Host "patched $file"
 
-          # (the project keeps a [patch.crates-io] section of its own, for gpu-allocator: a
-          # second table of that name is a duplicate key and cargo refuses the whole file, so
-          # our entry goes inside the section that is there - or makes one when there is none)
-          $ours = "# Lets ReShade load: see vendor/wgpu-hal/src/dx12/instance.rs`nwgpu-hal = { path = `"vendor/wgpu-hal`" }`n"
-          $text = Get-Content Cargo.toml -Raw
-          if ($text -match '(?m)^\[patch\.crates-io\]\r?\n') {
-            $text = $text -replace '(?m)^(\[patch\.crates-io\]\r?\n)', "`$1$ours"
-          } else {
-            $text = $text + "`n[patch.crates-io]`n$ours"
+          if ($vendored) {
+            # a vendored copy is built only if [patch.crates-io] says so, and the project keeps
+            # a section of that name for itself (for gpu-allocator): a second table would be a
+            # duplicate key, so the entry goes inside the one that is there
+            $entry = 'wgpu-hal = { path = "vendor/wgpu-hal" }'
+            if (-not $toml.Contains($entry)) {
+              $reason = '# Lets ReShade load: see vendor/wgpu-hal/src/dx12/instance.rs'
+              if ($toml -match '(?m)^\[patch\.crates-io\]\r?\n') {
+                $toml = $toml -replace '(?m)^(\[patch\.crates-io\]\r?\n)', ('$1' + "$reason`n$entry`n")
+              } else {
+                $toml = $toml.TrimEnd() + "`n`n" + "$reason`n[patch.crates-io]`n$entry`n"
+              }
+              Set-Content Cargo.toml $toml -NoNewline
+              Write-Host 'put the wgpu-hal patch entry into Cargo.toml'
+            }
           }
-          Set-Content Cargo.toml $text -NoNewline
+
+          # the step after the build reads this back to check the workaround is still in the
+          # source that was built
+          "RESHADE_FILE=$file" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # No --locked here: the [patch.crates-io] entry above changes Cargo.lock, so the build
       # has to be allowed to record that (one entry, wgpu-hal's source).
@@ -127,6 +164,17 @@ jobs:
           # same file, and this is the only thing it does that this build does not).
           Copy-Item "assets/steam_redist/steam_api64.dll" dist/windows/
           Get-ChildItem dist/windows
+
+      # cargo unpacks a git checkout once and keeps it, but a build that put the line back
+      # would mean a release without the fix: the workaround has to be in what was built.
+      - name: The workaround survived the build
+        shell: pwsh
+        run: |
+          $text = Get-Content $env:RESHADE_FILE -Raw
+          if ($text -notmatch 'IDXGIFactoryMedia is made through the legacy') {
+            throw 'the wgpu-hal workaround is not in the source that was built'
+          }
+          Write-Host 'the workaround is in the source that was built'
 
       # Microsoft's shader compiler for DirectX 12 (dxcompiler.dll, dxil.dll beside the
       # program): without it wgpu falls back to the old FXC, which is slow and refuses some
