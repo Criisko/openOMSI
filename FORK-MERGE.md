@@ -107,8 +107,15 @@ cargo test --release --workspace --no-fail-fast
   wgpu_hal::dx12::Api: wgpu::wgpu_hal::Api is not satisfied`, and one missing method after
   another); a copy of the fork's whole repository put inside this workspace is worse still,
   because it inherits from *this* workspace and stops at `error inheriting authors`. The line
-  is taken out of the checkout cargo fetched now, and a step after the build checks that it is
-  still out - a build that put it back is a red run, not a release.
+  is taken out of the checkout cargo fetched now.
+- **Cargo does not notice a file edited inside a git dependency's checkout.** That dependency
+  is fingerprinted by the revision it fetched, not by the files in it, so the older `wgpu-hal`
+  artifact is reused and the workaround silently is not in the build - the game then dies in
+  `dxgi.dll` (`0xc0000005`) under ReShade before any window shows, which looks exactly like the
+  workaround never having been written. `cargo clean -p wgpu-hal` after patching, before the
+  build, is what makes it real, and what checks it is the *binary*: the id of the call that was
+  removed (`IDXGIFactoryMedia`, `{41E7D1F2-A591-4F7B-A2E5-FA9C843E1C12}`) must not be in
+  `openomsi.exe` at all. A build that has it is a red run, not a release.
 
 ## How to know it went right
 

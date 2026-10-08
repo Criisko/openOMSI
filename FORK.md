@@ -26,9 +26,11 @@ Which copy of that crate is patched matters. The project patches `wgpu-hal` to t
 wgpu fork (`Cargo.toml`), and the whole set of wgpu crates then comes from that one source: a
 patched copy standing beside it is a second `wgpu-hal` in the same build, and the fork's `wgpu`
 does not recognise its types. So the line is taken out of the source cargo itself fetched,
-before the build, and a step after the build checks that it is still out. A project that ever
-stops patching that crate is the case the registry copy and the `[patch.crates-io]` entry are
-still kept for.
+before the build, the crate is compiled again (a git dependency is fingerprinted by the
+revision, not by the files in its checkout, so without that the older build would be reused),
+and what is checked afterwards is the program: the id of the call that was removed must not
+be in `openomsi.exe`. A project that ever stops patching that crate is the case the registry
+copy and the `[patch.crates-io]` entry are still kept for.
 
 It is a bug in ReShade rather than in wgpu or openOMSI: `CreateDXGIFactory1` with the
 `IDXGIFactory1` IID works fine under ReShade, while the same call with the `IDXGIFactoryMedia`

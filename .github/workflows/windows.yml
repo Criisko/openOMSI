@@ -130,6 +130,14 @@ jobs:
           Set-Content $file $patched -NoNewline
           Write-Host "patched $file"
 
+          # A git dependency is fingerprinted by the revision cargo fetched, not by the files in
+          # its checkout: editing that file leaves the older wgpu-hal artifact in place, so the
+          # workaround would silently not be in the build and the game would die in dxgi.dll
+          # under ReShade for everybody. The crate is thrown away here and compiled again by the
+          # build below.
+          cargo clean --release --target $env:TARGET -p wgpu-hal
+          if ($LASTEXITCODE -ne 0) { throw 'cargo clean could not remove the old wgpu-hal build' }
+
           if ($vendored) {
             # a vendored copy is built only if [patch.crates-io] says so, and the project keeps
             # a section of that name for itself (for gpu-allocator): a second table would be a
@@ -147,10 +155,6 @@ jobs:
             }
           }
 
-          # the step after the build reads this back to check the workaround is still in the
-          # source that was built
-          "RESHADE_FILE=$file" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
       # No --locked here: the [patch.crates-io] entry above changes Cargo.lock, so the build
       # has to be allowed to record that (one entry, wgpu-hal's source).
       - name: Build
@@ -167,16 +171,21 @@ jobs:
           Copy-Item "assets/steam_redist/steam_api64.dll" dist/windows/
           Get-ChildItem dist/windows
 
-      # cargo unpacks a git checkout once and keeps it, but a build that put the line back
-      # would mean a release without the fix: the workaround has to be in what was built.
-      - name: The workaround survived the build
+      # The workaround has to be in the program that was built, not only in the source: the id
+      # the removed call asks for must not be in the binary at all. This is what caught the case
+      # where cargo kept an older wgpu-hal - the source was patched, the build was not, and the
+      # game died in dxgi.dll under ReShade before any window showed.
+      - name: The workaround is in the built program
         shell: pwsh
         run: |
-          $text = Get-Content $env:RESHADE_FILE -Raw
-          if ($text -notmatch 'IDXGIFactoryMedia is made through the legacy') {
-            throw 'the wgpu-hal workaround is not in the source that was built'
+          $latin1 = [Text.Encoding]::GetEncoding(28591)
+          $bytes = [IO.File]::ReadAllBytes("target/$env:TARGET/release/openomsi.exe")
+          # IDXGIFactoryMedia, the id the removed call asks for
+          $needle = $latin1.GetString([byte[]](0xF2, 0xD1, 0xE7, 0x41, 0x91, 0xA5, 0x7B, 0x4F, 0xA2, 0xE5, 0xFA, 0x9C, 0x84, 0x3E, 0x1C, 0x12))
+          if ($latin1.GetString($bytes).Contains($needle)) {
+            throw 'the ReShade workaround is not in the built program: wgpu-hal was not compiled again'
           }
-          Write-Host 'the workaround is in the source that was built'
+          Write-Host 'the built program no longer asks for IDXGIFactoryMedia'
 
       # Microsoft's shader compiler for DirectX 12 (dxcompiler.dll, dxil.dll beside the
       # program): without it wgpu falls back to the old FXC, which is slow and refuses some
