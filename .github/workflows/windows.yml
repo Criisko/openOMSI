@@ -264,6 +264,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'an OMSI_* name in the code is not declared in omsi_cfg::flags' }
 
       - name: Publish
+        # A run started by hand builds and checks everything but publishes nothing, so the whole
+        # pipeline can be tried out before the `push` trigger is put back. A push publishes, as
+        # it always did.
+        if: github.event_name == 'push'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
