@@ -1575,7 +1575,7 @@ impl Player {
         }
         // OMSI_SUSP_TRACE_WINDOW=<csv>: each wheel's travel every frame of a window run
         // (the offscreen run has OMSI_SUSP_TRACE)
-        if let Some(path) = omsi_cfg::env::var_os("OMSI_SUSP_TRACE_WINDOW") {
+        if let Some(path) = omsi_cfg::flags::OMSI_SUSP_TRACE_WINDOW.os() {
             use std::io::Write;
             static TRACE: std::sync::Mutex<Option<(std::fs::File, f64)>> = std::sync::Mutex::new(None);
             let mut g = TRACE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2099,6 +2099,7 @@ fn repair_roller_blind(vehicle: &mut omsi_sim::VehicleInstance, event: &str) {
 
 #[cfg(test)]
 mod roller_blind_tests {
+    include!("../../../tools/test-support/original_root.rs");
     use super::{auto_drag_click, repair_roller_blind};
     use crate::schedule::tests::script_test_vehicle;
 
@@ -2218,11 +2219,9 @@ mod roller_blind_tests {
     }
 
     #[test]
+    #[ignore = "needs the original OMSI 2 install (OMSI_ROOT)"]
     fn original_blinds_keep_small_upward_adjustments_after_release() {
-        let Some(root) = omsi_cfg::env::var_os("OMSI_ROOT").map(std::path::PathBuf::from) else {
-            eprintln!("skipped: OMSI_ROOT is not set");
-            return;
-        };
+        let root = original_root();
         let buses: [(&str, &[(&str, &str, &str)]); 3] = [
             (
                 "Vehicles/Urbino_II/SU_18_V.bus",
@@ -2355,6 +2354,11 @@ impl Player {
     /// 1 = visible from outside, 2 = visible from inside, 4 = visible on AI vehicles; 0 = always.
     pub(crate) fn sync_transforms(&mut self, renderer: &Renderer, scene: &mut Scene, inside: bool) {
         sync_vehicle_transforms(renderer, scene, &mut self.vehicle, &mut self.render, &mut self.trailer_renders, inside);
+        if self.render.window_wipers.is_none() {
+            self.render.window_wipers = Some(crate::window_wipers::WindowWipers::new(renderer, scene, &self.vehicle, &self.render));
+        }
+        let wipers = self.render.window_wipers.as_mut().unwrap();
+        wipers.update(renderer, scene, &self.vehicle, &self.render.instances);
     }
 
     /// Pose and place the driver at the wheel; `show` false hides the figure (the `driver`
@@ -2933,8 +2937,10 @@ pub(crate) fn keep_wheel(p: Option<&mut Player>) {
 /// window is the steering from full left to full right lock, divided by the speed in tens of
 /// km/h once the bus is faster than 10 km/h (going backwards counts as standing). At 50 km/h
 /// the same movement of the hand turns the wheels a fifth as far: the wheel "gets heavier".
+/// The mouse's point may lie past the window's edges (app_impl/mouse_grab.rs): the caller
+/// holds the result at the full lock.
 pub(crate) fn mouse_steering(cursor_x: f32, width: f32, kmh: f32) -> f32 {
-    let x = (2.0 * cursor_x / width.max(1.0) - 1.0).clamp(-1.0, 1.0);
+    let x = 2.0 * cursor_x / width.max(1.0) - 1.0;
     x / (kmh / 10.0).max(1.0)
 }
 
@@ -2951,6 +2957,10 @@ pub(crate) fn mouse_follow(fade: f32, dt: f32, smooth: bool) -> f32 {
     } else {
         0.0
     }
+}
+
+pub(crate) fn mouse_pedal_target(input: f32, strength: f32) -> f32 {
+    (input.clamp(0.0, 1.0) * strength.clamp(0.25, 4.0)).min(1.0)
 }
 
 /// A mouse pedal following the cursor, `k` of the way left behind each frame. The last bit
@@ -3000,7 +3010,7 @@ mod orbit_pivot_tests {
 
 #[cfg(test)]
 mod mouse_tests {
-    use super::{mouse_follow, mouse_pedal, mouse_steering};
+    use super::{mouse_follow, mouse_pedal, mouse_pedal_target, mouse_steering};
 
     /// The mouse's wheel eases after the cursor by default; with the smoothing off it is where
     /// the cursor says the same frame, as in OMSI (#1092) - only the first second after
@@ -3037,6 +3047,15 @@ mod mouse_tests {
         let k = (-(1.0 / 60.0f32) / 0.06).exp();
         let t = mouse_pedal(0.0, 1.0, k);
         assert!(t > 0.2 && t < 0.3, "{t}");
+    }
+
+    #[test]
+    fn mouse_pedal_strength_moves_the_full_pedal_threshold() {
+        assert_eq!(mouse_pedal_target(0.5, 1.0), 0.5);
+        assert_eq!(mouse_pedal_target(0.5, 2.0), 1.0);
+        assert_eq!(mouse_pedal_target(1.0, 0.5), 0.5);
+        assert_eq!(mouse_pedal_target(1.0, 2.0), 1.0);
+        assert_eq!(mouse_pedal_target(0.5, 0.5), 0.25);
     }
 
     #[test]

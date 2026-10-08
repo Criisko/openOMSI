@@ -125,7 +125,7 @@ fn rescue_update() {
     let Some(mark) = start_mark() else { return };
     let stuck = mark.exists();
     let _ = std::fs::write(&mark, VERSION);
-    if !stuck || omsi_cfg::env::var_os("OMSI_NO_UPDATE").is_some() {
+    if !stuck || omsi_cfg::flags::OMSI_NO_UPDATE.is_set() {
         return;
     }
     log::warn!("the last start did not reach the launcher: looking for an update now");
@@ -378,7 +378,7 @@ impl Shell {
                     }
                 }
             }
-            if vulkan && std::env::var_os("OMSI_BACKEND").is_none() {
+            if vulkan && omsi_cfg::flags::OMSI_BACKEND.live_os().is_none() {
                 std::env::set_var("OMSI_BACKEND", "gl");
             }
             log::warn!("the last run closed in the middle of a drive: this one starts with safer graphics{}", if vulkan { " on OpenGL" } else { "" });

@@ -273,6 +273,11 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool,
         var irr = l.color.rgb * l.color.w * enh.lights.y * e;
         let nl = dot(n, ld);
         ground_e = ground_e + irr * max(ld.z, 0.0);
+        // Ground bounce is unshadowed. A lamp behind an ordinary surface contributes
+        // no direct light, so it must not sample its shadow map before being rejected.
+        if (!thin && nl <= 0.0) {
+            continue;
+        }
         // the lamps' own shadow maps (the few lighting the view most, see `lamp_shadow_at`)
         if (shadows) {
             irr = irr * lamp_shadow_at(li, p, n, thin);
@@ -281,9 +286,6 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool,
             // a headlamp skims the grass: it lights the tips, not a crown's every side
             let wrap = select(0.45 + 0.25 * nl, 0.15 + 0.6 * max(nl, 0.0), l.extra.z != 0.0);
             sum = sum + irr * wrap * sf.albedo / PI;
-            continue;
-        }
-        if (nl <= 0.0) {
             continue;
         }
         let h = normalize(ld + v);
@@ -406,6 +408,18 @@ fn display_level(t: vec3<f32>) -> vec3<f32> {
     return x + 0.04 * smoothstep(vec3<f32>(0.0), vec3<f32>(0.08), x);
 }
 
+// [matl_glow] (see MaterialExtra::glow): the material is its own light. `buv` is where its
+// mask is read (the light map's own coordinate, the slot it rides in) and `col` the colour
+// the light is drawn in - the material's own, so a destination panel keeps the colour its
+// display draws. The mask is a greyscale picture of how much shines where (white full, black
+// none). The strength is the mod's own (the .cfg value x0.25, on the scale of the LED
+// panels' `Led glow`) and is held against the metering as an LED panel's dots are; the
+// glare round it comes from how bright it is, as every light's does (post.wgsl).
+fn matl_glow_light(buv: vec2<f32>, col: vec3<f32>) -> vec3<f32> {
+    let gm = textureSample(t_light, s_diffuse, buv);
+    return col * dot(gm.rgb, vec3<f32>(0.299, 0.587, 0.114)) * material.glow.x * max(enh.exposure.z * 2.0, 0.8);
+}
+
 // How much of the light crossing the player's bus's pane at `world` its condensation
 // scatters (0..1): 1 - e^-depth of the windscreen's, the side windows' or the rear
 // window's film (enh.condensation, optical depths from omsi-app condensation.rs), the film
@@ -457,17 +471,20 @@ fn pane_condensation(world: vec3<f32>) -> f32 {
 }
 
 fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bool, eye: vec3<f32>) -> vec4<f32> {
+    // (the pane's water, read once for the uses below)
+    let film_water = window_wetness(in);
     if (material.emissive.w > 1.5) {
         // a pane's film of water: drops, not the sliding texture (see `rain_glass`), each a
         // lens that mirrors the sky probe and shows it upside down through itself
         let v = camera.cam_pos.xyz - in.world;
         let vn = normalize(v);
         let in_cab = inside_vehicle(camera.cam_pos.xyz) * near_player_vehicle(in.world) > 0.5;
-        let g = rain_glass(in.world, in.uv - in.params.zw, in.normal, in.params.x, camera.post.y, in_cab);
+        let g = rain_glass(in.world, in.uv - in.params.zw, in.normal, film_water, camera.post.y, in_cab, in.wipe_uv);
+        if (g.cover <= 0.001 && g.mist <= 0.001) { return vec4<f32>(0.0); }
         let through = rain_through(g, vn);
         let valid = dot(through, through) > 1e-4;
         // (the picture behind is as the HDR pass drew it: exposed already)
-        let seen = select(vec3<f32>(0.0), rain_behind(in.world, through, rain_env_enhanced(normalize(select(g.out, through, valid)), 2.0), 1.0 / max(enh.exposure.x, 1e-6)), valid);
+        let seen = select(vec3<f32>(0.0), rain_behind(in.world, through, rain_env_enhanced(normalize(select(g.out, through, valid)), 2.0), 1.0 / max(enh.exposure.x, 1e-6), g.mist), valid);
         let mirrored = rain_env_enhanced(reflect(-vn, g.n), 1.0);
         let d = rain_light(g, vn, through, mirrored, seen, sh_irradiance(g.out) / PI * 0.9, enh.sun.rgb / PI);
         let aer = air(-normalize(v), fog_distance(in.world), camera.cam_pos.z - enh.fog.z, in.world.z - enh.fog.z);
@@ -511,6 +528,9 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     let pic_lod = led_lod(duv, vec2<f32>(textureDimensions(t_diffuse)));
     let led_pic = material.emissive.w < -1.5 && enh.led.y < pic_lod;
     var tex = diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv);
+    if (is_snow_pane()) {
+        tex = snow_on_pane(in, film_water);
+    }
     if (led_pic) {
         tex = diffuse_border(textureSampleLevel(t_diffuse, s_diffuse, duv, enh.led.y), duv);
     }
@@ -553,7 +573,9 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     if (mode < 0.5) {
         alpha = 1.0;
     }
-    alpha = alpha * in.params.x;
+    if (!is_snow_pane()) {
+        alpha = alpha * clamp(film_water, 0.0, 1.0);
+    }
     // Sparse brush masks still cover the whole tile mesh. Empty pixels contribute
     // neither colour nor reflection coverage, so avoid lighting them. Keep fractional
     // edges, debug views, and water (whose Fresnel can raise zero alpha) unchanged.
@@ -586,6 +608,8 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // ago, dark at night. Brightened like a display by the metering (up to 1.6 in the
         // dark) it showed a street far brighter than the one through the windscreen.
         let lift = select(display_dim(enh.exposure.y), min(enh.exposure.y, 1.0), material.params.y < 0.95);
+        // (no [matl_glow] here: an unlit slot is drawn at its own brightness already, and
+        // reading the light map's slot in this branch failed Metal's shader compiler)
         let c = display_level(t) * lift;
         return vec4<f32>(c * aer.a + aer.rgb * pre, alpha);
     }
@@ -1145,11 +1169,19 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // white light map's, so it goes out with that map's variable (the busbar, the
         // lights) as the Omsi.exe stage does.
         let lm_gate = select(1.0, clamp(in.params2.x, 0.0, 1.0), material.params2.x > 0.5);
-        // (in the cab - a dashboard's LCD lit by a white map reads as a panel - it dims at night)
-        emit = emit + tex.rgb * enh.led.x * alpha * lm_gate * max(enh.exposure.z * 2.0, 0.8) * mix(1.0, display_dim(1.0), 1.0 - outside);
+        // (in the cab - a dashboard's LCD lit by a white map reads as a panel - it dims at night;
+        // not a page's destination sign (-3), which is read from the street through the windscreen)
+        let cab_dim = select(1.0 - outside, 0.0, material.emissive.w < -2.5);
+        emit = emit + tex.rgb * enh.led.x * alpha * lm_gate * max(enh.exposure.z * 2.0, 0.8) * mix(1.0, display_dim(1.0), cab_dim);
     } else if (material.emissive.w < -0.5) {
         // a display's text (see MaterialExtra::display)
         emit = emit + tex.rgb * 0.35 * max(enh.exposure.z * 2.0, 0.8) * display_dim(1.0);
+    }
+    if (material.glow.x > 0.0) {
+        // [matl_glow] (see `matl_glow_light`): the material is its own light, drawn in HDR.
+        // The classic picture does not know the keyword (`params2.x` is off, see
+        // `add_material_extra`).
+        emit = emit + matl_glow_light(buv, tex.rgb);
     }
     rgb = rgb + emit;
     if (enh.debug.x > 0.5) {

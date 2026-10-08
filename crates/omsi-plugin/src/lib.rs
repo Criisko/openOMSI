@@ -462,14 +462,14 @@ impl HostConfig {
     /// The host next to the running program and, off Windows, `wine` from the path.
     pub fn detect() -> HostConfig {
         let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
-        let host32 = std::env::var_os("OMSI_PLUGIN_HOST32")
+        let host32 = omsi_cfg::flags::OMSI_PLUGIN_HOST32.live_os()
             .map(PathBuf::from)
             .or_else(|| exe_dir.map(|d| d.join("omsi-plugin-host32.exe")))
             .filter(|p| p.is_file());
         let runner = if cfg!(windows) {
             None
         } else {
-            std::env::var_os("OMSI_WINE").map(PathBuf::from).or_else(|| {
+            omsi_cfg::flags::OMSI_WINE.live_os().map(PathBuf::from).or_else(|| {
                 // the path, then where Homebrew and the Wine app bundles put it (a game
                 // started from Finder gets a path without /opt/homebrew/bin)
                 let from_path: Vec<PathBuf> = std::env::var_os("PATH")
@@ -684,8 +684,9 @@ pub trait PluginIo {
         false
     }
     /// What happened in the game since the last plugin frame, each sent to Lua plugins as an
-    /// event (`crash`, `pedestrian`, `stops_skipped`): things `omsi.info()` cannot show, as
-    /// they are over before a plugin could look. Every plugin of the frame gets them all.
+    /// event (`crash`, `pedestrian`, `stops_skipped`, `service`, `trip_done`, `jolt`,
+    /// `ticket_sold`): things `omsi.info()` cannot show, as they are over before a plugin
+    /// could look. Every plugin of the frame gets them all.
     fn events(&self) -> Vec<GameEvent> {
         Vec::new()
     }

@@ -71,6 +71,20 @@ cargo test --release --workspace --no-fail-fast
   translated and `the_scene_shader_reads_its_arrays_from_textures_without_vertex_storage`
   failed. A new array belongs in `arrays_as_textures` beside the others - and **without** the
   `@group(3) @binding(1)` prefix, or the texture it makes comes out with no binding.
+- **The project can split a file we have a piece in.** The October 2026 merge took the
+  renderer's one `lib.rs` apart into `passes/` and `pipelines/` modules, so what the DLSS
+  change had added there had to be carried into those: `crates/omsi-render/src/pipelines/dlss.rs`
+  is new, and `passes/setup.rs`, `passes/prepass.rs` and `passes/post.rs` each took a piece.
+  Inside a line the project wrote, the vertex entry's parameters are `in_pos`, `in_normal` and
+  `in_uv` - an `in.pos` left in a function that takes those by value is not a warning but nine
+  failing tests, all of them saying `no definition in scope for identifier: 'in'`.
+- **A new `OMSI_*` name has to be declared where the project keeps its flags.**
+  `flags_match_source` in `omsi-cfg` reads the code and wants every name it mentions in
+  `crates/omsi-cfg/src/flags.rs` (that table is sorted, and searched by binary search), while
+  `flags_doc_up_to_date` wants `docs/DEBUG_FLAGS.md` in step with it: `$env:OMSI_FLAGS_BLESS =
+  '1'; cargo test --release -p omsi-cfg --lib flags`. The five DLSS ones (`OMSI_DLSS`,
+  `OMSI_DLSS_JITTER_SIGN`, `OMSI_DLSS_PROJECT_ID`, `OMSI_DLSS_VERBOSE`, `OMSI_STREAMLINE_DIR`)
+  were carried over in this merge.
 - **Two failures are the machine's, not the code's**, and are worth saying so rather than
   chasing: `a_picked_trip_starts_the_rest_of_the_tour` and `a_duty_passes_its_fleet_number` in
   `omsi-launcher-core` need an OMSI installation to be present.
@@ -88,15 +102,17 @@ cargo test --release --workspace --no-fail-fast
 ## How to know it went right
 
 Before anything is published, the release workflow checks this ("What the fork adds is still
-whole" in `.github/workflows/windows.yml`) and a failure publishes nothing: `dlss.rs` exists,
-the three files that read the setting still mention it, and the project's own two contracts
-pass. The same by hand:
+whole" in `.github/workflows/windows.yml`) and a failure publishes nothing: `dlss.rs` and the
+motion pipelines beside it exist, the three files that read the setting still mention it, and
+the project's own three contracts pass. The same by hand:
 
 ```powershell
 Test-Path crates/omsi-render/src/dlss.rs
+Test-Path crates/omsi-render/src/pipelines/dlss.rs
 cargo test --release -p omsi-launcher-core --lib the_games_options_survive_a_save
 cargo test --release -p omsi-app --lib every_setting_is_on_exactly_one_tab
+cargo test --release -p omsi-cfg --lib flags
 ```
 
 `git diff --stat origin/main...HEAD` is the whole answer to "what does this fork add now":
-23 files in October 2026, and the list in `FORK.md` should read the same after a merge.
+32 files in October 2026, and the list in `FORK.md` should read the same after a merge.

@@ -335,7 +335,7 @@ fn short_error(e: &ureq::Error) -> String {
 
 /// The latest release when it is newer than this build and has a file for this platform.
 pub fn latest() -> anyhow::Result<Option<Release>> {
-    let url = omsi_cfg::env::var("OMSI_UPDATE_URL").unwrap_or_else(|_| LATEST_API.to_string());
+    let url = omsi_cfg::flags::OMSI_UPDATE_URL.var().map(str::to_string).unwrap_or_else(|| LATEST_API.to_string());
     match fetch_text(&url).and_then(|t| Ok(serde_json::from_str::<serde_json::Value>(&t)?)) {
         Ok(v) => parse_release(&v, current_version()),
         // (the API: an address over its limit gets 403 for an hour, and some networks reach

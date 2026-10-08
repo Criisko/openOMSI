@@ -42,6 +42,13 @@ the first commit of the fork's history, which is the author's branch as it stood
 is tagged `dlss-ours-2026-10-03`. Its `dlss.rs`, `upscale.wgsl`, `shader.wgsl` and
 `crates/omsi-render/Cargo.toml` are byte-identical to that earlier commit.
 
+The project split the renderer's one file into `passes/` and `pipelines/` modules with
+0.2.20. The merge that brought 0.2.20 here carried this change over into that shape -
+`crates/omsi-render/src/pipelines/dlss.rs` builds the motion pipelines, `passes/setup.rs`
+sizes the frames and records the jitter, `passes/prepass.rs` draws the motion colours, and
+`passes/post.rs` hands the picture to Streamline - so a later merge reads those files, not
+the one `lib.rs` the patch was written against.
+
 ## The rest of the arrangement
 
 `.github/workflows/sync-upstream.yml` merges the project's `main` into this fork's `main`
@@ -50,8 +57,9 @@ Before `.github/workflows/windows.yml` publishes anything, it checks that what t
 is still whole: `crates/omsi-render/src/dlss.rs` is there, the word `dlss` still appears in the
 three files that read or write the setting (`crates/omsi-app/src/settings.rs`,
 `crates/omsi-app/src/launcher/pages.rs`, `crates/omsi-launcher-core/src/lib.rs`), and the
-project's own two contracts pass (the settings round trip, and every launcher row named in
-`by_tab()`). A failure there publishes nothing, so a merge that silently dropped part of a
+project's own three contracts pass (the settings round trip, every launcher row named in
+`by_tab()`, and every `OMSI_*` name in the code declared in `omsi_cfg::flags`). A failure
+there publishes nothing, so a merge that silently dropped part of a
 change is a red run and no update, rather than a release without the feature.
 
 ## The pieces a merge has to keep
@@ -62,14 +70,29 @@ or a merge that reads suspiciously should be checked against.
 - `crates/omsi-render/src/dlss.rs` - the whole runtime: Streamline's DLLs loaded from beside
   the game, the swap chain watched, the options set, and the present paced.
 - `crates/omsi-render/src/lib.rs` - `DlssMode` and its round trip, `RenderOptions::dlss`,
-  `DlssState` and `DlssPipelines`, the motion pipelines (`dlss_pipes`, `make`, the sky pass),
-  and the `prev_models` swap in `arrays_as_textures`.
+  `DlssState` and `DlssPipelines`, the present (`dlss_pending`, `dlss_present`), and the
+  `prev_models` swap in `arrays_as_textures`.
+- `crates/omsi-render/src/pipelines/dlss.rs` - the motion pipelines: their bind group, the
+  `DLSS_MOTION_FORMAT` target, the six prepass pipelines and the sky's, built on demand where
+  the project builds its own.
+- `crates/omsi-render/src/passes/setup.rs` - the frame's sizes and targets (`dlss_start`,
+  `dlss_targets`, `scene_size`), the Halton jitter and the `MotionUniform` in
+  `frame_uniforms`.
+- `crates/omsi-render/src/passes/prepass.rs` - the motion colour attachment, and the sky's
+  motion draw.
+- `crates/omsi-render/src/passes/post.rs` - `encode_upscale` leaves the picture to Streamline
+  (`dlss_end_of_scene`) instead of filtering it, and post keeps its FXAA off.
+- `crates/omsi-render/src/passes/mod.rs` - `FrameCtx::dlss_frame` and `full_h`.
 - `crates/omsi-render/src/shader.wgsl` - the entry points `vs_motion`, `fs_motion`,
   `fs_motion_test`, `fs_motion_transmap`, `vs_motion_sky`, `fs_motion_sky`, the `motion`
   uniform block, `@group(3) @binding(1) prev_models`, and `motion_pixels()`.
 - `crates/omsi-render/src/upscale.wgsl` - the upscale's mode 2.
 - `crates/omsi-render/Cargo.toml` - the `windows` features (`Win32_Graphics_Dxgi_Common`,
   `Direct3D12`, `System_LibraryLoader`), `windows-core`, and `wgpu-hal` with `dx12`.
+- `crates/omsi-cfg/src/flags.rs`, `docs/DEBUG_FLAGS.md` - the five flags `OMSI_DLSS`,
+  `OMSI_DLSS_JITTER_SIGN`, `OMSI_DLSS_PROJECT_ID`, `OMSI_DLSS_VERBOSE` and
+  `OMSI_STREAMLINE_DIR`, declared in the project's own flag table, because its test wants
+  every `OMSI_*` name the code mentions to be there and the document in step with it.
 - `crates/omsi-app/src/settings.rs` - `pub dlss: String`, `dlss_mode()` with its `OMSI_DLSS`
   override, the `dlss: "off"` default, the `dlss={}` line the file is written with, and the
   arm that parses it back (which clamps anything unknown to `off`).

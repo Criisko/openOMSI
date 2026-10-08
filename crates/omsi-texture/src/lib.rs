@@ -22,6 +22,8 @@ mod format_tests;
 pub const MAX_DIMENSION: usize = 16384;
 
 pub mod pbr;
+pub mod season_mix;
+pub use season_mix::{find_texture_in_look, mixed_look, season_mix, set_season_mix, SeasonMix};
 pub use gpu::{gpu_options, set_gpu_options, GpuOptions, PixelFormat, TextureData};
 
 #[derive(Debug, Clone)]
@@ -484,7 +486,7 @@ pub fn cfg_path(requested: &str, found: &Path) -> Option<PathBuf> {
         }
         for n in names {
             let c = d.join(&n);
-            if c.is_file() {
+            if omsi_cfg::vfs::is_file(&c) {
                 return Some(c);
             }
         }

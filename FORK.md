@@ -46,7 +46,7 @@ no release at all.
 
 ## What this fork adds, file by file
 
-`git diff --stat origin/main...HEAD` is the whole answer - 24 files in October 2026 - and this
+`git diff --stat origin/main...HEAD` is the whole answer - 32 files in October 2026 - and this
 is what each of them is for. Anything not on this list is the project's own code, so a merge
 that turns up a difference somewhere else has found something to read rather than to keep. The
 tables are the list; the number is only there to tell you at a glance whether something new has
@@ -58,7 +58,13 @@ project):
 | file | what is there |
 |---|---|
 | `crates/omsi-render/src/dlss.rs` | the runtime - new file |
-| `crates/omsi-render/src/lib.rs` | the mode, the pipeline state, the motion prepass, the upscaler |
+| `crates/omsi-render/src/pipelines/dlss.rs` | the motion pipelines, built where the project builds its own - new file |
+| `crates/omsi-render/src/pipelines/mod.rs` | the module that file is declared in |
+| `crates/omsi-render/src/passes/setup.rs` | the frame's sizes and targets, the jitter, and what is still to be presented |
+| `crates/omsi-render/src/passes/prepass.rs` | the motion colours and the sky's motion draw |
+| `crates/omsi-render/src/passes/post.rs` | the upscale hands the picture to Streamline instead of filtering it |
+| `crates/omsi-render/src/passes/mod.rs` | the frame context's `dlss_frame` and `full_h` |
+| `crates/omsi-render/src/lib.rs` | the mode, the pipeline state, the present |
 | `crates/omsi-render/src/shader.wgsl` | the motion entry points the prepass draws with |
 | `crates/omsi-render/src/upscale.wgsl` | the upscale pass's DLSS path |
 | `crates/omsi-render/Cargo.toml` | the Windows features and the crates it needs |
@@ -68,6 +74,7 @@ project):
 | `crates/omsi-app/src/launcher/mod.rs` | the showroom draws without it |
 | `crates/omsi-app/locales/app.yml` | the strings |
 | `crates/omsi-launcher-core/src/lib.rs` | the mode where the launcher reads and writes it |
+| `crates/omsi-cfg/src/flags.rs`, `docs/DEBUG_FLAGS.md` | the five flags that drive it, declared where the project keeps every flag |
 | `docs/USER_GUIDE.md`, `CHANGELOG.md` | what the player is told |
 
 **This fork's own pipeline**, so that a build from here updates itself and carries the

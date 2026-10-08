@@ -179,6 +179,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path crates/omsi-render/src/dlss.rs)) { throw 'dlss.rs is gone' }
+          if (-not (Test-Path crates/omsi-render/src/pipelines/dlss.rs)) { throw 'the motion pipelines are gone' }
           $mentions = @{
             'dlss' = @(
               'crates/omsi-app/src/settings.rs',
@@ -194,11 +195,14 @@ jobs:
             }
           }
           # The project's own contracts: every key both readers of settings.cfg must know,
-          # and every row of a launcher tab named in by_tab().
+          # every row of a launcher tab named in by_tab(), and every OMSI_* name the code
+          # mentions declared in omsi_cfg::flags.
           cargo test --release --target $env:TARGET -p omsi-launcher-core --lib the_games_options_survive_a_save
           if ($LASTEXITCODE -ne 0) { throw 'the settings round trip failed' }
           cargo test --release --target $env:TARGET -p omsi-app --lib every_setting_is_on_exactly_one_tab
           if ($LASTEXITCODE -ne 0) { throw 'a launcher row is not named in by_tab()' }
+          cargo test --release --target $env:TARGET -p omsi-cfg --lib flags
+          if ($LASTEXITCODE -ne 0) { throw 'an OMSI_* name in the code is not declared in omsi_cfg::flags' }
 
       - name: Publish
         shell: bash

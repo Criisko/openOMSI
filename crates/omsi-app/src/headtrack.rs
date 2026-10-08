@@ -294,7 +294,7 @@ mod npclient {
 
     impl Reader {
         pub fn new(hwnd: Option<isize>) -> Self {
-            let native_enabled = std::env::var_os("OMSI_TRACKIR_NATIVE")
+            let native_enabled = omsi_cfg::flags::OMSI_TRACKIR_NATIVE.live_os()
                 .map(|v| v != "0")
                 .unwrap_or(true);
             if !native_enabled {

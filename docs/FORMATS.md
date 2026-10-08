@@ -851,7 +851,7 @@ original way: string `SetLineTo` + `AI_target_index` (terminus index) and the
 the group names no depot file at all (`AI_target_index` stays as it was). Depot callbacks with
 index -1 (what the lookups answer for an unknown code) return "" / -1, never entry 0. A depot
 file belongs to a map: when the bus folder has none of the name the map's `ailists.cfg` wants
-(a mod bus brings only its own map's), the openOMSI takes it from another vehicle folder
+(a mod bus brings only its own map's), openOMSI takes it from another vehicle folder
 (`omsi_vehicle::hof::depot_anywhere`); a bus of a plain `[aigroup_2]` pool, whose group names
 no depot, takes the map's depot of its folder where it has one, else the folder's first
 (`schedule::pool_depot`, Omsi.exe's selected-hof index 0). The FloFix
@@ -972,3 +972,20 @@ items are washer water / condensation that only exist while the variable is on;
 the variant and add `texture × emissive` self-illumination (lower-deck lighting).
 `[matl_lightmap]` is a light *mask* multiplied with the diffuse texture (the SD202 maps
 `D86_02_L1.bmp` are grey masks of the lit atlas regions), scaled by its variable.
+
+`[matl_glow] <texture> <value>` is **an openOMSI extension** (Omsi.exe's model unit has no
+such keyword and skips it as it skips any unknown line; no stock content uses it): it makes the
+slot **its own light**. The named texture is a **greyscale mask** of how much shines where
+(white full, black none) and the light is the material's **own colour** - a destination
+panel's text keeps the colour its display draws. `value` is its brightness on the scale of the
+LED panels' `Led glow` setting (the shader's strength is `value * 0.25`, as that setting's
+levels are): `6` is as bright as that setting's default, `20` brighter than its top. The setting
+itself does not scale it. Only the enhanced picture draws it, as an emission held against the
+metering as an LED panel's dots are, so it shows by day as well as by night; the glare round it
+comes from how bright it is, as any light's does. An unlit slot (a script's or a text texture,
+drawn at its own brightness already) does not take it.
+The mask is bound in the light map's slot: a slot that also has a `[matl_lightmap]` keeps its
+light map and has no glow, and the classic picture draws the slot as if the keyword were not
+there. A glow that is switched (a tail lamp) is a `[matl_item]` of a `[matl_change]` with the
+keyword; an item without a light map or glow of its own keeps its base material's. The last
+`[matl_glow]` of a slot counts.
