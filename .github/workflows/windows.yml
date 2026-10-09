@@ -112,23 +112,32 @@ jobs:
             $vendored = $true
           }
 
+          # The cache keeps cargo's git checkouts, and one of those may already carry the
+          # workaround from an earlier run: patching an already patched file would find nothing
+          # to replace and stop the release for no reason, so the mark is looked for first.
+          Write-Host "the source is $file"
           $text = Get-Content $file -Raw
-          $note = @(
-            '        // IDXGIFactoryMedia is made through the legacy CreateDXGIFactory1. ReShade hooks',
-            '        // that legacy export and the process dies with an access violation inside dxgi.dll,',
-            '        // so it is not asked for here. It is optional to wgpu (upstream wraps the call in',
-            '        // .ok()) and is only used for CreateSwapChainForCompositionSurfaceHandle, which',
-            '        // openOMSI never makes.',
-            '        let factory_media: Option<Dxgi::IDXGIFactoryMedia> = None;',
-            '        let _ = &lib_dxgi;'
-          ) -join "`n"
-          $pattern = '(?m)^[ \t]*// Create IDXGIFactoryMedia\r?\n[ \t]*let factory_media = lib_dxgi\.create_factory_media\(\)\.ok\(\);'
-          $patched = $text -replace $pattern, $note
-          if ($patched -eq $text) {
-            throw 'the line to patch is not in wgpu-hal any more - look at the workaround before releasing'
+          if ($text -match 'IDXGIFactoryMedia is made through the legacy') {
+            Write-Host 'already patched'
           }
-          Set-Content $file $patched -NoNewline
-          Write-Host "patched $file"
+          else {
+            $note = @(
+              '        // IDXGIFactoryMedia is made through the legacy CreateDXGIFactory1. ReShade hooks',
+              '        // that legacy export and the process dies with an access violation inside dxgi.dll,',
+              '        // so it is not asked for here. It is optional to wgpu (upstream wraps the call in',
+              '        // .ok()) and is only used for CreateSwapChainForCompositionSurfaceHandle, which',
+              '        // openOMSI never makes.',
+              '        let factory_media: Option<Dxgi::IDXGIFactoryMedia> = None;',
+              '        let _ = &lib_dxgi;'
+            ) -join "`n"
+            $pattern = '(?m)^[ \t]*// Create IDXGIFactoryMedia\r?\n[ \t]*let factory_media = lib_dxgi\.create_factory_media\(\)\.ok\(\);'
+            $patched = $text -replace $pattern, $note
+            if ($patched -eq $text) {
+              throw 'the line to patch is not in wgpu-hal any more - look at the workaround before releasing'
+            }
+            Set-Content $file $patched -NoNewline
+            Write-Host "patched $file"
+          }
 
           # A git dependency is fingerprinted by the revision cargo fetched, not by the files in
           # its checkout: editing that file leaves the older wgpu-hal artifact in place, so the
