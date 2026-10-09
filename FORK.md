@@ -39,13 +39,6 @@ games and not here.
 
 ## Releases
 
-**Nothing is published by itself at the moment.** The release workflow
-(`.github/workflows/windows.yml`) runs only when it is started by hand, and the trigger it
-used to have is kept as a comment at the top of that file: it goes back once a build from
-this branch has been seen to work on a machine with a real graphics card. Until then the
-`main` branch here is a work in progress rather than a release, and the launcher's update
-check still finds the last one it published before that.
-
 Windows x64 only. Every push to `main` builds one and publishes it, and the build's own update
 check asks *this* repository for it (`crates/omsi-app/src/updater.rs`, `LATEST_API`), so the
 launcher hands the player the newest project code together with the workaround above. Nothing to

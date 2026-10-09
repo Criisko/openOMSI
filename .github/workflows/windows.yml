@@ -28,11 +28,11 @@
 
 name: Windows release
 
-# Nothing is published by itself while the 0.2.20 merge is being checked: this workflow runs
-# only when it is started by hand (the Actions tab, "Run workflow"). Put the
-# `push: branches: [main]` trigger back, above `workflow_dispatch`, once a build from this
-# branch has been seen to work on a machine with a real graphics card.
+# A push publishes. A run started by hand builds and checks everything and publishes nothing
+# (the `Publish` step at the end is guarded), which is how the whole pipeline is tried out.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
